@@ -35,11 +35,11 @@ codex exec \
   -c 'approval_policy="never"' \
   -c 'model_providers.m365-copilot-bun-proxy={ name = "M365 Copilot Bun Proxy", base_url = "http://localhost:4000/v1", wire_api="responses" }' \
   -c 'model_provider="m365-copilot-bun-proxy"' \
-  -m m365-copilot-gpt5.5-reasoning \
+  -m gpt-5.5 \
   'Read notes.md and write a short markdown summary to summary.md.'
 ```
 
-The proxy returns both OpenAI-compatible `/v1/models` data and Codex-compatible model metadata. It also accepts both Chat Completions tool definitions (`function.name`) and Responses API tool definitions (`name` at the tool top level), which is required for Codex local shell/file tool calls.
+The proxy returns both OpenAI-compatible `/v1/models` data and Codex-compatible model metadata. It also accepts both Chat Completions tool definitions (`function.name`) and Responses API tool definitions (`name` at the tool top level), which is required for Codex local shell/file tool calls. The native Codex slug `gpt-5.5` is accepted as an alias for the M365 Copilot GPT-5.5 reasoning tone.
 
 ## Run proxy
 
@@ -186,6 +186,7 @@ Model to Substrate `tone` mapping:
 - `m365-copilot-gpt5.4-reasoning` -> `Gpt_5_4_Reasoning`
 - `m365-copilot-gpt5.5-quick` -> `Gpt_5_5_Chat`
 - `m365-copilot-gpt5.5-reasoning` -> `Gpt_5_5_Reasoning`
+- `gpt-5.5` -> `Gpt_5_5_Reasoning`
 
 Notes:
 

@@ -44,6 +44,7 @@ describe("resolveSubstrateTone", () => {
     expect(resolveSubstrateTone("m365-copilot-gpt5.5-reasoning")).toBe(
       "Gpt_5_5_Reasoning",
     );
+    expect(resolveSubstrateTone("gpt-5.5")).toBe("Gpt_5_5_Reasoning");
   });
 
   test("maps magic-family models to magic tone", () => {

@@ -106,6 +106,7 @@ const AvailableModelIds = [
   "m365-copilot-gpt5.4-reasoning",
   "m365-copilot-gpt5.5-quick",
   "m365-copilot-gpt5.5-reasoning",
+  "gpt-5.5",
   "m365-copilot",
   "m365-copilot-auto",
   "m365-copilot-magic",
@@ -165,7 +166,8 @@ function buildModelsResponse(): JsonObject {
 }
 
 function buildCodexModelInfo(id: (typeof AvailableModelIds)[number], index: number): JsonObject {
-  const isReasoning = id.endsWith("-reasoning") || id === "m365-copilot";
+  const isReasoning =
+    id.endsWith("-reasoning") || id === "m365-copilot" || id === "gpt-5.5";
   const supportedReasoningLevels = isReasoning
     ? [
         { effort: "medium", description: "Balanced reasoning" },

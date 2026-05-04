@@ -52,6 +52,7 @@ describe("simulated transform mode proxy flow", () => {
       "m365-copilot-gpt5.4-reasoning",
       "m365-copilot-gpt5.5-quick",
       "m365-copilot-gpt5.5-reasoning",
+      "gpt-5.5",
       "m365-copilot",
       "m365-copilot-auto",
       "m365-copilot-magic",
@@ -60,10 +61,10 @@ describe("simulated transform mode proxy flow", () => {
       ? (body.models as JsonObject[])
       : [];
     expect(codexModels.map((item) => tryGetString(item, "slug"))).toEqual(ids);
-    expect(codexModels[7]?.shell_type).toBe("shell_command");
-    expect(codexModels[7]?.default_reasoning_level).toBe("xhigh");
-    expect(codexModels[7]?.apply_patch_tool_type).toBe("freeform");
-    expect(codexModels[7]?.supports_parallel_tool_calls).toBe(true);
+    expect(codexModels[8]?.shell_type).toBe("shell_command");
+    expect(codexModels[8]?.default_reasoning_level).toBe("xhigh");
+    expect(codexModels[8]?.apply_patch_tool_type).toBe("freeform");
+    expect(codexModels[8]?.supports_parallel_tool_calls).toBe(true);
   });
 
   test("chat/completions non-stream wraps incoming JSON and returns parsed JSON block", async () => {
