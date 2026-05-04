@@ -43,6 +43,19 @@ const PlaywrightBrowserSchema = z.preprocess(
   ]),
 );
 
+function defaultSubstrateDeviceOS(): string {
+  switch (process.platform) {
+    case "darwin":
+      return "macOS";
+    case "win32":
+      return "Windows";
+    case "linux":
+      return "Linux";
+    default:
+      return process.platform || "Unknown";
+  }
+}
+
 const WrapperOptionsSchema = z.object({
   listenUrl: z.string().default("http://localhost:4000"),
   debugPath: z.string().nullable().default("./Logs"),
@@ -76,28 +89,44 @@ const WrapperOptionsSchema = z.object({
       agentHost: z.string().nullable().default("Bizchat.FullScreen"),
       licenseType: z.string().nullable().default("Starter"),
       agent: z.string().nullable().default("web"),
-      variants: z.string().nullable().default(null),
-      clientPlatform: z.string().default("web"),
+      variants: z
+        .string()
+        .nullable()
+        .default(
+          "EnableMcpServerWidgets,feature.EnableMcpServerWidgets,feature.EnableLuForChatCIQ,feature.enableChatCIQPlugin,EnableRequestPlugins,feature.EnableSensitivityLabels,EnableUnsupportedUrlDetector,feature.IsCustomEngineCopilotEnabled,feature.bizchatfluxv3,feature.enablechatpages,feature.enableCodeCanvas,feature.turnOnWorkTabRecommendation,feature.turnOnDARecommendation,feature.IsStreamingModeInChatRequestEnabled,IncludeSourceAttributionsConcise,SkipPublishEmptyMessage,feature.EnableDeduplicatingSourceAttributions,Enable3PActionProgressMessages,feature.EnableCIQDesktopDisplay,feature.enableClientWebRtc,feature.EnableMeetingRecapOfSeriesMeetingWithCiq,feature.EnableReferencesListCompleteSignal,feature.StorageMessageSplitDisabled,feature.EnableCuaTakeControlApi,SingletonEnvOn,feature.cwcallowedos,feature.EnableMergingPureDeltas,feature.disabledisallowedmsgs,feature.enableCitationsForSynthesisData,feature.EnableConversationShareApis,feature.enableGenerateGraphicArtOptionsSet,cdximagen,feature.EnableUpdatedUXForConfirmationDialog,feature.EnableContentApiandDocTypeHtmlInRichAnswers,cdxgrounding_api_v2_rich_web_answers_reference_bottom_force,cdxenablerenderforisocomp,feature.EnableClientFileURLSupportForOfficeWebPaidCopilot,feature.EnableDesignEditorImageGrounding,feature.EnableDesignerEditor,feature.EnableSkipRehydrationForSpeCIdImages,feature.EnableSkipEmittingMessageOnFlush,feature.EnableRemoveEmptySourceAttributions,feature.EnableRemoveStreamingMode,feature.OfficeWebToHelix,feature.OfficeDesktopToHelix,feature.M365TeamsHubToHelix,feature.OwaHubToHelix,feature.MonarchHubToHelix,feature.Win32OutlookHubToHelix,feature.MacOutlookHubToHelix,Agt_bizchat_enableGpt5ForHelix",
+        ),
+      clientPlatform: z.string().default("mcmcopilot-web"),
+      clientAppName: z.string().default("Office"),
+      clientEntrypoint: z.string().default("mcmcopilot-officeweb"),
+      clientAppType: z.string().default("Web"),
+      productEntryPoint: z.string().default("ChatPanel"),
+      productCategory: z.string().default("Chat"),
+      deviceOS: z.string().default(defaultSubstrateDeviceOS()),
+      deviceType: z.string().default("Desktop"),
       productThreadType: z.string().default("Office"),
       invocationTimeoutSeconds: z.number().int().default(120),
       keepAliveSeconds: z.number().int().default(15),
       optionsSets: z
         .array(z.string())
         .default([
-          "enterprise_flux_web",
-          "enterprise_flux_work",
-          "enable_request_response_interstitials",
-          "enterprise_flux_image_v1",
-          "enterprise_toolbox_with_skdsstore",
-          "enterprise_toolbox_with_skdsstore_search_message_extensions",
-          "enable_ME_auth_interstitial",
-          "skdsstorethirdparty",
-          "enable_confirmation_interstitial",
-          "enable_plugin_auth_interstitial",
-          "enable_response_action_processing",
-          "enterprise_flux_work_gptv",
-          "enterprise_flux_work_code_interpreter",
+          "search_result_progress_messages_with_search_queries",
+          "cwc_flux_image",
+          "cwc_code_interpreter",
+          "cwc_code_interpreter_amsfix",
+          "cwcfluxgptv",
+          "flux_v3_gptv_enable_upload_multi_image_in_turn_wo_ch",
+          "gptvnorm2048",
+          "cwc_code_interpreter_citation_fix",
+          "code_interpreter_interactive_charts",
+          "cwc_code_interpreter_interactive_charts_inline_image",
+          "code_interpreter_matplotlib_patching",
+          "cwc_fileupload_odb",
+          "update_memory_plugin",
+          "add_custom_instructions",
+          "cwc_flux_v3",
+          "flux_v3_progress_messages",
           "enable_batch_token_processing",
+          "enable_gg_gpt",
         ]),
       allowedMessageTypes: z
         .array(z.string())
@@ -105,17 +134,33 @@ const WrapperOptionsSchema = z.object({
           "Chat",
           "Suggestion",
           "InternalSearchQuery",
-          "InternalSearchResult",
           "Disengaged",
           "InternalLoaderMessage",
+          "Progress",
+          "GeneratedCode",
           "RenderCardRequest",
           "AdsQuery",
           "SemanticSerp",
           "GenerateContentQuery",
+          "GenerateGraphicArt",
           "SearchQuery",
           "ConfirmationCard",
           "AuthError",
           "DeveloperLogs",
+          "TriggerPlugin",
+          "HintInvocation",
+          "MemoryUpdate",
+          "EndOfRequest",
+          "TriggerConfirmation",
+          "ResumeInvokeAction",
+          "ResumeUserInputRequest",
+          "TriggerUserInputRequest",
+          "EscapeHatch",
+          "TriggerPluginAuth",
+          "ResumePluginAuth",
+          "SideBySide",
+          "ReferencesListComplete",
+          "SwitchRespondingEndpoint",
         ]),
       invocationTarget: z.string().default("chat"),
       invocationType: z.number().int().default(4),

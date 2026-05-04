@@ -50,10 +50,20 @@ describe("simulated transform mode proxy flow", () => {
       "m365-copilot-gpt5.2-reasoning",
       "m365-copilot-gpt5.4-quick",
       "m365-copilot-gpt5.4-reasoning",
+      "m365-copilot-gpt5.5-quick",
+      "m365-copilot-gpt5.5-reasoning",
       "m365-copilot",
       "m365-copilot-auto",
       "m365-copilot-magic",
     ]);
+    const codexModels = Array.isArray(body.models)
+      ? (body.models as JsonObject[])
+      : [];
+    expect(codexModels.map((item) => tryGetString(item, "slug"))).toEqual(ids);
+    expect(codexModels[7]?.shell_type).toBe("shell_command");
+    expect(codexModels[7]?.default_reasoning_level).toBe("xhigh");
+    expect(codexModels[7]?.apply_patch_tool_type).toBe("freeform");
+    expect(codexModels[7]?.supports_parallel_tool_calls).toBe(true);
   });
 
   test("chat/completions non-stream wraps incoming JSON and returns parsed JSON block", async () => {
@@ -1877,6 +1887,12 @@ describe("simulated transform mode proxy flow", () => {
       "Tool calls are supported here: emit assistant tool calls when appropriate.",
     );
     expect(capturedPrompt).toContain(
+      "If the request requires local files, shell state, or any other local environment access, emit an appropriate tool call instead of saying the environment is inaccessible.",
+    );
+    expect(capturedPrompt).toContain(
+      "Do not claim you inspected, changed, or verified local files unless the response includes the matching tool call.",
+    );
+    expect(capturedPrompt).toContain(
       "Do not refuse by saying tool invocation is unsupported.",
     );
     expect(capturedPrompt).toContain(
@@ -1884,6 +1900,81 @@ describe("simulated transform mode proxy flow", () => {
     );
     expect(capturedPrompt).toContain(
       "This request requires at least one tool call.",
+    );
+  });
+
+  test("responses simulated prompt requires tool calls for initial local file tasks", async () => {
+    let capturedPrompt = "";
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        capturedPrompt = readPrompt(payload);
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            id: "resp_tool_required",
+            object: "response",
+            created_at: 1700000000,
+            status: "completed",
+            model: "simulated-model",
+            output: [
+              {
+                type: "function_call",
+                call_id: "call_1",
+                name: "exec_command",
+                arguments: "{\"cmd\":\"cat seed.md\"}",
+              },
+            ],
+          }),
+        );
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: [
+            {
+              type: "message",
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: "Use local shell/file tools. Read seed.md and write result.md.",
+                },
+              ],
+            },
+          ],
+          tools: [
+            {
+              type: "function",
+              name: "exec_command",
+              description: "Run a command",
+              parameters: {
+                type: "object",
+                properties: { cmd: { type: "string" } },
+                required: ["cmd"],
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(capturedPrompt).toContain(
+      "The latest user request needs local workspace access and this request has no prior tool result, so this response must include at least one tool call.",
+    );
+    expect(capturedPrompt).toContain(
+      "Do not return a message-only response for this turn.",
     );
   });
 

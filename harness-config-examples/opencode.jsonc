@@ -55,6 +55,16 @@
           "name": "GPT-5.4 | Reasoning | Completions [365Pilot]",
           "tool_call": true,
           "reasoning": true
+        },
+        "m365-copilot-gpt5.5-quick": {
+          "name": "GPT-5.5 | Quick | Completions [365Pilot]",
+          "tool_call": true,
+          "reasoning": false
+        },
+        "m365-copilot-gpt5.5-reasoning": {
+          "name": "GPT-5.5 | Reasoning | Completions [365Pilot]",
+          "tool_call": true,
+          "reasoning": true
         }
       }
     },
@@ -98,6 +108,16 @@
         },
         "m365-copilot-gpt5.4-reasoning": {
           "name": "GPT-5.4 | Reasoning | Responses [365Pilot]",
+          "tool_call": true,
+          "reasoning": true
+        },
+        "m365-copilot-gpt5.5-quick": {
+          "name": "GPT-5.5 | Quick | Responses [365Pilot]",
+          "tool_call": true,
+          "reasoning": false
+        },
+        "m365-copilot-gpt5.5-reasoning": {
+          "name": "GPT-5.5 | Reasoning | Responses [365Pilot]",
           "tool_call": true,
           "reasoning": true
         }

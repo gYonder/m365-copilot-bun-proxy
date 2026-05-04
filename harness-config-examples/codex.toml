@@ -1,0 +1,13 @@
+# Append this to ~/.codex/config.toml, or pass the same values with `codex -c`.
+
+[model_providers.m365-copilot-bun-proxy]
+name = "M365 Copilot Bun Proxy"
+base_url = "http://localhost:4000/v1"
+wire_api = "responses"
+
+[profiles.m365-copilot]
+model_provider = "m365-copilot-bun-proxy"
+model = "m365-copilot-gpt5.5-reasoning"
+model_reasoning_effort = "xhigh"
+approval_policy = "never"
+sandbox_mode = "workspace-write"

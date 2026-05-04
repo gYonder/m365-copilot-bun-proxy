@@ -20,7 +20,26 @@ bun install
 Example harness configuration files live in `harness-config-examples/`.
 
 - `harness-config-examples/opencode.jsonc` provides a ready-to-use OpenCode config wired to this proxy on `http://localhost:4000/v1/`.
+- `harness-config-examples/codex.toml` provides a Codex CLI profile using the Responses API wire format.
 - Copy and adapt these examples for your local harness setup.
+
+### Codex CLI
+
+Start the proxy, then add the sample provider/profile from `harness-config-examples/codex.toml` to `~/.codex/config.toml` or pass the same values with `-c` overrides:
+
+```bash
+codex exec \
+  --skip-git-repo-check \
+  --cd /path/to/workspace \
+  --sandbox workspace-write \
+  -c 'approval_policy="never"' \
+  -c 'model_providers.m365-copilot-bun-proxy={ name = "M365 Copilot Bun Proxy", base_url = "http://localhost:4000/v1", wire_api="responses" }' \
+  -c 'model_provider="m365-copilot-bun-proxy"' \
+  -m m365-copilot-gpt5.5-reasoning \
+  'Read notes.md and write a short markdown summary to summary.md.'
+```
+
+The proxy returns both OpenAI-compatible `/v1/models` data and Codex-compatible model metadata. It also accepts both Chat Completions tool definitions (`function.name`) and Responses API tool definitions (`name` at the tool top level), which is required for Codex local shell/file tool calls.
 
 ## Run proxy
 
@@ -150,6 +169,8 @@ The proxy accepts any OpenAI-compatible `model` string, but for Substrate transp
 - "GPT5.2 Think deeper" => `Gpt_5_2_Reasoning`
 - "GPT5.4 Quick" => `Gpt_5_4_Chat`
 - "GPT5.4 Think deeper" => `Gpt_5_4_Reasoning`
+- "GPT5.5 Quick" => `Gpt_5_5_Chat`
+- "GPT5.5 Think deeper" => `Gpt_5_5_Reasoning`
 
 Model to Substrate `tone` mapping:
 
@@ -163,11 +184,14 @@ Model to Substrate `tone` mapping:
 - `m365-copilot-gpt5.2-reasoning` -> `Gpt_5_2_Reasoning`
 - `m365-copilot-gpt5.4-quick` -> `Gpt_5_4_Chat`
 - `m365-copilot-gpt5.4-reasoning` -> `Gpt_5_4_Reasoning`
+- `m365-copilot-gpt5.5-quick` -> `Gpt_5_5_Chat`
+- `m365-copilot-gpt5.5-reasoning` -> `Gpt_5_5_Reasoning`
 
 Notes:
 
 - If `model` is omitted, the proxy uses `defaultModel` from config (defaults to `m365-copilot`).
 - `GET /v1/models` (and `GET /openai/v1/models`) returns the full supported model list above.
+- The GPT-5.5 reasoning tone (`Gpt_5_5_Reasoning`) and updated Substrate defaults are based on current Microsoft 365 Copilot web traffic captured in May 2026.
 
 ## Chat Completions Tool Calling
 

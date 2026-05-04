@@ -282,7 +282,7 @@ function captureSubstrateToken(page) {
       const url = ws.url();
       if (!SUBSTRATE_WS_PATTERN.test(url)) return;
 
-      console.log(`[playwright] Substrate WebSocket detected: ${url.slice(0, 120)}`);
+      console.log("[playwright] Substrate WebSocket detected.");
       try {
         const token = new URL(url).searchParams.get("access_token");
         if (token) {

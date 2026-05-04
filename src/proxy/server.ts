@@ -104,10 +104,15 @@ const AvailableModelIds = [
   "m365-copilot-gpt5.2-reasoning",
   "m365-copilot-gpt5.4-quick",
   "m365-copilot-gpt5.4-reasoning",
+  "m365-copilot-gpt5.5-quick",
+  "m365-copilot-gpt5.5-reasoning",
   "m365-copilot",
   "m365-copilot-auto",
   "m365-copilot-magic",
 ] as const;
+
+const CodexBaseInstructions =
+  "You are Codex, a coding agent running in a local CLI. You and the user share the same workspace. Use the available shell/file tools to inspect and change files when a task requires local state, and verify the result before claiming it is done.";
 
 export function createProxyApp(services: Services): Hono {
   const app = new Hono();
@@ -155,6 +160,42 @@ function buildModelsResponse(): JsonObject {
       created: 0,
       owned_by: "microsoft-365-copilot",
     })),
+    models: AvailableModelIds.map((id, index) => buildCodexModelInfo(id, index)),
+  };
+}
+
+function buildCodexModelInfo(id: (typeof AvailableModelIds)[number], index: number): JsonObject {
+  const isReasoning = id.endsWith("-reasoning") || id === "m365-copilot";
+  const supportedReasoningLevels = isReasoning
+    ? [
+        { effort: "medium", description: "Balanced reasoning" },
+        { effort: "high", description: "Deeper reasoning" },
+        { effort: "xhigh", description: "Maximum reasoning" },
+      ]
+    : [{ effort: "none", description: "Fast chat" }];
+
+  return {
+    slug: id,
+    display_name: id,
+    description: "Microsoft 365 Copilot via the local Bun proxy",
+    default_reasoning_level: isReasoning ? "xhigh" : "none",
+    supported_reasoning_levels: supportedReasoningLevels,
+    shell_type: "shell_command",
+    visibility: "list",
+    supported_in_api: true,
+    priority: AvailableModelIds.length - index,
+    upgrade: null,
+    base_instructions: CodexBaseInstructions,
+    supports_reasoning_summaries: false,
+    support_verbosity: true,
+    default_verbosity: "low",
+    apply_patch_tool_type: "freeform",
+    truncation_policy: { mode: "tokens", limit: 10_000 },
+    supports_parallel_tool_calls: true,
+    supports_image_detail_original: false,
+    context_window: 272_000,
+    experimental_supported_tools: [],
+    input_modalities: ["text"],
   };
 }
 

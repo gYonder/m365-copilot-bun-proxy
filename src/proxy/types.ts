@@ -183,6 +183,13 @@ export type SubstrateOptions = {
   agent: string | null;
   variants: string | null;
   clientPlatform: string;
+  clientAppName?: string;
+  clientEntrypoint?: string;
+  clientAppType?: string;
+  productEntryPoint?: string;
+  productCategory?: string;
+  deviceOS?: string;
+  deviceType?: string;
   productThreadType: string;
   invocationTimeoutSeconds: number;
   keepAliveSeconds: number;

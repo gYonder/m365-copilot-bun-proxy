@@ -681,11 +681,33 @@ export function buildInvocationPayload(
     conversationId,
     traceId: randomUUID().replaceAll("-", ""),
     isStartOfSession,
+    streamingMode: "ConciseWithPadding",
+    spokenTextMode: "None",
+    options: {},
+    extraExtensionParameters: {},
+    sliceIds: [],
+    threadLevelGptId: {},
     productThreadType: options.substrate.productThreadType?.trim() || "Office",
     clientInfo: {
-      clientPlatform: options.substrate.clientPlatform?.trim() || "web",
+      clientPlatform:
+        options.substrate.clientPlatform?.trim() || "mcmcopilot-web",
+      clientAppName: options.substrate.clientAppName?.trim() || "Office",
+      clientEntrypoint:
+        options.substrate.clientEntrypoint?.trim() ||
+        "mcmcopilot-officeweb",
+      clientSessionId: sessionId,
+      ProductCategory: options.substrate.productCategory?.trim() || "Chat",
+      clientAppType: options.substrate.clientAppType?.trim() || "Web",
+      productEntryPoint:
+        options.substrate.productEntryPoint?.trim() || "ChatPanel",
+      deviceOS: options.substrate.deviceOS?.trim() || "Unknown",
+      deviceType: options.substrate.deviceType?.trim() || "Desktop",
     },
     message,
+    plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }],
+    isSbsSupported: true,
+    renderReferencesBehindEOS: true,
+    disconnectBehavior: "continue",
   };
 
   if (options.substrate.optionsSets.length > 0) {
@@ -728,6 +750,10 @@ export function resolveSubstrateTone(model: string | null | undefined): string {
       return "Gpt_5_4_Chat";
     case "m365-copilot-gpt5.4-reasoning":
       return "Gpt_5_4_Reasoning";
+    case "m365-copilot-gpt5.5-quick":
+      return "Gpt_5_5_Chat";
+    case "m365-copilot-gpt5.5-reasoning":
+      return "Gpt_5_5_Reasoning";
     case "m365-copilot":
     case "m365-copilot-auto":
     case "m365-copilot-magic":

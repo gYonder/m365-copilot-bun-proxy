@@ -415,6 +415,11 @@ function buildSimulatedPrompt(
   ];
 
   if (tooling.tools.length > 0) {
+    lines.push(
+      "You are producing a response for a local harness that will execute tool calls.",
+      "If the request requires local files, shell state, or any other local environment access, emit an appropriate tool call instead of saying the environment is inaccessible.",
+      "Do not claim you inspected, changed, or verified local files unless the response includes the matching tool call.",
+    );
     if (endpointFormat === "chat.completions") {
       lines.push(
         "Tool calls are supported here: emit assistant tool calls when appropriate.",
@@ -439,6 +444,11 @@ function buildSimulatedPrompt(
       lines.push(
         "This request requires at least one tool call. Do not return a plain-text-only assistant response.",
       );
+    } else if (shouldRequireInitialLocalToolCall(requestJson, tooling)) {
+      lines.push(
+        "The latest user request needs local workspace access and this request has no prior tool result, so this response must include at least one tool call.",
+        "Do not return a message-only response for this turn.",
+      );
     } else if (
       tooling.toolChoiceMode === ToolChoiceModes.Function &&
       tooling.toolChoiceFunctionName
@@ -451,6 +461,102 @@ function buildSimulatedPrompt(
 
   lines.push("```json", serializedRequest, "```");
   return lines.join("\n");
+}
+
+function shouldRequireInitialLocalToolCall(
+  requestJson: JsonObject,
+  tooling: OpenAiTooling,
+): boolean {
+  if (
+    tooling.tools.length === 0 ||
+    tooling.toolChoiceMode === ToolChoiceModes.None ||
+    tooling.toolChoiceMode === ToolChoiceModes.Required ||
+    tooling.toolChoiceMode === ToolChoiceModes.Function
+  ) {
+    return false;
+  }
+  if (hasPriorToolResult(requestJson)) {
+    return false;
+  }
+
+  const latestUserText = extractLatestUserText(requestJson).toLowerCase();
+  if (!latestUserText.trim()) {
+    return false;
+  }
+  const hasLocalAction = /\b(local shell\/file tools|local shell|file tools|read|inspect|write|create|edit|modify|delete|verify|cat|list)\b/.test(
+    latestUserText,
+  );
+  const hasLocalTarget = /\b(file|files|workspace|shell|markdown|md|txt)\b|\.[a-z0-9]{1,8}\b/.test(
+    latestUserText,
+  );
+  return hasLocalAction && hasLocalTarget;
+}
+
+function hasPriorToolResult(requestJson: JsonObject): boolean {
+  const input = requestJson.input;
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!isJsonObject(item)) {
+        continue;
+      }
+      const type = (tryGetString(item, "type") ?? "").toLowerCase();
+      if (type === "function_call_output") {
+        return true;
+      }
+    }
+  }
+
+  const messages = requestJson.messages;
+  if (Array.isArray(messages)) {
+    for (const message of messages) {
+      if (!isJsonObject(message)) {
+        continue;
+      }
+      const role = (tryGetString(message, "role") ?? "").toLowerCase();
+      if (role === "tool") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function extractLatestUserText(requestJson: JsonObject): string {
+  const input = requestJson.input;
+  if (typeof input === "string") {
+    return input;
+  }
+  if (Array.isArray(input)) {
+    for (let i = input.length - 1; i >= 0; i--) {
+      const item = input[i];
+      if (typeof item === "string" && item.trim()) {
+        return item;
+      }
+      if (!isJsonObject(item)) {
+        continue;
+      }
+      const type = (tryGetString(item, "type") ?? "message").toLowerCase();
+      const role = (tryGetString(item, "role") ?? "user").toLowerCase();
+      if (type === "message" && role === "user") {
+        return extractMessageContent(item.content, role);
+      }
+    }
+  }
+
+  const messages = requestJson.messages;
+  if (Array.isArray(messages)) {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const message = messages[i];
+      if (!isJsonObject(message)) {
+        continue;
+      }
+      const role = (tryGetString(message, "role") ?? "user").toLowerCase();
+      if (role === "user") {
+        return extractMessageContent(message.content, role);
+      }
+    }
+  }
+  return "";
 }
 
 function resolvePrompt(
@@ -874,10 +980,9 @@ function parseTooling(requestJson: JsonObject): OpenAiTooling {
       if (type?.toLowerCase() !== "function") {
         continue;
       }
-      const functionObject = toolNode.function;
-      if (!isJsonObject(functionObject)) {
-        continue;
-      }
+      const functionObject = isJsonObject(toolNode.function)
+        ? toolNode.function
+        : toolNode;
       const name = tryGetString(functionObject, "name");
       if (!name) {
         continue;

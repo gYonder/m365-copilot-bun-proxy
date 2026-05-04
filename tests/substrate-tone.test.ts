@@ -34,6 +34,18 @@ describe("resolveSubstrateTone", () => {
     );
   });
 
+  test("maps gpt 5.5 quick model to Gpt_5_5_Chat tone", () => {
+    expect(resolveSubstrateTone("m365-copilot-gpt5.5-quick")).toBe(
+      "Gpt_5_5_Chat",
+    );
+  });
+
+  test("maps gpt 5.5 reasoning model to Gpt_5_5_Reasoning tone", () => {
+    expect(resolveSubstrateTone("m365-copilot-gpt5.5-reasoning")).toBe(
+      "Gpt_5_5_Reasoning",
+    );
+  });
+
   test("maps magic-family models to magic tone", () => {
     expect(resolveSubstrateTone("m365-copilot")).toBe("magic");
     expect(resolveSubstrateTone("m365-copilot-auto")).toBe("magic");
@@ -54,6 +66,9 @@ describe("resolveSubstrateTone", () => {
     );
     expect(resolveSubstrateTone("M365-COPILOT-GPT5.4-REASONING")).toBe(
       "Gpt_5_4_Reasoning",
+    );
+    expect(resolveSubstrateTone("M365-COPILOT-GPT5.5-REASONING")).toBe(
+      "Gpt_5_5_Reasoning",
     );
   });
 });
