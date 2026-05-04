@@ -19,6 +19,9 @@ export async function fetchTokenWithPlaywright(
   options?: {
     quiet?: boolean;
     browser?: PlaywrightBrowserName;
+    headless?: boolean;
+    loginTimeoutMs?: number;
+    tokenTimeoutMs?: number;
   },
 ): Promise<void> {
   const runnerPath = await resolveNodeRunnerPath();
@@ -27,7 +30,12 @@ export async function fetchTokenWithPlaywright(
     tokenPath,
     storageStatePath,
     options?.browser ?? DEFAULT_PLAYWRIGHT_BROWSER,
-    options?.quiet ?? false,
+    {
+      quiet: options?.quiet ?? false,
+      headless: options?.headless ?? false,
+      loginTimeoutMs: options?.loginTimeoutMs,
+      tokenTimeoutMs: options?.tokenTimeoutMs,
+    },
   );
 }
 
@@ -60,20 +68,36 @@ function runNodePlaywrightFetch(
   tokenPath: string,
   storageStatePath: string,
   browser: PlaywrightBrowserName,
-  quiet: boolean,
+  options: {
+    quiet: boolean;
+    headless: boolean;
+    loginTimeoutMs?: number;
+    tokenTimeoutMs?: number;
+  },
 ): Promise<void> {
   return new Promise((resolve, reject) => {
+    const args = [
+      runnerPath,
+      "--token-path",
+      tokenPath,
+      "--storage-state-path",
+      storageStatePath,
+      "--browser",
+      browser,
+    ];
+    if (options.headless) {
+      args.push("--headless");
+    }
+    if (options.loginTimeoutMs !== undefined) {
+      args.push("--login-timeout-ms", String(options.loginTimeoutMs));
+    }
+    if (options.tokenTimeoutMs !== undefined) {
+      args.push("--token-timeout-ms", String(options.tokenTimeoutMs));
+    }
+
     const child = spawn(
       "node",
-      [
-        runnerPath,
-        "--token-path",
-        tokenPath,
-        "--storage-state-path",
-        storageStatePath,
-        "--browser",
-        browser,
-      ],
+      args,
       {
         stdio: "pipe",
         env: process.env,
@@ -91,7 +115,7 @@ function runNodePlaywrightFetch(
     child.stdout?.on("data", (data) => {
       const chunk = String(data);
       pushOutput(chunk);
-      if (!quiet) {
+      if (!options.quiet) {
         process.stdout.write(chunk);
       }
     });
@@ -99,7 +123,7 @@ function runNodePlaywrightFetch(
     child.stderr?.on("data", (data) => {
       const chunk = String(data);
       pushOutput(chunk);
-      if (!quiet) {
+      if (!options.quiet) {
         process.stderr.write(chunk);
       }
     });

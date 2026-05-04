@@ -61,7 +61,7 @@ function showUsage(): number {
   console.log("       bun src/cli/index.ts token clear");
   console.log("       bun src/cli/index.ts token status");
   console.log(
-    "       bun src/cli/index.ts token fetch [--quiet] [--print-token]",
+    "       bun src/cli/index.ts token fetch [--quiet] [--headless] [--login-timeout-ms <ms>] [--token-timeout-ms <ms>] [--print-token]",
   );
   return 0;
 }
@@ -106,6 +106,13 @@ async function runTokenCommand(parsedArgs: ParsedArgs): Promise<number> {
     return 0;
   }
 
+  if (
+    (sub === "fetch" && hasHelpFlag(parsedArgs.options)) ||
+    (sub === "help" && parsedArgs.positionals[2]?.toLowerCase() === "fetch")
+  ) {
+    return showTokenFetchUsage();
+  }
+
   if (sub === "fetch") {
     const quiet =
       parsedArgs.options.quiet !== undefined ||
@@ -113,6 +120,22 @@ async function runTokenCommand(parsedArgs: ParsedArgs): Promise<number> {
     const shouldPrintToken =
       parsedArgs.options["print-token"] !== undefined ||
       parsedArgs.options["show-token"] !== undefined;
+    const headless = parsedArgs.options.headless !== undefined;
+    let loginTimeoutMs: number | undefined;
+    let tokenTimeoutMs: number | undefined;
+    try {
+      loginTimeoutMs = parseOptionalPositiveIntegerOption(
+        parsedArgs.options["login-timeout-ms"],
+        "--login-timeout-ms",
+      );
+      tokenTimeoutMs = parseOptionalPositiveIntegerOption(
+        parsedArgs.options["token-timeout-ms"],
+        "--token-timeout-ms",
+      );
+    } catch (error) {
+      console.error(formatError(error));
+      return 1;
+    }
 
     if (!quiet) {
       console.log("[token fetch] Starting Playwright token capture...");
@@ -125,6 +148,9 @@ async function runTokenCommand(parsedArgs: ParsedArgs): Promise<number> {
     try {
       await fetchTokenWithPlaywright(tokenPath, storageStatePath, {
         quiet,
+        headless,
+        loginTimeoutMs,
+        tokenTimeoutMs,
       });
       if (shouldPrintToken) {
         const tokenState = await loadToken(tokenPath);
@@ -152,6 +178,25 @@ async function runTokenCommand(parsedArgs: ParsedArgs): Promise<number> {
   }
 
   return showUnknownCommand(`token ${sub}`);
+}
+
+function hasHelpFlag(options: Record<string, string | null>): boolean {
+  return options.help !== undefined || options.h !== undefined;
+}
+
+function showTokenFetchUsage(): number {
+  console.log("Fetch and cache a Microsoft 365 Copilot Substrate token.");
+  console.log(
+    "Usage: bun src/cli/index.ts token fetch [--quiet] [--headless] [--login-timeout-ms <ms>] [--token-timeout-ms <ms>] [--print-token]",
+  );
+  console.log("");
+  console.log("Options:");
+  console.log("  --headless             Try saved browser state without showing a browser window.");
+  console.log("  --login-timeout-ms     Time to wait for interactive login in headed mode.");
+  console.log("  --token-timeout-ms     Time to wait for the Substrate WebSocket token.");
+  console.log("  --quiet                Suppress Playwright progress output.");
+  console.log("  --print-token          Print the raw token after capture. Avoid unless debugging.");
+  return 0;
 }
 
 async function runStatusCommand(
@@ -935,6 +980,20 @@ function parseArgs(args: string[]): ParsedArgs {
   }
 
   return { positionals, options };
+}
+
+function parseOptionalPositiveIntegerOption(
+  raw: string | null | undefined,
+  name: string,
+): number | undefined {
+  if (raw === undefined || raw === null || !raw.trim()) {
+    return undefined;
+  }
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+  return value;
 }
 
 function resolveApiMode(options: Record<string, string | null>): ApiMode {

@@ -92,6 +92,14 @@ Substrate settings are grouped under the `substrate` object in config (for examp
 
 `temporaryChat` (default `true`) enables temporary-chat mode for Substrate by appending `disableMemory=1` to the websocket hub URL query string. This will prevent Copilot from showing your conversation history in the sidebar.
 
+For proactive token refresh without opening a browser window, run:
+
+```bash
+bun src/cli/index.ts token fetch --headless --quiet
+```
+
+Headless token fetch uses the saved Playwright browser state, opens M365 Copilot in temporary-chat mode, sends a tiny message to trigger the Substrate websocket, and stores the captured token locally. If Microsoft requires interactive sign-in, rerun without `--headless` and complete the browser login.
+
 `openAiTransformMode` controls how requests are translated for M365 Copilot:
 
 - `simulated` (default): sends the full incoming OpenAI JSON payload as a markdown JSON block and asks Copilot to respond in the same endpoint format; proxy extracts JSON from the response block and returns it.
@@ -334,6 +342,7 @@ bun run cli -- status
 bun run cli -- chat
 bun run cli -- chat --api responses
 bun run cli -- token set --token "<jwt>"
+bun src/cli/index.ts token fetch --headless --quiet
 ```
 
 By default, CLI chat requests do not send an Authorization header. The proxy handles token acquisition when needed. Use `--token` or `YARPILOT_TOKEN` only when you want to force a specific token from the CLI.

@@ -22,8 +22,8 @@ const SUPPORTED_BROWSERS = new Set([
   "webkit",
 ]);
 
-const TOKEN_TIMEOUT_MS = 120_000;
-const LOGIN_TIMEOUT_MS = 300_000;
+const DEFAULT_TOKEN_TIMEOUT_MS = 120_000;
+const DEFAULT_LOGIN_TIMEOUT_MS = 300_000;
 
 if (isMainModule(process.argv[1])) {
   await runCli();
@@ -45,6 +45,15 @@ async function runCli() {
   const tokenPath = parsed["token-path"];
   const storageStatePath = parsed["storage-state-path"];
   const requestedBrowser = normalizeBrowserName(parsed.browser ?? "edge");
+  const headless = parsed.headless !== undefined;
+  const loginTimeoutMs = parsePositiveIntegerOption(
+    parsed["login-timeout-ms"],
+    DEFAULT_LOGIN_TIMEOUT_MS,
+  );
+  const tokenTimeoutMs = parsePositiveIntegerOption(
+    parsed["token-timeout-ms"],
+    DEFAULT_TOKEN_TIMEOUT_MS,
+  );
 
   if (!tokenPath || !storageStatePath || !requestedBrowser) {
     const browserHelp = [...SUPPORTED_BROWSERS].join(", ");
@@ -54,18 +63,24 @@ async function runCli() {
     process.exit(2);
   }
 
-  await fetchTokenWithPlaywrightNode(tokenPath, storageStatePath, requestedBrowser);
+  await fetchTokenWithPlaywrightNode(tokenPath, storageStatePath, requestedBrowser, {
+    headless,
+    loginTimeoutMs,
+    tokenTimeoutMs,
+  });
 }
 
 async function fetchTokenWithPlaywrightNode(
   tokenPath,
   storageStatePath,
   browserName,
+  options,
 ) {
+  const mode = options.headless ? "headless" : "headed";
   console.log(
-    `[playwright] Launching ${browserName} under Node.js (headed)...`,
+    `[playwright] Launching ${browserName} under Node.js (${mode})...`,
   );
-  const browser = await launchBrowser(browserName);
+  const browser = await launchBrowser(browserName, options.headless);
   const storageStateExists = await fileExists(storageStatePath);
   const context = await browser.newContext(
     storageStateExists ? { storageState: storageStatePath } : {},
@@ -79,64 +94,103 @@ async function fetchTokenWithPlaywrightNode(
     const page = await context.newPage();
     await page.bringToFront().catch(() => {});
     console.log(`[playwright] Page URL: ${page.url()}`);
-
-    const tokenPromise = captureSubstrateToken(page);
-
-    console.log(`[playwright] Navigating to ${CHAT_URL}`);
-    await page.goto(CHAT_URL, {
-      waitUntil: "domcontentloaded",
-      timeout: 60_000,
-    });
-    console.log(`[playwright] Landed on: ${page.url()}`);
-
-    if (LOGIN_HOST_PATTERN.test(page.url())) {
-      console.log("[playwright] Login required - sign in in the browser window.");
-      await page.waitForURL(CHAT_URL_GLOB, { timeout: LOGIN_TIMEOUT_MS });
-      console.log(`[playwright] Login complete: ${page.url()}`);
-    } else {
-      console.log("[playwright] Already logged in.");
-    }
+    const tokenCapture = captureSubstrateToken(page, options.tokenTimeoutMs);
+    tokenCapture.promise.catch(() => {});
 
     try {
-      const editor = page.locator("#m365-chat-editor-target-element");
-      await editor.waitFor({ state: "visible", timeout: 20_000 });
-      console.log("[playwright] Sending message to trigger WebSocket...");
-      await editor.fill("Hi");
-      await page.waitForTimeout(1_000);
+      console.log(`[playwright] Navigating to ${CHAT_URL}`);
+      await page.goto(CHAT_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 60_000,
+      });
+      console.log(`[playwright] Landed on: ${page.url()}`);
 
-      const sendButton = page
-        .locator('button[title="Send"], [role="button"][title="Send"], [title="Send"]')
-        .first();
-      try {
-        await sendButton.waitFor({ state: "visible", timeout: 10_000 });
-        await sendButton.click({ timeout: 10_000 });
-        console.log("[playwright] Send button clicked.");
-      } catch {
-        await page.keyboard.press("Enter");
-        console.log("[playwright] Send button unavailable, submitted with Enter.");
+      if (LOGIN_HOST_PATTERN.test(page.url())) {
+        if (options.headless) {
+          throw new Error(
+            "Microsoft login is required; headless token capture cannot complete interactive sign-in.",
+          );
+        }
+        console.log("[playwright] Login required - sign in in the browser window.");
+        await page.waitForURL(CHAT_URL_GLOB, { timeout: options.loginTimeoutMs });
+        console.log(`[playwright] Login complete: ${page.url()}`);
+      } else {
+        console.log("[playwright] Already logged in.");
       }
-    } catch {
+
+      await page
+        .locator('[data-testid="newChatButton"], button[aria-label="New chat"]')
+        .first()
+        .click({ timeout: 5_000 })
+        .catch(() => {});
+
+      try {
+        const editor = page.locator("#m365-chat-editor-target-element");
+        await editor.waitFor({ state: "visible", timeout: 20_000 });
+        console.log("[playwright] Sending message to trigger WebSocket...");
+        await fillChatEditor(page, "Hi");
+        await page.waitForTimeout(1_000);
+
+        const sendButton = page
+          .locator('button[title="Send"], [role="button"][title="Send"], [title="Send"]')
+          .first();
+        try {
+          await sendButton.waitFor({ state: "visible", timeout: 10_000 });
+          await sendButton.click({ timeout: 10_000 });
+          console.log("[playwright] Send button clicked.");
+        } catch {
+          await page.keyboard.press("Enter");
+          console.log("[playwright] Send button unavailable, submitted with Enter.");
+        }
+      } catch {
+        console.log(
+          "[playwright] Chat editor not found - waiting passively for WebSocket...",
+        );
+      }
+
       console.log(
-        "[playwright] Chat editor not found - waiting passively for WebSocket...",
+        `[playwright] Waiting up to ${options.tokenTimeoutMs / 1000}s for token...`,
       );
+      const rawToken = await tokenCapture.promise;
+      console.log("[playwright] Token captured!");
+
+      const expiresAtUtc = tryGetJwtExpiry(rawToken) ?? new Date(Date.now() + 3_600_000);
+      await saveToken(tokenPath, rawToken, expiresAtUtc);
+      await fs.mkdir(path.dirname(storageStatePath), { recursive: true });
+      await context.storageState({ path: storageStatePath });
+      console.log(`[playwright] Browser state saved: ${storageStatePath}`);
+      console.log(`Token saved. Expires: ${expiresAtUtc.toISOString()}`);
+    } finally {
+      tokenCapture.cancel();
     }
-
-    console.log(
-      `[playwright] Waiting up to ${TOKEN_TIMEOUT_MS / 1000}s for token...`,
-    );
-    const rawToken = await tokenPromise;
-    console.log("[playwright] Token captured!");
-
-    const expiresAtUtc = tryGetJwtExpiry(rawToken) ?? new Date(Date.now() + 3_600_000);
-    await saveToken(tokenPath, rawToken, expiresAtUtc);
-    await fs.mkdir(path.dirname(storageStatePath), { recursive: true });
-    await context.storageState({ path: storageStatePath });
-    console.log(`[playwright] Browser state saved: ${storageStatePath}`);
-    console.log(`Token saved. Expires: ${expiresAtUtc.toISOString()}`);
   } finally {
     await context?.close().catch(() => {});
     await browser?.close().catch(() => {});
   }
+}
+
+async function fillChatEditor(page, text) {
+  const focused = await page.evaluate(() => {
+    const editor = document.querySelector("#m365-chat-editor-target-element");
+    if (!editor) {
+      return false;
+    }
+    editor.focus();
+    const target = editor.querySelector("p") ?? editor;
+    const range = document.createRange();
+    range.selectNodeContents(target);
+    range.collapse(false);
+    const selection = window.getSelection();
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+    return true;
+  });
+
+  if (!focused) {
+    throw new Error("M365 chat editor was not found.");
+  }
+
+  await page.keyboard.type(text, { delay: 10 });
 }
 
 async function installSubstrateTemporaryChatShim(context) {
@@ -216,12 +270,12 @@ export function withDisableMemoryForSubstrateHubUrl(inputUrl, baseUrl) {
   return parsed.toString();
 }
 
-async function launchBrowser(browserName) {
+async function launchBrowser(browserName, headless) {
   switch (browserName) {
     case "edge":
       try {
         return await chromium.launch({
-          headless: false,
+          headless,
           channel: "msedge",
           args: CHROMIUM_LAUNCH_ARGS,
         });
@@ -230,14 +284,14 @@ async function launchBrowser(browserName) {
           "[playwright] Edge channel unavailable, falling back to Chromium.",
         );
         return chromium.launch({
-          headless: false,
+          headless,
           args: CHROMIUM_LAUNCH_ARGS,
         });
       }
     case "chrome":
       try {
         return await chromium.launch({
-          headless: false,
+          headless,
           channel: "chrome",
           args: CHROMIUM_LAUNCH_ARGS,
         });
@@ -246,39 +300,51 @@ async function launchBrowser(browserName) {
           "[playwright] Chrome channel unavailable, falling back to Chromium.",
         );
         return chromium.launch({
-          headless: false,
+          headless,
           args: CHROMIUM_LAUNCH_ARGS,
         });
       }
     case "chromium":
       return chromium.launch({
-        headless: false,
+        headless,
         args: CHROMIUM_LAUNCH_ARGS,
       });
     case "firefox":
       return firefox.launch({
-        headless: false,
+        headless,
       });
     case "webkit":
       return webkit.launch({
-        headless: false,
+        headless,
       });
     default:
       throw new Error(`Unsupported browser: ${String(browserName)}`);
   }
 }
 
-function captureSubstrateToken(page) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+function captureSubstrateToken(page, timeoutMs = DEFAULT_TOKEN_TIMEOUT_MS) {
+  let timer;
+  let handler;
+  let settled = false;
+
+  const cleanup = () => {
+    if (timer) clearTimeout(timer);
+    if (handler) page.off("websocket", handler);
+  };
+
+  const promise = new Promise((resolve, reject) => {
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(
         new Error(
-          `Timed out waiting for Substrate WebSocket after ${TOKEN_TIMEOUT_MS / 1000}s. Try running 'token fetch' again.`,
+          `Timed out waiting for Substrate WebSocket after ${timeoutMs / 1000}s. Try running 'token fetch' again.`,
         ),
       );
-    }, TOKEN_TIMEOUT_MS);
+    }, timeoutMs);
 
-    page.on("websocket", (ws) => {
+    handler = (ws) => {
       const url = ws.url();
       if (!SUBSTRATE_WS_PATTERN.test(url)) return;
 
@@ -286,15 +352,28 @@ function captureSubstrateToken(page) {
       try {
         const token = new URL(url).searchParams.get("access_token");
         if (token) {
-          clearTimeout(timer);
+          if (settled) return;
+          settled = true;
+          cleanup();
           console.log("[playwright] access_token extracted.");
           resolve(token);
         }
       } catch {
         // Ignore parse failures from malformed websocket URLs.
       }
-    });
+    };
+
+    page.on("websocket", handler);
   });
+
+  return {
+    promise,
+    cancel() {
+      if (settled) return;
+      settled = true;
+      cleanup();
+    },
+  };
 }
 
 async function saveToken(filePath, token, expiresAtUtc) {
@@ -385,4 +464,12 @@ function normalizeBrowserName(value) {
   }
   const canonical = normalized === "msedge" ? "edge" : normalized;
   return SUPPORTED_BROWSERS.has(canonical) ? canonical : null;
+}
+
+function parsePositiveIntegerOption(value, defaultValue) {
+  if (typeof value !== "string" || !value.trim()) {
+    return defaultValue;
+  }
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
 }
