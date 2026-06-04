@@ -6,6 +6,8 @@ import readline from "node:readline/promises";
 export type TokenState = {
   token: string;
   expiresAtUtc: string;
+  oid?: string;
+  tid?: string;
 };
 
 export type TokenSummary = {
@@ -35,6 +37,8 @@ export async function loadToken(filePath: string): Promise<TokenState | null> {
     const parsed = JSON.parse(content) as {
       token?: string;
       expiresAtUtc?: string;
+      oid?: string;
+      tid?: string;
     };
     if (!parsed.token?.trim() || !parsed.expiresAtUtc?.trim()) {
       return null;
@@ -43,7 +47,12 @@ export async function loadToken(filePath: string): Promise<TokenState | null> {
     if (Number.isNaN(expires.getTime())) {
       return null;
     }
-    return { token: parsed.token.trim(), expiresAtUtc: expires.toISOString() };
+    return {
+      token: parsed.token.trim(),
+      expiresAtUtc: expires.toISOString(),
+      oid: parsed.oid?.trim() || undefined,
+      tid: parsed.tid?.trim() || undefined,
+    };
   } catch {
     return null;
   }
@@ -53,6 +62,10 @@ export async function saveToken(
   filePath: string,
   token: string,
   expiresAtUtc: Date,
+  metadata?: {
+    oid?: string | null;
+    tid?: string | null;
+  },
 ): Promise<void> {
   await fs.writeFile(
     filePath,
@@ -60,6 +73,8 @@ export async function saveToken(
       {
         token,
         expiresAtUtc: expiresAtUtc.toISOString(),
+        ...(metadata?.oid ? { oid: metadata.oid } : {}),
+        ...(metadata?.tid ? { tid: metadata.tid } : {}),
       },
       null,
       2,

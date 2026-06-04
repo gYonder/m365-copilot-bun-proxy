@@ -118,6 +118,43 @@ async function fetchTokenWithPlaywrightNode(
         console.log("[playwright] Already logged in.");
       }
 
+      await maybeHandleAuthDialog(page);
+      await persistBrowserState(context, storageStatePath, "chat landing");
+
+      const storageToken = await waitForStoredSubstrateToken(
+        page,
+        options.tokenTimeoutMs,
+      );
+      if (storageToken) {
+        const jwtExpiry = tryGetJwtExpiry(storageToken.token);
+        if (jwtExpiry) {
+          console.log("[playwright] Token recovered from browser storage.");
+          const expiresAtUtc = storageToken.expiresAtUtc ?? jwtExpiry;
+          await saveToken(tokenPath, storageToken.token, expiresAtUtc, {
+            oid: storageToken.oid ?? null,
+            tid: storageToken.tid ?? null,
+          });
+          await persistBrowserState(context, storageStatePath, "storage token");
+          console.log(`Token saved. Expires: ${expiresAtUtc.toISOString()}`);
+          return;
+        }
+
+        console.log(
+          "[playwright] Browser storage exposed a non-JWT substrate token; keeping browser state and waiting for a websocket token instead.",
+        );
+      }
+
+      const storedClaims = storageToken
+        ? {
+            oid: storageToken.oid ?? null,
+            tid: storageToken.tid ?? null,
+          }
+        : await extractStoredSubstrateAccountClaims(page);
+
+      console.log(
+        "[playwright] No browser-stored substrate token found yet; falling back to WebSocket capture.",
+      );
+
       await page
         .locator('[data-testid="newChatButton"], button[aria-label="New chat"]')
         .first()
@@ -129,18 +166,11 @@ async function fetchTokenWithPlaywrightNode(
         await editor.waitFor({ state: "visible", timeout: 20_000 });
         console.log("[playwright] Sending message to trigger WebSocket...");
         await fillChatEditor(page, "Hi");
-        await page.waitForTimeout(1_000);
-
-        const sendButton = page
-          .locator('button[title="Send"], [role="button"][title="Send"], [title="Send"]')
-          .first();
-        try {
-          await sendButton.waitFor({ state: "visible", timeout: 10_000 });
-          await sendButton.click({ timeout: 10_000 });
-          console.log("[playwright] Send button clicked.");
-        } catch {
-          await page.keyboard.press("Enter");
-          console.log("[playwright] Send button unavailable, submitted with Enter.");
+        const submitted = await trySubmitTriggerMessage(page);
+        if (!submitted) {
+          console.log(
+            "[playwright] Could not verify trigger message submission; waiting passively for WebSocket...",
+          );
         }
       } catch {
         console.log(
@@ -154,11 +184,27 @@ async function fetchTokenWithPlaywrightNode(
       const rawToken = await tokenCapture.promise;
       console.log("[playwright] Token captured!");
 
+      const jwtClaims = tryReadJwtClaims(rawToken);
+      const oid =
+        typeof jwtClaims?.oid === "string" && jwtClaims.oid.trim()
+          ? jwtClaims.oid.trim()
+          : storedClaims?.oid ?? null;
+      const tid =
+        typeof jwtClaims?.tid === "string" && jwtClaims.tid.trim()
+          ? jwtClaims.tid.trim()
+          : storedClaims?.tid ?? null;
+      if (!jwtClaims && (!oid || !tid)) {
+        throw new Error(
+          "Captured websocket token is not a JWT and no reusable oid/tid metadata was available from browser state.",
+        );
+      }
+
       const expiresAtUtc = tryGetJwtExpiry(rawToken) ?? new Date(Date.now() + 3_600_000);
-      await saveToken(tokenPath, rawToken, expiresAtUtc);
-      await fs.mkdir(path.dirname(storageStatePath), { recursive: true });
-      await context.storageState({ path: storageStatePath });
-      console.log(`[playwright] Browser state saved: ${storageStatePath}`);
+      await saveToken(tokenPath, rawToken, expiresAtUtc, {
+        oid,
+        tid,
+      });
+      await persistBrowserState(context, storageStatePath, "token capture");
       console.log(`Token saved. Expires: ${expiresAtUtc.toISOString()}`);
     } finally {
       tokenCapture.cancel();
@@ -170,6 +216,9 @@ async function fetchTokenWithPlaywrightNode(
 }
 
 async function fillChatEditor(page, text) {
+  const editorLocator = page.locator("#m365-chat-editor-target-element");
+  await editorLocator.click({ timeout: 10_000 });
+
   const focused = await page.evaluate(() => {
     const editor = document.querySelector("#m365-chat-editor-target-element");
     if (!editor) {
@@ -191,6 +240,303 @@ async function fillChatEditor(page, text) {
   }
 
   await page.keyboard.type(text, { delay: 10 });
+}
+
+async function maybeHandleAuthDialog(page, timeoutMs = 5_000) {
+  const continueButton = page.getByRole("button", { name: /^continue$/i }).first();
+  try {
+    await continueButton.waitFor({ state: "visible", timeout: timeoutMs });
+  } catch {
+    return false;
+  }
+
+  await continueButton.click({ timeout: 10_000 });
+  console.log("[playwright] Authentication dialog dismissed with Continue.");
+  await continueButton.waitFor({ state: "hidden", timeout: 15_000 }).catch(() => {});
+  await page.waitForTimeout(3_000);
+  return true;
+}
+
+async function waitForStoredSubstrateToken(page, timeoutMs) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    await maybeHandleAuthDialog(page, 500);
+    const token = await extractStoredSubstrateToken(page);
+    if (token) {
+      return token;
+    }
+    await page.waitForTimeout(500);
+  }
+  return null;
+}
+
+async function extractStoredSubstrateToken(page) {
+  return page.evaluate(() => {
+    const now = Date.now();
+    const storages = [window.localStorage, window.sessionStorage];
+    const preferredKeyPatterns = [
+      /https:\/\/substrate\.office\.com\/\.default\|\|$/i,
+      /https:\/\/substrate\.office\.com\/search\/\.default\|\|$/i,
+      /https:\/\/substrate\.office\.com\/sydney\/\.default\|\|$/i,
+      /https:\/\/substrate\.office\.com/i,
+    ];
+
+    const parseDateValue = (value) => {
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return value > 10_000_000_000 ? value : value * 1000;
+      }
+      if (typeof value !== "string" || !value.trim()) {
+        return null;
+      }
+      const asNumber = Number(value);
+      if (Number.isFinite(asNumber)) {
+        return asNumber > 10_000_000_000 ? asNumber : asNumber * 1000;
+      }
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : null;
+    };
+
+    const parseJwtExpiry = (token) => {
+      const parts = token.split(".");
+      if (parts.length < 2) {
+        return null;
+      }
+      try {
+        const normalized = parts[1]
+          .replace(/-/g, "+")
+          .replace(/_/g, "/")
+          .padEnd(parts[1].length + ((4 - (parts[1].length % 4)) % 4), "=");
+        const payload = JSON.parse(atob(normalized));
+        const exp = payload?.exp;
+        if (typeof exp === "number" && Number.isFinite(exp)) {
+          return exp * 1000;
+        }
+        if (typeof exp === "string" && Number.isFinite(Number(exp))) {
+          return Number(exp) * 1000;
+        }
+      } catch {
+        // Ignore invalid JWTs.
+      }
+      return null;
+    };
+
+    const claimSources = [];
+    for (const storage of storages) {
+      for (const key of Object.keys(storage)) {
+        if (!/active-account-filters|account/i.test(key)) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(storage.getItem(key) ?? "{}");
+          const oid =
+            typeof parsed.localAccountId === "string" && parsed.localAccountId.trim()
+              ? parsed.localAccountId.trim()
+              : typeof parsed.homeAccountId === "string" && parsed.homeAccountId.includes(".")
+                ? parsed.homeAccountId.split(".", 1)[0].trim()
+                : null;
+          const tid =
+            typeof parsed.tenantId === "string" && parsed.tenantId.trim()
+              ? parsed.tenantId.trim()
+              : typeof parsed.realm === "string" && parsed.realm.trim()
+                ? parsed.realm.trim()
+                : null;
+          if (oid && tid) {
+            claimSources.push({ oid, tid });
+          }
+        } catch {
+          // Ignore malformed account metadata.
+        }
+      }
+    }
+    const preferredClaims =
+      claimSources.find((candidate) => candidate.oid && candidate.tid) ?? null;
+
+    const candidates = [];
+    for (const storage of storages) {
+      const keys = Object.keys(storage).filter(
+        (key) => key.includes("accesstoken") && key.includes("substrate.office.com"),
+      );
+      for (const matchingKey of keys) {
+        try {
+          const parsed = JSON.parse(storage.getItem(matchingKey) ?? "{}");
+          const token =
+            typeof parsed.secret === "string"
+              ? parsed.secret.trim()
+              : typeof parsed.data === "string"
+                ? parsed.data.trim()
+                : "";
+          if (token.length > 100) {
+            const explicitExpiry =
+              parseDateValue(parsed.expiresOn) ??
+              parseDateValue(parsed.expires_on) ??
+              parseDateValue(parsed.expiresAtUtc) ??
+              parseJwtExpiry(token);
+            const updatedAt =
+              parseDateValue(parsed.lastUpdatedAt) ??
+              parseDateValue(parsed.cachedAt) ??
+              0;
+            const preference =
+              preferredKeyPatterns.findIndex((pattern) => pattern.test(matchingKey));
+            candidates.push({
+              token,
+              expiresAtMs: explicitExpiry,
+              updatedAtMs: updatedAt,
+              preference: preference === -1 ? preferredKeyPatterns.length : preference,
+              oid: preferredClaims?.oid ?? null,
+              tid: preferredClaims?.tid ?? null,
+            });
+          }
+        } catch {
+          // Try the next candidate.
+        }
+      }
+    }
+
+    const unexpired = candidates
+      .filter((candidate) => candidate.expiresAtMs && candidate.expiresAtMs > now + 60_000)
+      .sort(
+        (left, right) =>
+          left.preference - right.preference ||
+          right.expiresAtMs - left.expiresAtMs ||
+          right.updatedAtMs - left.updatedAtMs,
+      );
+    if (unexpired.length > 0) {
+      return {
+        token: unexpired[0].token,
+        expiresAtUtc: new Date(unexpired[0].expiresAtMs).toISOString(),
+        oid: unexpired[0].oid,
+        tid: unexpired[0].tid,
+      };
+    }
+
+    const fallback = candidates.sort(
+      (left, right) =>
+        left.preference - right.preference ||
+        right.updatedAtMs - left.updatedAtMs ||
+        (right.expiresAtMs ?? 0) - (left.expiresAtMs ?? 0),
+    )[0];
+    if (!fallback) {
+      return null;
+    }
+
+    return {
+      token: fallback.token,
+      expiresAtUtc: fallback.expiresAtMs
+        ? new Date(fallback.expiresAtMs).toISOString()
+        : null,
+      oid: fallback.oid,
+      tid: fallback.tid,
+    };
+  });
+}
+
+async function extractStoredSubstrateAccountClaims(page) {
+  return page.evaluate(() => {
+    const storages = [window.localStorage, window.sessionStorage];
+    for (const storage of storages) {
+      for (const key of Object.keys(storage)) {
+        if (!/active-account-filters|account/i.test(key)) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(storage.getItem(key) ?? "{}");
+          const oid =
+            typeof parsed.localAccountId === "string" && parsed.localAccountId.trim()
+              ? parsed.localAccountId.trim()
+              : typeof parsed.homeAccountId === "string" && parsed.homeAccountId.includes(".")
+                ? parsed.homeAccountId.split(".", 1)[0].trim()
+                : null;
+          const tid =
+            typeof parsed.tenantId === "string" && parsed.tenantId.trim()
+              ? parsed.tenantId.trim()
+              : typeof parsed.realm === "string" && parsed.realm.trim()
+                ? parsed.realm.trim()
+                : null;
+          if (oid && tid) {
+            return { oid, tid };
+          }
+        } catch {
+          // Ignore malformed account metadata.
+        }
+      }
+    }
+    return null;
+  });
+}
+
+async function trySubmitTriggerMessage(page) {
+  await page.waitForTimeout(750);
+
+  const sendButtonLocators = [
+    page.getByRole("button", { name: /^send$/i }).first(),
+    page
+      .locator(
+        [
+          'button[aria-label="Send"]',
+          '[role="button"][aria-label="Send"]',
+          'button[title="Send"]',
+          '[role="button"][title="Send"]',
+          '[data-testid*="send"]',
+        ].join(", "),
+      )
+      .first(),
+  ];
+
+  for (const locator of sendButtonLocators) {
+    try {
+      await locator.waitFor({ state: "visible", timeout: 5_000 });
+      await locator.click({ timeout: 10_000 });
+      if (await waitForEditorToClear(page, 2_500)) {
+        console.log("[playwright] Trigger message submitted with Send button.");
+        return true;
+      }
+    } catch {
+      // Try the next submission method.
+    }
+  }
+
+  const keyAttempts = [
+    { keys: "Enter", label: "Enter" },
+    { keys: "Meta+Enter", label: "Meta+Enter" },
+    { keys: "Control+Enter", label: "Control+Enter" },
+  ];
+
+  for (const attempt of keyAttempts) {
+    try {
+      await page.keyboard.press(attempt.keys);
+      if (await waitForEditorToClear(page, 2_500)) {
+        console.log(
+          `[playwright] Trigger message submitted with ${attempt.label}.`,
+        );
+        return true;
+      }
+    } catch {
+      // Try the next submission method.
+    }
+  }
+
+  return false;
+}
+
+async function waitForEditorToClear(page, timeoutMs) {
+  try {
+    await page.waitForFunction(
+      () => {
+        const editor = document.querySelector("#m365-chat-editor-target-element");
+        return !!editor && !(editor.textContent ?? "").trim();
+      },
+      { timeout: timeoutMs },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function persistBrowserState(context, storageStatePath, reason) {
+  await fs.mkdir(path.dirname(storageStatePath), { recursive: true });
+  await context.storageState({ path: storageStatePath });
+  console.log(`[playwright] Browser state saved (${reason}): ${storageStatePath}`);
 }
 
 async function installSubstrateTemporaryChatShim(context) {
@@ -357,6 +703,10 @@ function captureSubstrateToken(page, timeoutMs = DEFAULT_TOKEN_TIMEOUT_MS) {
           cleanup();
           console.log("[playwright] access_token extracted.");
           resolve(token);
+        } else {
+          console.log(
+            "[playwright] Substrate WebSocket detected, but no access_token was present in the URL.",
+          );
         }
       } catch {
         // Ignore parse failures from malformed websocket URLs.
@@ -376,7 +726,7 @@ function captureSubstrateToken(page, timeoutMs = DEFAULT_TOKEN_TIMEOUT_MS) {
   };
 }
 
-async function saveToken(filePath, token, expiresAtUtc) {
+async function saveToken(filePath, token, expiresAtUtc, metadata = {}) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(
     filePath,
@@ -384,6 +734,8 @@ async function saveToken(filePath, token, expiresAtUtc) {
       {
         token,
         expiresAtUtc: expiresAtUtc.toISOString(),
+        ...(metadata.oid ? { oid: metadata.oid } : {}),
+        ...(metadata.tid ? { tid: metadata.tid } : {}),
       },
       null,
       2,
@@ -402,6 +754,24 @@ async function fileExists(filePath) {
 }
 
 function tryGetJwtExpiry(token) {
+  const parsed = tryReadJwtClaims(token);
+  if (!parsed) {
+    return null;
+  }
+  const expRaw = parsed.exp;
+  const exp =
+    typeof expRaw === "number"
+      ? expRaw
+      : typeof expRaw === "string"
+        ? Number.parseInt(expRaw, 10)
+        : Number.NaN;
+  if (!Number.isFinite(exp)) {
+    return null;
+  }
+  return new Date(exp * 1000);
+}
+
+function tryReadJwtClaims(token) {
   if (!token.trim()) {
     return null;
   }
@@ -414,18 +784,7 @@ function tryGetJwtExpiry(token) {
     const payload = Buffer.from(base64UrlNormalize(parts[1]), "base64").toString(
       "utf8",
     );
-    const parsed = JSON.parse(payload);
-    const expRaw = parsed.exp;
-    const exp =
-      typeof expRaw === "number"
-        ? expRaw
-        : typeof expRaw === "string"
-          ? Number.parseInt(expRaw, 10)
-          : Number.NaN;
-    if (!Number.isFinite(exp)) {
-      return null;
-    }
-    return new Date(exp * 1000);
+    return JSON.parse(payload);
   } catch {
     return null;
   }

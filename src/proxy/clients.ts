@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
+import { getTokenPath, loadToken } from "../cli/token-helpers";
 import {
   tryBuildAssistantResponseFromChatCompletionPayload,
   tryExtractSimulatedResponsePayload,
@@ -222,19 +223,20 @@ export class CopilotSubstrateClient {
     }
 
     const tokenPayload = tryReadJwtPayload(rawToken);
-    if (!tokenPayload) {
-      return buildFailure(
-        400,
-        "Authorization token must be a JWT so oid/tid can be resolved for Substrate.",
-      );
+    let objectId = tokenPayload ? tryGetString(tokenPayload, "oid") : null;
+    let tenantId = tokenPayload ? tryGetString(tokenPayload, "tid") : null;
+    if (!objectId || !tenantId) {
+      const tokenPath = await getTokenPath();
+      const tokenState = await loadToken(tokenPath);
+      if (tokenState?.token === rawToken) {
+        objectId = tokenState.oid?.trim() || objectId;
+        tenantId = tokenState.tid?.trim() || tenantId;
+      }
     }
-
-    const objectId = tryGetString(tokenPayload, "oid");
-    const tenantId = tryGetString(tokenPayload, "tid");
     if (!objectId || !tenantId) {
       return buildFailure(
         400,
-        "Authorization token is missing required 'oid' and/or 'tid' claims for Substrate.",
+        "Authorization token must be a JWT or have cached oid/tid metadata so Substrate can be addressed correctly.",
       );
     }
 
@@ -850,16 +852,21 @@ async function connectWebSocket(
       handshakeTimeout: timeoutMs,
       headers: origin ? { Origin: origin } : undefined,
     });
+    installWebSocketErrorSink(ws);
     const timeout = setTimeout(() => {
       try {
-        ws.terminate();
+        if (typeof (ws as { terminate?: () => void }).terminate === "function") {
+          ws.terminate();
+        } else {
+          ws.close();
+        }
       } catch {
         // ignore
       }
       reject(new Error("timeout"));
     }, timeoutMs);
 
-    ws.once("open", () => {
+    listenToWebSocketEvent(ws, "open", () => {
       clearTimeout(timeout);
       if (keepAliveMs > 0) {
         const timer = setInterval(() => {
@@ -868,19 +875,21 @@ async function connectWebSocket(
             return;
           }
           try {
-            ws.ping();
+            if (typeof (ws as { ping?: () => void }).ping === "function") {
+              ws.ping();
+            }
           } catch {
             clearInterval(timer);
           }
         }, keepAliveMs);
-        ws.once("close", () => clearInterval(timer));
+        listenToWebSocketEvent(ws, "close", () => clearInterval(timer), true);
       }
       resolve(ws);
-    });
-    ws.once("error", (error) => {
+    }, true);
+    listenToWebSocketEvent(ws, "error", (error) => {
       clearTimeout(timeout);
-      reject(error);
-    });
+      reject(normalizeWebSocketError(error));
+    }, true);
   });
 }
 
@@ -893,13 +902,22 @@ async function sendFrame(
   const payload = `${JSON.stringify(frame)}\u001e`;
   await logger.logSubstrateFrame(requestUri.toString(), "request", payload);
   await new Promise<void>((resolve, reject) => {
-    ws.send(payload, (error) => {
-      if (error) {
-        reject(error);
-      } else {
-        resolve();
+    try {
+      if (ws.send.length >= 2) {
+        ws.send(payload, (error) => {
+          if (error) {
+            reject(error);
+          } else {
+            resolve();
+          }
+        });
+        return;
       }
-    });
+      ws.send(payload);
+      resolve();
+    } catch (error) {
+      reject(error);
+    }
   });
 }
 
@@ -922,7 +940,7 @@ function createWebSocketReceiver(ws: WebSocket): {
     queue.push(value);
   };
 
-  const onMessage = (data: WebSocket.RawData) => {
+  const onMessage = (data: unknown) => {
     if (disposed) {
       return;
     }
@@ -938,7 +956,17 @@ function createWebSocketReceiver(ws: WebSocket): {
       flush(Buffer.concat(data).toString("utf8"));
       return;
     }
-    flush(Buffer.from(data).toString("utf8"));
+    if (data instanceof ArrayBuffer) {
+      flush(Buffer.from(data).toString("utf8"));
+      return;
+    }
+    if (ArrayBuffer.isView(data)) {
+      flush(
+        Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString("utf8"),
+      );
+      return;
+    }
+    flush(String(data ?? ""));
   };
 
   const onClose = () => {
@@ -955,9 +983,9 @@ function createWebSocketReceiver(ws: WebSocket): {
     flush(null);
   };
 
-  ws.on("message", onMessage);
-  ws.on("close", onClose);
-  ws.on("error", onError);
+  const offMessage = listenToWebSocketEvent(ws, "message", onMessage);
+  const offClose = listenToWebSocketEvent(ws, "close", onClose);
+  const offError = listenToWebSocketEvent(ws, "error", onError);
 
   return {
     next: (timeoutMs: number) => {
@@ -991,9 +1019,9 @@ function createWebSocketReceiver(ws: WebSocket): {
         return;
       }
       disposed = true;
-      ws.off("message", onMessage);
-      ws.off("close", onClose);
-      ws.off("error", onError);
+      offMessage();
+      offClose();
+      offError();
       while (waiters.length > 0) {
         const waiter = waiters.shift();
         waiter?.(null);
@@ -1001,6 +1029,112 @@ function createWebSocketReceiver(ws: WebSocket): {
       queue.length = 0;
     },
   };
+}
+
+function listenToWebSocketEvent(
+  ws: WebSocket,
+  event: "open" | "message" | "close" | "error",
+  handler: (...args: unknown[]) => void,
+  once = false,
+): () => void {
+  const emitter = ws as WebSocket & {
+    on?: (event: string, handler: (...args: unknown[]) => void) => void;
+    once?: (event: string, handler: (...args: unknown[]) => void) => void;
+    off?: (event: string, handler: (...args: unknown[]) => void) => void;
+    addListener?: (event: string, handler: (...args: unknown[]) => void) => void;
+    removeListener?: (event: string, handler: (...args: unknown[]) => void) => void;
+    addEventListener?: (
+      event: string,
+      handler: (event: { data?: unknown; error?: unknown }) => void,
+      options?: { once?: boolean },
+    ) => void;
+    removeEventListener?: (
+      event: string,
+      handler: (event: { data?: unknown; error?: unknown }) => void,
+    ) => void;
+  };
+
+  if (once && typeof emitter.once === "function") {
+    emitter.once(event, handler);
+    return () => {
+      if (typeof emitter.off === "function") {
+        emitter.off(event, handler);
+      } else {
+        emitter.removeListener?.(event, handler);
+      }
+    };
+  }
+
+  if (typeof emitter.on === "function") {
+    emitter.on(event, handler);
+    return () => {
+      if (typeof emitter.off === "function") {
+        emitter.off(event, handler);
+      } else {
+        emitter.removeListener?.(event, handler);
+      }
+    };
+  }
+
+  if (typeof emitter.addListener === "function") {
+    emitter.addListener(event, handler);
+    return () => emitter.removeListener?.(event, handler);
+  }
+
+  if (typeof emitter.addEventListener === "function") {
+    const wrapped = (domEvent: { data?: unknown; error?: unknown }) => {
+      if (event === "message") {
+        handler(domEvent.data);
+        return;
+      }
+      if (event === "error") {
+        handler(domEvent.error ?? domEvent);
+        return;
+      }
+      handler(domEvent);
+    };
+    emitter.addEventListener(event, wrapped, once ? { once: true } : undefined);
+    return () => emitter.removeEventListener?.(event, wrapped);
+  }
+
+  throw new Error(`Unsupported WebSocket event API for '${event}'.`);
+}
+
+function normalizeWebSocketError(error: unknown): Error {
+  if (error instanceof Error) {
+    return error;
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    error.message.trim()
+  ) {
+    return new Error(error.message);
+  }
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    "type" in error &&
+    typeof error.type === "string" &&
+    error.type.trim()
+  ) {
+    return new Error(`WebSocket error event: ${error.type}`);
+  }
+  return new Error(String(error));
+}
+
+function installWebSocketErrorSink(ws: WebSocket): void {
+  try {
+    listenToWebSocketEvent(ws, "error", () => {
+      // Keep an error listener attached so failed websocket handshakes return
+      // normal request errors instead of crashing the Bun process.
+    });
+  } catch {
+    // Best effort only; runtimes without a compatible listener API still rely
+    // on the explicit connect/receiver error handling paths.
+  }
 }
 
 function extractSubstrateAssistantText(envelope: JsonObject): string | null {
