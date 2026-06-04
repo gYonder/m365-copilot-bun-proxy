@@ -1979,6 +1979,78 @@ describe("simulated transform mode proxy flow", () => {
     );
   });
 
+  test("responses simulated prompt preserves mcp-like tool names", async () => {
+    let capturedPrompt = "";
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        capturedPrompt = readPrompt(payload);
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            id: "resp_mcp_like_tool",
+            object: "response",
+            created_at: 1700000000,
+            status: "completed",
+            model: "simulated-model",
+            output: [
+              {
+                type: "function_call",
+                call_id: "call_mcp_1",
+                name: "mcp__wiki__search",
+                arguments: "{\"query\":\"order allocation\"}",
+              },
+            ],
+          }),
+        );
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Search the local wiki for order allocation notes.",
+          tools: [
+            {
+              type: "function",
+              name: "mcp__wiki__search",
+              description: "Search the local companion wiki",
+              parameters: {
+                type: "object",
+                properties: { query: { type: "string" } },
+                required: ["query"],
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    const body = await response.json();
+    const output = Array.isArray(body.output) ? body.output : [];
+    const functionCall = output.find(
+      (item) =>
+        isJsonObject(item) &&
+        tryGetString(item, "type") === "function_call" &&
+        tryGetString(item, "name") === "mcp__wiki__search",
+    );
+
+    expect(response.status).toBe(200);
+    expect(capturedPrompt).toContain('\"name\": \"mcp__wiki__search\"');
+    expect(capturedPrompt).toContain(
+      "Tool calls are supported here: emit function_call output items when appropriate.",
+    );
+    expect(functionCall).toBeTruthy();
+  });
+
   test("chat/completions repairs malformed tool-call arguments with raw newlines", async () => {
     const brokenArguments =
       "{\"path\":\"tests/agent-tests/fizz-buzz.ts\",\"diff\":\"<<<<<<< SEARCH\n:start_line:1\nfoo\n=======\nbar\n>>>>>>> REPLACE\"}";

@@ -1,9 +1,20 @@
 .vscode/
+.DS_Store
 logs/
 .playwright-cli/
 tests/agent-tests
 
 todo.md
+
+# Local runtime/auth/debug state
+*.log
+*.pid
+*.tmp
+debug/
+captures/
+browser-state*.json
+*token*.json
+*cookies*.json
 
 # Based on https://raw.githubusercontent.com/github/gitignore/main/Node.gitignore
 
