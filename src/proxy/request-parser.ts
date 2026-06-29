@@ -203,7 +203,10 @@ export function tryParseOpenAiRequest(
     };
   }
 
-  const tooling = parseTooling(requestJson);
+  const tooling = requireLocalToolingIfNeeded(
+    requestJson,
+    parseTooling(requestJson),
+  );
   const responseFormat = parseResponseFormat(requestJson);
   const reasoningEffort = tryGetString(requestJson, "reasoning_effort");
   const temperature = tryGetDouble(requestJson, "temperature");
@@ -268,7 +271,7 @@ export function tryParseOpenAiRequest(
     model,
     stream,
     transformMode,
-    promptText: prompt.content,
+    promptText: buildMappedPromptText(prompt.content, tooling),
     userKey: tryGetString(requestJson, "user"),
     locationHint: buildLocationHint(requestJson, options.defaultTimeZone),
     contextualResources: buildContextualResources(requestJson),
@@ -376,7 +379,10 @@ function buildSimulatedOpenAiRequest(
   options: WrapperOptions,
   endpointFormat: "chat.completions" | "responses",
 ): ParsedOpenAiRequest {
-  const tooling = parseTooling(requestJson);
+  const tooling = requireLocalToolingIfNeeded(
+    requestJson,
+    parseTooling(requestJson),
+  );
   const model =
     tryGetString(requestJson, "model") ||
     (options.defaultModel?.trim() ? options.defaultModel : "m365-copilot");
@@ -483,13 +489,66 @@ function shouldRequireInitialLocalToolCall(
   if (!latestUserText.trim()) {
     return false;
   }
-  const hasLocalAction = /\b(local shell\/file tools|local shell|file tools|read|inspect|write|create|edit|modify|delete|verify|cat|list)\b/.test(
+  const hasLocalAction = /\b(local shell\/file tools|local shell|file tools|read|inspect|write|create|edit|modify|delete|verify|cat|list|run|execute|pwd|commit|stage|git)\b/.test(
     latestUserText,
   );
-  const hasLocalTarget = /\b(file|files|workspace|shell|markdown|md|txt)\b|\.[a-z0-9]{1,8}\b/.test(
+  const hasLocalTarget = /\b(file|files|workspace|shell|repo|repository|directory|working directory|cwd|pwd|git|commit|docs?|releases?|markdown|md|txt)\b|\.[a-z0-9]{1,8}\b/.test(
     latestUserText,
   );
   return hasLocalAction && hasLocalTarget;
+}
+
+function requireLocalToolingIfNeeded(
+  requestJson: JsonObject,
+  tooling: OpenAiTooling,
+): OpenAiTooling {
+  if (!shouldRequireInitialLocalToolCall(requestJson, tooling)) {
+    return tooling;
+  }
+  return {
+    ...tooling,
+    toolChoiceMode: ToolChoiceModes.Required,
+    toolChoiceFunctionName: null,
+  };
+}
+
+function buildMappedPromptText(
+  userPrompt: string,
+  tooling: OpenAiTooling,
+): string {
+  if (
+    tooling.tools.length === 0
+  ) {
+    return userPrompt;
+  }
+
+  const lines = [
+    "You are responding through a local Codex harness with shell and file tools.",
+    "The local repository is accessible through those tools; do not answer from an M365, Python, or /mnt/file_upload environment.",
+    "If tool output is present, treat that output as the source of truth for the local environment.",
+  ];
+  if (
+    tooling.toolChoiceMode === ToolChoiceModes.Required ||
+    tooling.toolChoiceMode === ToolChoiceModes.Function
+  ) {
+    lines.push(
+      'A tool call is required for this turn. Respond ONLY as minified JSON with this exact shape: {"tool_calls":[{"name":"<tool-name>","arguments":{}}]}.',
+      "Do not include markdown, prose, or a natural-language answer before the tool call.",
+      `Available tool names: ${tooling.tools.map((tool) => tool.name).join(", ")}`,
+    );
+    if (
+      tooling.toolChoiceMode === ToolChoiceModes.Function &&
+      tooling.toolChoiceFunctionName
+    ) {
+      lines.push(`Required tool name: ${tooling.toolChoiceFunctionName}`);
+    }
+  } else {
+    lines.push(
+      "Use a tool when local repo state is needed; otherwise answer normally using any prior tool outputs.",
+    );
+  }
+  lines.push("User request:", userPrompt);
+  return lines.join("\n");
 }
 
 function hasPriorToolResult(requestJson: JsonObject): boolean {
@@ -1168,6 +1227,15 @@ function appendOpenAiCompatibilityContext(
   temperature: number | null,
 ): void {
   if (tooling.tools.length > 0) {
+    context.push({
+      text: [
+        "You are connected to a local Codex harness with shell and file tools.",
+        "The user's workspace is the local repository described by the Codex turn context, not any M365, Python, or /mnt/file_upload environment you may infer.",
+        "For requests that ask you to inspect, edit, verify, or commit local repo files, call the appropriate tool instead of saying the filesystem is unavailable.",
+        "If earlier conversation text claimed the local repo was not mounted, treat that claim as stale and recover by using the available tools.",
+      ].join(" "),
+      description: "Local Codex tool availability",
+    });
     context.push({
       text: 'If you call a tool, respond ONLY as minified JSON with this exact shape: {"tool_calls":[{"name":"<tool-name>","arguments":{}}]}. No markdown, no prose, no extra keys.',
       description: "OpenAI tool-calling contract",

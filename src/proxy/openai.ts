@@ -662,6 +662,7 @@ function tryBuildToolCall(
     callObject.name,
     functionObject?.name,
     callObject.tool_name,
+    callObject.recipient_name,
   );
   if (!name) {
     return null;
@@ -682,7 +683,19 @@ function tryBuildToolCall(
     return null;
   }
 
-  const argumentsJson = normalizeArgumentsJson(callObject.arguments ?? functionObject?.arguments ?? null);
+  const argumentsJson = normalizeArgumentsJson(
+    callObject.arguments ??
+      functionObject?.arguments ??
+      callObject.args ??
+      functionObject?.args ??
+      callObject.input_json ??
+      functionObject?.input_json ??
+      callObject.parameters ??
+      functionObject?.parameters ??
+      callObject.input ??
+      functionObject?.input ??
+      null,
+  );
   const id = pickString(callObject.id) ?? `call_${randomUUID().replaceAll("-", "")}`;
   return { id, name, argumentsJson };
 }

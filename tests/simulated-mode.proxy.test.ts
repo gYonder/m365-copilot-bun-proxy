@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { CopilotGraphClient, CopilotSubstrateClient } from "../src/proxy/clients";
 import { ConversationStore } from "../src/proxy/conversation-store";
 import { DebugMarkdownLogger } from "../src/proxy/logger";
+import { tryParseResponsesRequest } from "../src/proxy/request-parser";
 import { createProxyApp } from "../src/proxy/server";
 import { ResponseStore } from "../src/proxy/response-store";
 import { ProxyTokenProvider } from "../src/proxy/token-provider";
 import {
   LogLevels,
   OpenAiTransformModes,
+  ToolChoiceModes,
   TransportNames,
   type ChatResult,
   type CreateConversationResult,
@@ -23,6 +25,77 @@ import {
 } from "../src/proxy/utils";
 
 describe("simulated transform mode proxy flow", () => {
+  test("GET /healthz reports active transform mode", async () => {
+    const app = createProxyApp(
+      createServices(
+        (conversationId, payload) =>
+          buildGraphChatResult(conversationId, payload, "unused"),
+        (options) => {
+          options.openAiTransformMode = OpenAiTransformModes.Mapped;
+          options.defaultModel = "gpt-5.5";
+        },
+      ),
+    );
+
+    const response = await app.fetch(new Request("http://localhost/healthz"));
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as JsonObject;
+    expect(body.status).toBe("ok");
+    expect(body.openAiTransformMode).toBe(OpenAiTransformModes.Mapped);
+    expect(body.defaultModel).toBe("gpt-5.5");
+  });
+
+  test("mapped responses prompt inlines required local tool contract", () => {
+    const options = createOptions();
+    options.openAiTransformMode = OpenAiTransformModes.Mapped;
+
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "m365-copilot",
+        stream: false,
+        input: "Run pwd using the local shell tool, then answer with the command output.",
+        tools: [
+          {
+            type: "function",
+            name: "exec_command",
+            description: "Run a shell command.",
+            parameters: {
+              type: "object",
+              properties: {
+                cmd: { type: "string" },
+                workdir: { type: "string" },
+              },
+              required: ["cmd"],
+            },
+          },
+        ],
+        tool_choice: "auto",
+      },
+      options,
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.request.base.tooling.toolChoiceMode).toBe(
+      ToolChoiceModes.Required,
+    );
+    expect(parsed.request.base.promptText).toContain(
+      "A tool call is required for this turn.",
+    );
+    expect(parsed.request.base.promptText).toContain(
+      "Available tool names: exec_command",
+    );
+    expect(parsed.request.base.promptText).toContain(
+      "do not answer from an M365, Python, or /mnt/file_upload environment",
+    );
+    expect(parsed.request.base.promptText).toContain(
+      "If tool output is present, treat that output as the source of truth",
+    );
+  });
+
   test("GET /v1/models returns all supported models", async () => {
     const app = createProxyApp(
       createServices((conversationId, payload) =>
@@ -1972,10 +2045,7 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(capturedPrompt).toContain(
-      "The latest user request needs local workspace access and this request has no prior tool result, so this response must include at least one tool call.",
-    );
-    expect(capturedPrompt).toContain(
-      "Do not return a message-only response for this turn.",
+      "This request requires at least one tool call. Do not return a plain-text-only assistant response.",
     );
   });
 

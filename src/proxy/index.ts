@@ -61,6 +61,9 @@ console.log(
     : `Debugging: disabled (configured level: ${options.logLevel})`,
 );
 
+setInterval(() => undefined, 86_400_000);
+await new Promise<never>(() => {});
+
 function parseDebugFlag(): boolean {
   const { values } = parseArgs({
     args: Bun.argv,

@@ -118,7 +118,7 @@ const CodexBaseInstructions =
 export function createProxyApp(services: Services): Hono {
   const app = new Hono();
 
-  app.get("/healthz", (c) => c.json({ status: "ok" }));
+  app.get("/healthz", (c) => c.json(buildHealthResponse(services.options)));
   app.get("/v1/models", (c) => c.json(buildModelsResponse()));
   app.get("/openai/v1/models", (c) => c.json(buildModelsResponse()));
   app.get("/__viz/traces/:traceId", (c) =>
@@ -150,6 +150,17 @@ export function createProxyApp(services: Services): Hono {
     handleResponsesDelete(c.req.raw, services, c.req.param("responseId")),
   );
   return app;
+}
+
+function buildHealthResponse(options: WrapperOptions): JsonObject {
+  return {
+    status: "ok",
+    openAiTransformMode: normalizeOpenAiTransformMode(
+      options.openAiTransformMode,
+    ),
+    transport: options.transport,
+    defaultModel: options.defaultModel,
+  };
 }
 
 function buildModelsResponse(): JsonObject {
@@ -2265,6 +2276,17 @@ function hasUsableSimulatedChatCompletionPayload(payload: JsonObject): boolean {
   return Boolean(assistantResponse.content?.trim());
 }
 
+function looksLikeForeignSandboxLeak(text: string | null | undefined): boolean {
+  if (!text) {
+    return false;
+  }
+  // M365 Copilot's own Python/code-interpreter sandbox paths. When these appear
+  // in a turn that has local shell/file tools available, the model has answered
+  // from its hosted sandbox instead of the local Codex harness, so the reply is
+  // provably ungrounded and should be re-asked.
+  return /\/mnt\/(?:file_upload|data)\b/i.test(text);
+}
+
 function shouldRetrySimulatedToollessChatPayload(
   options: WrapperOptions,
   request: ParsedOpenAiRequest,
@@ -2284,6 +2306,11 @@ function shouldRetrySimulatedToollessChatPayload(
     tryBuildAssistantResponseFromChatCompletionPayload(payload);
   if (!assistantResponse || assistantResponse.toolCalls.length > 0) {
     return false;
+  }
+  // A reply that leaks M365's hosted sandbox is ungrounded even if it carries a
+  // natural-language answer; re-ask so the model uses the local tool output.
+  if (looksLikeForeignSandboxLeak(assistantResponse.content)) {
+    return true;
   }
   if (!assistantResponse.content?.trim()) {
     return false;
@@ -2457,11 +2484,7 @@ function normalizeSimulatedAssistantMessage(message: JsonObject): JsonObject {
     normalized.role = "assistant";
   }
 
-  const rawToolCalls = Array.isArray(normalized.tool_calls)
-    ? normalized.tool_calls
-    : [];
-  const toolCalls = rawToolCalls
-    .filter(isJsonObject)
+  const toolCalls = extractSimulatedToolCallCandidates(normalized)
     .map(normalizeSimulatedToolCall)
     .filter(isJsonObject);
   if (toolCalls.length > 0) {
@@ -2487,18 +2510,68 @@ function normalizeSimulatedAssistantMessage(message: JsonObject): JsonObject {
   return normalized;
 }
 
+function extractSimulatedToolCallCandidates(message: JsonObject): JsonObject[] {
+  const candidates: JsonObject[] = [];
+
+  for (const key of ["tool_calls", "toolCalls", "function_calls", "functionCalls"] as const) {
+    const value = message[key];
+    if (Array.isArray(value)) {
+      candidates.push(...value.filter(isJsonObject));
+    }
+  }
+
+  for (const key of ["tool_call", "toolCall", "function_call", "functionCall"] as const) {
+    const value = message[key];
+    if (isJsonObject(value)) {
+      candidates.push(value);
+    }
+  }
+
+  if (looksLikeSimulatedToolCall(message)) {
+    candidates.push(message);
+  }
+
+  return candidates;
+}
+
+function looksLikeSimulatedToolCall(value: JsonObject): boolean {
+  const functionNode = isJsonObject(value.function) ? value.function : null;
+  return Boolean(
+    tryGetString(value, "name") ||
+      tryGetString(value, "tool_name") ||
+      tryGetString(value, "recipient_name") ||
+      tryGetString(functionNode, "name"),
+  );
+}
+
+function firstDefined(...values: unknown[]): unknown {
+  for (const value of values) {
+    if (value !== undefined) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
 function normalizeSimulatedToolCall(toolCall: JsonObject): JsonObject | null {
   const functionNode = isJsonObject(toolCall.function) ? toolCall.function : null;
   const functionName =
-    tryGetString(functionNode, "name") ?? tryGetString(toolCall, "name");
+    tryGetString(functionNode, "name") ??
+    tryGetString(toolCall, "name") ??
+    tryGetString(toolCall, "tool_name") ??
+    tryGetString(toolCall, "recipient_name");
   if (!functionName) {
     return null;
   }
 
-  const argumentsNode =
-    functionNode?.arguments !== undefined
-      ? functionNode.arguments
-      : toolCall.arguments;
+  const argumentsNode = firstDefined(
+    functionNode?.arguments,
+    toolCall.arguments,
+    toolCall.args,
+    toolCall.input_json,
+    toolCall.parameters,
+    toolCall.input,
+  );
   const argumentsText = normalizeSimulatedToolArguments(argumentsNode);
 
   return {
@@ -2687,6 +2760,7 @@ function shouldRetrySimulatedToollessResponsesPayload(
 
   let hasFunctionCall = false;
   let hasMessageText = false;
+  let hasSandboxLeak = false;
   for (const item of output) {
     if (!isJsonObject(item)) {
       continue;
@@ -2696,19 +2770,31 @@ function shouldRetrySimulatedToollessResponsesPayload(
       hasFunctionCall = true;
       break;
     }
-    if (extractMessageOutputText(item).trim()) {
+    const messageText = extractMessageOutputText(item);
+    if (messageText.trim()) {
       hasMessageText = true;
+    }
+    if (looksLikeForeignSandboxLeak(messageText)) {
+      hasSandboxLeak = true;
     }
   }
 
   if (hasFunctionCall) {
     return false;
   }
+  // A reply that leaks M365's hosted sandbox (/mnt/file_upload) is ungrounded:
+  // the model ignored the local tool output. Re-ask so it uses the real result.
+  if (hasSandboxLeak) {
+    return true;
+  }
   if (hasMessageText) {
     return true;
   }
 
   const outputText = tryGetString(responseBody, "output_text");
+  if (looksLikeForeignSandboxLeak(outputText)) {
+    return true;
+  }
   return Boolean(outputText?.trim());
 }
 
@@ -3237,18 +3323,36 @@ function getSimulatedResponsesOutputItems(payload: JsonObject): unknown[] | null
 }
 
 function isSimulatedResponsesFunctionCallOutputItem(item: JsonObject): boolean {
+  const type = (tryGetString(item, "type") ?? "").toLowerCase();
   return (
-    (tryGetString(item, "type") ?? "").toLowerCase() === "function_call" ||
-    isJsonObject(item.function_call)
+    type === "function_call" ||
+    type === "tool_call" ||
+    type === "custom_tool_call" ||
+    isJsonObject(item.function_call) ||
+    isJsonObject(item.tool_call) ||
+    Boolean(
+      tryGetString(item, "name") ||
+        tryGetString(item, "tool_name") ||
+        tryGetString(item, "recipient_name"),
+    )
   );
 }
 
 function normalizeSimulatedResponsesFunctionCallItem(
   item: JsonObject,
 ): JsonObject | null {
-  const functionCallNode = isJsonObject(item.function_call) ? item.function_call : null;
+  const functionCallNode = isJsonObject(item.function_call)
+    ? item.function_call
+    : isJsonObject(item.tool_call)
+      ? item.tool_call
+      : null;
   const name =
-    tryGetString(item, "name") ?? tryGetString(functionCallNode, "name");
+    tryGetString(item, "name") ??
+    tryGetString(item, "tool_name") ??
+    tryGetString(item, "recipient_name") ??
+    tryGetString(functionCallNode, "name") ??
+    tryGetString(functionCallNode, "tool_name") ??
+    tryGetString(functionCallNode, "recipient_name");
   if (!name) {
     return null;
   }
@@ -3265,9 +3369,18 @@ function normalizeSimulatedResponsesFunctionCallItem(
       itemId,
     name,
     arguments: normalizeSimulatedToolArguments(
-      functionCallNode?.arguments !== undefined
-        ? functionCallNode.arguments
-        : item.arguments,
+      firstDefined(
+        functionCallNode?.arguments,
+        functionCallNode?.args,
+        functionCallNode?.input_json,
+        functionCallNode?.parameters,
+        functionCallNode?.input,
+        item.arguments,
+        item.args,
+        item.input_json,
+        item.parameters,
+        item.input,
+      ),
     ),
   };
 }

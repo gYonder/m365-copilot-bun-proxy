@@ -65,17 +65,67 @@ describe("buildAssistantResponse strict tool behavior", () => {
     expect(response.toolCalls[0]?.argumentsJson).toBe("{\"zone\":\"UTC\"}");
     expect(response.content).toBeNull();
   });
+
+
+
+  test("extracts M365-style tool call aliases into canonical JSON arguments", () => {
+    const request = createRequest(ToolChoiceModes.Required, null, {
+      toolName: "write_to_file",
+    });
+    const response = buildAssistantResponse(
+      request,
+      JSON.stringify({
+        tool_calls: [
+          {
+            recipient_name: "write_to_file",
+            parameters: {
+              path: "tests/agent-tests/fallback.ts",
+              content: "export const ok = true;",
+            },
+          },
+        ],
+      }),
+    );
+
+    expect(response.strictToolErrorMessage).toBeNull();
+    expect(response.finishReason).toBe("tool_calls");
+    expect(response.toolCalls.length).toBe(1);
+    expect(response.toolCalls[0]?.name).toBe("write_to_file");
+    expect(response.toolCalls[0]?.argumentsJson).toContain("\"path\"");
+    expect(response.toolCalls[0]?.argumentsJson).toContain("\"content\"");
+  });
+
+  test("does not fabricate a tool call when strict local exec output is missing", () => {
+    const request = createRequest(ToolChoiceModes.Required, null, {
+      promptText:
+        "You are responding through a local Codex harness with shell and file tools.\nUser request:\nRun pwd using the local shell tool.",
+      toolName: "exec_command",
+    });
+    const response = buildAssistantResponse(
+      request,
+      "```text\n/mnt/file_upload\n```",
+    );
+
+    expect(response.toolCalls.length).toBe(0);
+    expect(response.finishReason).toBe("stop");
+    expect(response.strictToolErrorMessage).not.toBeNull();
+  });
 });
 
 function createRequest(
   toolChoiceMode: string,
   toolChoiceFunctionName: string | null,
+  overrides: {
+    promptText?: string;
+    toolName?: string;
+  } = {},
 ): ParsedOpenAiRequest {
+  const toolName = overrides.toolName ?? "get_time";
   return {
     model: "m365-copilot",
     stream: false,
     transformMode: OpenAiTransformModes.Mapped,
-    promptText: "test",
+    promptText: overrides.promptText ?? "test",
     userKey: null,
     locationHint: { timeZone: "America/New_York" },
     contextualResources: null,
@@ -83,7 +133,7 @@ function createRequest(
     tooling: {
       tools: [
         {
-          name: "get_time",
+          name: toolName,
           description: "Get time",
           parameters: {
             type: "object",
