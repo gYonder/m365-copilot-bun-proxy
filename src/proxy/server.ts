@@ -1208,6 +1208,22 @@ async function handleResponsesCreate(
       replayLoopHash,
       replayConversationId,
     );
+    // Prefer replaying the real stored response for this conversation so a
+    // byte-identical retry keeps its function_call output items (patch / shell)
+    // instead of collapsing to an empty message. Empty suppression stays as the
+    // fallback when no body was cached (e.g. the first turn errored upstream).
+    const storedReplayResponse = replayConversationId
+      ? responseStore.tryGetReplayResponse(replayConversationId)
+      : null;
+    if (storedReplayResponse) {
+      return buildStoredReplayResponsesResult(
+        services,
+        parsedRequest,
+        responseHeaders,
+        replayConversationId,
+        storedReplayResponse,
+      );
+    }
     return buildSuppressedReplayResponsesResult(
       services,
       parsedRequest,
@@ -2074,6 +2090,163 @@ async function buildSuppressedReplayResponsesResult(
         );
       }
       writeDataEvent(buildResponseCompletedEvent(completed));
+      enqueueSseDoneEvent(controller, encoder);
+      controller.close();
+    },
+  });
+
+  headers.set("content-type", "text/event-stream");
+  headers.set("cache-control", "no-cache");
+  headers.set("connection", "keep-alive");
+  await services.debugLogger.logOutgoingResponse(200, headers.entries(), null);
+  return finalizeOutgoingStreamResponse(services, stream, headers);
+}
+
+// Concatenate the output_text parts of a single stored message output item.
+function extractOutputItemText(outputItem: JsonObject): string {
+  const content = outputItem.content;
+  if (!Array.isArray(content)) {
+    return "";
+  }
+  const segments: string[] = [];
+  for (const part of content) {
+    if (typeof part !== "object" || part === null || Array.isArray(part)) {
+      continue;
+    }
+    const typed = part as Record<string, unknown>;
+    if ((typed.type ?? "") !== "output_text") {
+      continue;
+    }
+    if (typeof typed.text === "string" && typed.text.length > 0) {
+      segments.push(typed.text);
+    }
+  }
+  return segments.join("");
+}
+
+// Idempotent replay of a byte-identical retry inside the guard window. Unlike
+// buildSuppressedReplayResponsesResult (empty message only), this replays the
+// REAL previously stored completed response, preserving function_call output
+// items — without it, a retried tool turn returns an empty message and Codex
+// cannot apply the patch / run the shell command. The stored body is emitted
+// verbatim for non-stream; for stream it is reconstructed as SSE over every
+// output item (message text + function_call items) so the client sees the same
+// tool calls it would have on the first attempt.
+async function buildStoredReplayResponsesResult(
+  services: Services,
+  parsedRequest: ParsedResponsesRequest,
+  headers: Headers,
+  conversationId: string | null,
+  storedResponse: JsonObject,
+): Promise<Response> {
+  const responseId =
+    typeof storedResponse.id === "string" && storedResponse.id.trim()
+      ? storedResponse.id.trim()
+      : createOpenAiResponseId();
+  const createdAt =
+    typeof storedResponse.created_at === "number"
+      ? storedResponse.created_at
+      : nowUnix();
+  void createdAt;
+  const normalizedConversationId = conversationId?.trim()
+    ? conversationId.trim()
+    : null;
+  const outputItems: JsonObject[] = Array.isArray(storedResponse.output)
+    ? storedResponse.output.filter(
+        (item): item is JsonObject =>
+          typeof item === "object" && item !== null && !Array.isArray(item),
+      )
+    : [];
+
+  headers.set("x-m365-replay-suppressed", "true");
+  headers.set("x-m365-replay-idempotent", "true");
+  if (normalizedConversationId) {
+    headers.set("x-m365-conversation-id", normalizedConversationId);
+  }
+
+  if (!parsedRequest.base.stream) {
+    headers.set("content-type", "application/json");
+    const body = JSON.stringify(storedResponse);
+    await services.debugLogger.logOutgoingResponse(200, headers.entries(), body);
+    return new Response(body, { status: 200, headers });
+  }
+
+  const inProgress = { ...storedResponse, status: "in_progress", output: [] };
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const writeDataEvent = (event: JsonObject) => {
+        enqueueSseJsonEvent(controller, encoder, event);
+      };
+
+      writeDataEvent(buildResponseCreatedEvent(inProgress));
+      writeDataEvent(buildResponseInProgressEvent(inProgress));
+      for (let index = 0; index < outputItems.length; index += 1) {
+        const outputItem = outputItems[index];
+        const outputItemType = String(outputItem.type ?? "message");
+        const outputItemId = String(
+          outputItem.id ?? createOpenAiOutputItemId("item"),
+        );
+
+        if (outputItemType === "message") {
+          const text = extractOutputItemText(outputItem);
+          writeDataEvent(
+            buildResponseOutputItemAddedEvent(
+              responseId,
+              index,
+              buildMessageOutputItem(outputItemId, "", "in_progress"),
+            ),
+          );
+          writeDataEvent(
+            buildResponseContentPartAddedEvent(responseId, index, outputItemId, {
+              type: "output_text",
+              text: "",
+            }),
+          );
+          if (text) {
+            writeDataEvent(
+              buildResponseOutputTextDeltaEvent(
+                responseId,
+                index,
+                outputItemId,
+                text,
+              ),
+            );
+          }
+          writeDataEvent(
+            buildResponseOutputTextDoneEvent(
+              responseId,
+              index,
+              outputItemId,
+              text,
+            ),
+          );
+          writeDataEvent(
+            buildResponseContentPartDoneEvent(responseId, index, outputItemId, {
+              type: "output_text",
+              text,
+            }),
+          );
+          writeDataEvent(
+            buildResponseOutputItemDoneEvent(responseId, index, outputItem),
+          );
+          continue;
+        }
+
+        // Non-message items (function_call above all): emit the item verbatim
+        // via added/done so tool calls survive the replay intact.
+        writeDataEvent(
+          buildResponseOutputItemAddedEvent(responseId, index, {
+            ...outputItem,
+            status: "in_progress",
+          }),
+        );
+        writeDataEvent(
+          buildResponseOutputItemDoneEvent(responseId, index, outputItem),
+        );
+      }
+      writeDataEvent(buildResponseCompletedEvent(storedResponse));
       enqueueSseDoneEvent(controller, encoder);
       controller.close();
     },

@@ -15,12 +15,18 @@ type RequestHashEntry = {
   conversationId: string | null;
 };
 
+type ReplayBodyEntry = {
+  expiresAtUtc: number;
+  response: JsonObject;
+};
+
 const RequestHashGuardTtlMs = 60_000;
 
 export class ResponseStore {
   private readonly entries = new Map<string, StoredOpenAiResponseRecord>();
   private readonly conversationLinks = new Map<string, ConversationLinkEntry>();
   private readonly requestHashes = new Map<string, RequestHashEntry>();
+  private readonly replayBodies = new Map<string, ReplayBodyEntry>();
 
   constructor(private readonly options: WrapperOptions) {}
 
@@ -47,6 +53,9 @@ export class ResponseStore {
         conversationId: conversationId.trim(),
         expiresAtUtc: record.expiresAtUtc,
       });
+      // Cache the completed body for idempotent replay of a byte-identical
+      // retry inside the guard window (see rememberReplayResponse).
+      this.rememberReplayResponse(conversationId.trim(), response);
     }
   }
 
@@ -166,6 +175,53 @@ export class ResponseStore {
     });
   }
 
+  // Cache the real completed response body per conversation so a byte-identical
+  // retry inside the guard window can be answered with the same body (crucially,
+  // any function_call output items) instead of an empty suppressed message.
+  // Keyed by conversationId — the one join key available both here (via set())
+  // and at the guard hit site (via getRecentRequestHashConversationId). For a
+  // byte-identical retry the client never received turn N's response (that is
+  // why it retries), so it cannot have advanced the conversation past N, and the
+  // latest cached body for the conversation is turn N's. Guard TTL; kept out of
+  // the entries map so it never surfaces in list().
+  rememberReplayResponse(conversationId: string, response: JsonObject): void {
+    const normalizedId = conversationId.trim();
+    if (!normalizedId) {
+      return;
+    }
+    // Only cache responses that carry useful output (a function_call item or
+    // non-empty assistant text). Empty / tool-less bodies are left uncached so a
+    // byte-identical retry falls through to a fresh upstream attempt instead of
+    // being permanently answered with an empty replay — this preserves the
+    // stochastic "retry until the model emits the forced tool call" flow while
+    // still replaying real tool/text turns idempotently.
+    if (!responseHasUsefulOutput(response)) {
+      return;
+    }
+    this.purgeExpired();
+    this.replayBodies.set(normalizedId, {
+      expiresAtUtc: Date.now() + RequestHashGuardTtlMs,
+      response: cloneJsonValue(response),
+    });
+  }
+
+  tryGetReplayResponse(conversationId: string): JsonObject | null {
+    const normalizedId = conversationId.trim();
+    if (!normalizedId) {
+      return null;
+    }
+    this.purgeExpired();
+    const entry = this.replayBodies.get(normalizedId);
+    if (!entry) {
+      return null;
+    }
+    if (entry.expiresAtUtc <= Date.now()) {
+      this.replayBodies.delete(normalizedId);
+      return null;
+    }
+    return cloneJsonValue(entry.response);
+  }
+
   private resolveExpiryMs(): number {
     const ttlMinutes = this.options.conversationTtlMinutes;
     if (ttlMinutes <= 0) {
@@ -202,6 +258,15 @@ export class ResponseStore {
         }
       }
     }
+
+    if (this.replayBodies.size > 0) {
+      const now = Date.now();
+      for (const [id, entry] of this.replayBodies.entries()) {
+        if (entry.expiresAtUtc <= now) {
+          this.replayBodies.delete(id);
+        }
+      }
+    }
   }
 }
 
@@ -228,4 +293,43 @@ function readCreatedAt(response: JsonObject): number {
     }
   }
   return nowUnix();
+}
+
+// A response is worth caching for idempotent replay only if it carries output a
+// retry would want back: a function_call (tool) item, or a message with
+// non-empty text. Empty / tool-less bodies return false so they are not cached.
+function responseHasUsefulOutput(response: JsonObject): boolean {
+  const output = response.output;
+  if (!Array.isArray(output)) {
+    return false;
+  }
+  for (const item of output) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      continue;
+    }
+    const typed = item as Record<string, unknown>;
+    const itemType = typeof typed.type === "string" ? typed.type : "";
+    if (itemType === "function_call") {
+      return true;
+    }
+    if (itemType === "message" || itemType === "") {
+      const content = typed.content;
+      if (!Array.isArray(content)) {
+        continue;
+      }
+      for (const part of content) {
+        if (typeof part !== "object" || part === null || Array.isArray(part)) {
+          continue;
+        }
+        const partTyped = part as Record<string, unknown>;
+        if (
+          typeof partTyped.text === "string" &&
+          partTyped.text.trim().length > 0
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }

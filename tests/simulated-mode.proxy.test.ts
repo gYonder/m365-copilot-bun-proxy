@@ -1290,7 +1290,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(tryGetString(body.error as JsonObject, "code")).toBe("invalid_request");
   });
 
-  test("responses request-hash guard suppresses duplicate identical requests", async () => {
+  test("responses request-hash guard replays the stored response for duplicate identical requests", async () => {
     let chatCallCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
@@ -1349,19 +1349,109 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(second.status).toBe(200);
+    // Upstream is still hit only once — the guard prevents the duplicate from
+    // re-invoking the substrate conversation.
     expect(chatCallCount).toBe(1);
     expect(second.headers.get("x-m365-request-hash-replayed")).toBe("true");
     expect(second.headers.get("x-m365-replay-suppressed")).toBe("true");
+    // New: the duplicate now replays the REAL stored body (idempotent) rather
+    // than an empty message, so retried tool turns keep their output.
+    expect(second.headers.get("x-m365-replay-idempotent")).toBe("true");
     expect(second.headers.get("x-m365-conversation-id")).toBe("conv_simulated_1");
     const secondBody = (await second.json()) as JsonObject;
     expect(tryGetString(secondBody, "status")).toBe("completed");
-    expect(tryGetString(secondBody, "id")?.startsWith("resp_replay_")).toBeTrue();
-    expect(tryGetString(secondBody, "conversation")).toBe("conv_simulated_1");
-    expect(tryGetString(secondBody, "conversation_id")).toBe("conv_simulated_1");
+    expect(tryGetString(secondBody, "id")).toBe("resp_hash_guard_first");
     expect(Array.isArray(secondBody.output)).toBeTrue();
     expect((secondBody.output as unknown[]).length).toBe(1);
-    expect(tryGetString(secondBody, "output_text") ?? "").toBe("");
+    expect(tryGetString(secondBody, "output_text") ?? "").toBe("hello once");
   });
+
+  test("responses request-hash guard replays function_call tool output on duplicate (patch/write regression)", async () => {
+    let chatCallCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        chatCallCount += 1;
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            id: "resp_tool_first",
+            object: "response",
+            created_at: 1700000000,
+            status: "completed",
+            model: "simulated-model",
+            output: [
+              {
+                type: "function_call",
+                status: "completed",
+                call_id: "call_abc123",
+                name: "shell",
+                arguments: '{"command":["sh","-c","printf world > hello.txt"]}',
+              },
+            ],
+          }),
+        );
+      }),
+    );
+
+    const requestBody = {
+      model: "m365-copilot",
+      stream: false,
+      input: [
+        {
+          role: "user",
+          content: [{ type: "input_text", text: "Create hello.txt with world" }],
+        },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "shell",
+          parameters: {
+            type: "object",
+            properties: { command: { type: "array", items: { type: "string" } } },
+          },
+        },
+      ],
+      tool_choice: "auto",
+    };
+
+    const makeRequest = () =>
+      app.fetch(
+        new Request("http://localhost/v1/responses", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-m365-transport": TransportNames.Graph,
+          },
+          body: JSON.stringify(requestBody),
+        }),
+      );
+
+    const first = await makeRequest();
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as JsonObject;
+    const firstOutput = firstBody.output as JsonObject[];
+    expect(firstOutput[0]?.type).toBe("function_call");
+
+    const second = await makeRequest();
+    expect(second.status).toBe(200);
+    expect(chatCallCount).toBe(1);
+    expect(second.headers.get("x-m365-replay-idempotent")).toBe("true");
+
+    const secondBody = (await second.json()) as JsonObject;
+    const secondOutput = secondBody.output as JsonObject[];
+    // The retried tool turn MUST still carry the function_call so Codex can
+    // apply the patch / run the shell command — not an empty message.
+    expect(Array.isArray(secondOutput)).toBeTrue();
+    expect(secondOutput[0]?.type).toBe("function_call");
+    expect(tryGetString(secondOutput[0], "name")).toBe("shell");
+    expect(tryGetString(secondOutput[0], "call_id")).toBe("call_abc123");
+    expect(tryGetString(secondOutput[0], "arguments")).toBe(
+      '{"command":["sh","-c","printf world > hello.txt"]}',
+    );
+  });
+
 
   test("responses short-circuits repeated trailing assistant replay loop for non-stream requests", async () => {
     let chatCallCount = 0;
