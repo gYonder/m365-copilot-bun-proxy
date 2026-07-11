@@ -497,7 +497,10 @@ export class CopilotSubstrateClient {
         // ignore
       }
 
-      if (responseError && !assistantText) {
+      // SignalR type 7/error frames are terminal failures. Never turn a
+      // partially streamed message into a successful Codex turn: that would
+      // make a failed write or patch look completed to the client.
+      if (responseError) {
         return buildFailure(502, `Substrate chat failed. ${responseError}`);
       }
 
