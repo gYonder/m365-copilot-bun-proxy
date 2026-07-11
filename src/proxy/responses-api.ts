@@ -121,11 +121,13 @@ export function buildFunctionCallOutputItem(
 ): JsonObject {
   return {
     id: itemId,
-    type: "function_call",
+    type: toolCall.type === "custom" ? "custom_tool_call" : "function_call",
     status,
     call_id: toolCall.id,
     name: toolCall.name,
-    arguments: toolCall.argumentsJson,
+    ...(toolCall.type === "custom"
+      ? { input: toolCall.argumentsJson }
+      : { arguments: toolCall.argumentsJson }),
   };
 }
 

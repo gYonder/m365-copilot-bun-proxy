@@ -482,6 +482,7 @@ export function tryBuildAssistantResponseFromChatCompletionPayload(
           pickString(toolCallNode.id) ??
           `call_${randomUUID().replaceAll("-", "")}`,
         name,
+        type: "function",
         argumentsJson: normalizeArgumentsJson(
           toolCallNode.arguments ?? functionNode?.arguments ?? null,
         ),
@@ -683,7 +684,8 @@ function tryBuildToolCall(
     return null;
   }
 
-  const argumentsJson = normalizeArgumentsJson(
+  const offeredTool = tooling.tools.find((tool) => tool.name === name);
+  const rawArguments =
     callObject.arguments ??
       functionObject?.arguments ??
       callObject.args ??
@@ -694,10 +696,18 @@ function tryBuildToolCall(
       functionObject?.parameters ??
       callObject.input ??
       functionObject?.input ??
-      null,
-  );
+      null;
+  const argumentsJson = offeredTool?.type === "custom"
+    ? normalizeCustomToolInput(rawArguments)
+    : normalizeArgumentsJson(rawArguments);
   const id = pickString(callObject.id) ?? `call_${randomUUID().replaceAll("-", "")}`;
-  return { id, name, argumentsJson };
+  return { id, name, type: offeredTool?.type ?? "function", argumentsJson };
+}
+
+function normalizeCustomToolInput(input: JsonValue | null): string {
+  if (typeof input === "string") return input;
+  if (input === null) return "";
+  return JSON.stringify(input);
 }
 
 function normalizeArgumentsJson(argumentsNode: JsonValue | null): string {
@@ -957,11 +967,10 @@ export function buildToolCallsDelta(toolCalls: OpenAiAssistantToolCall[]): JsonV
   return toolCalls.map((toolCall, index) => ({
     index,
     id: toolCall.id,
-    type: "function",
-    function: {
-      name: toolCall.name,
-      arguments: toolCall.argumentsJson,
-    },
+    type: toolCall.type === "custom" ? "custom" : "function",
+    ...(toolCall.type === "custom"
+      ? { name: toolCall.name, input: toolCall.argumentsJson }
+      : { function: { name: toolCall.name, arguments: toolCall.argumentsJson } }),
   }));
 }
 

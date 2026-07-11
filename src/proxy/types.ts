@@ -83,6 +83,7 @@ export type OpenAiResponseFormat = {
 export type OpenAiAssistantToolCall = {
   id: string;
   name: string;
+  type: "function" | "custom";
   argumentsJson: string;
 };
 

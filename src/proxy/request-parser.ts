@@ -692,7 +692,7 @@ function normalizeResponsesInput(inputNode: JsonValue | undefined): {
       continue;
     }
 
-    if (type === "function_call_output") {
+    if (type === "function_call_output" || type === "custom_tool_call_output") {
       const message: JsonObject = {
         role: "tool",
         content: stringifyJsonValue(item.output),
@@ -710,13 +710,14 @@ function normalizeResponsesInput(inputNode: JsonValue | undefined): {
       continue;
     }
 
-    if (type === "function_call") {
+    if (type === "function_call" || type === "custom_tool_call") {
       const functionName = tryGetString(item, "name");
       if (!functionName) {
         continue;
       }
-      const functionArguments =
-        normalizeFunctionArguments(item.arguments) ?? "{}";
+      const functionArguments = type === "custom_tool_call"
+        ? (tryGetString(item, "input") ?? "")
+        : (normalizeFunctionArguments(item.arguments) ?? "{}");
       const toolCall: JsonObject = {
         id:
           tryGetString(item, "call_id") ??
