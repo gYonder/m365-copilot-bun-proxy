@@ -1,0 +1,12 @@
+{
+  "capture": "sanitized-loopback-shape-v1",
+  "codex_cli": "0.144.1",
+  "request": {
+    "top_level_fields": ["client_metadata", "include", "input", "model", "parallel_tool_calls", "prompt_cache_key", "reasoning", "store", "stream", "text", "tool_choice"],
+    "tool_container": {"input_item_type": "additional_tools", "role": "developer"},
+    "tool_types": ["custom", "function", "namespace"],
+    "custom_format": {"type": "grammar", "fields": ["definition", "syntax"]},
+    "function_fields": ["description", "name", "parameters", "strict", "type"],
+    "raw_content": "redacted"
+  }
+}

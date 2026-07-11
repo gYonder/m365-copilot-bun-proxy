@@ -1029,14 +1029,13 @@ function extractToolCallsFromResponsesOutputNode(node: JsonObject): JsonObject[]
 
 function parseTooling(requestJson: JsonObject): OpenAiTooling {
   const tools: OpenAiToolDefinition[] = [];
-  const toolsArray = requestJson.tools;
-  if (Array.isArray(toolsArray)) {
+  for (const toolsArray of collectResponseToolArrays(requestJson)) {
     for (const toolNode of toolsArray) {
       if (!isJsonObject(toolNode)) {
         continue;
       }
-      const type = tryGetString(toolNode, "type");
-      if (type?.toLowerCase() !== "function") {
+      const type = tryGetString(toolNode, "type")?.toLowerCase();
+      if (type !== "function" && type !== "custom") {
         continue;
       }
       const functionObject = isJsonObject(toolNode.function)
@@ -1052,8 +1051,12 @@ function parseTooling(requestJson: JsonObject): OpenAiTooling {
 
       tools.push({
         name: name.trim(),
+        type,
         description: tryGetString(functionObject, "description"),
         parameters,
+        format: isJsonObject(functionObject.format)
+          ? cloneJsonValue(functionObject.format)
+          : null,
       });
     }
   }
@@ -1089,6 +1092,35 @@ function parseTooling(requestJson: JsonObject): OpenAiTooling {
     parallelToolCalls:
       tryGetBoolean(requestJson, "parallel_tool_calls") !== false,
   };
+}
+
+// Codex CLI places its actual tool declarations inside a developer input item
+// (`type: additional_tools`), not only at the Responses request top level.
+// Keep namespace-contained function declarations too; they are client-offered
+// tools and must remain available to strict validation.
+function collectResponseToolArrays(requestJson: JsonObject): JsonValue[][] {
+  const arrays: JsonValue[][] = [];
+  if (Array.isArray(requestJson.tools)) {
+    arrays.push(requestJson.tools);
+  }
+  const input = requestJson.input;
+  if (!Array.isArray(input)) {
+    return arrays;
+  }
+  for (const item of input) {
+    if (!isJsonObject(item) || tryGetString(item, "type")?.toLowerCase() !== "additional_tools") {
+      continue;
+    }
+    if (Array.isArray(item.tools)) {
+      arrays.push(item.tools);
+      for (const tool of item.tools) {
+        if (isJsonObject(tool) && tryGetString(tool, "type")?.toLowerCase() === "namespace" && Array.isArray(tool.tools)) {
+          arrays.push(tool.tools);
+        }
+      }
+    }
+  }
+  return arrays;
 }
 
 function parseResponseFormat(
@@ -1248,8 +1280,10 @@ function appendOpenAiCompatibilityContext(
       text: JSON.stringify(
         tooling.tools.map((tool) => ({
           name: tool.name,
+          type: tool.type,
           description: tool.description,
           parameters: cloneJsonValue(tool.parameters),
+          format: tool.format ? cloneJsonValue(tool.format) : undefined,
         })),
       ),
       description: "Available tools",

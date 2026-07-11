@@ -61,8 +61,10 @@ export type ContextMessage = {
 
 export type OpenAiToolDefinition = {
   name: string;
+  type: "function" | "custom";
   description: string | null;
   parameters: JsonObject;
+  format: JsonObject | null;
 };
 
 export type OpenAiTooling = {

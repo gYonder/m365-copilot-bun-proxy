@@ -96,6 +96,62 @@ describe("simulated transform mode proxy flow", () => {
     );
   });
 
+  test("responses reads Codex additional_tools function and custom declarations", () => {
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        input: [
+          {
+            type: "additional_tools",
+            role: "developer",
+            tools: [
+              {
+                type: "custom",
+                name: "apply_patch",
+                description: "Apply a patch.",
+                format: { type: "grammar", syntax: "lark", definition: "patch" },
+              },
+              {
+                type: "function",
+                name: "exec_command",
+                parameters: {
+                  type: "object",
+                  properties: { cmd: { type: "string" } },
+                  required: ["cmd"],
+                },
+              },
+            ],
+          },
+          { type: "message", role: "user", content: "inspect the workspace" },
+        ],
+      },
+      createOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.base.tooling.tools).toEqual([
+      {
+        name: "apply_patch",
+        type: "custom",
+        description: "Apply a patch.",
+        parameters: {},
+        format: { type: "grammar", syntax: "lark", definition: "patch" },
+      },
+      {
+        name: "exec_command",
+        type: "function",
+        description: null,
+        parameters: {
+          type: "object",
+          properties: { cmd: { type: "string" } },
+          required: ["cmd"],
+        },
+        format: null,
+      },
+    ]);
+  });
+
   test("GET /v1/models returns all supported models", async () => {
     const app = createProxyApp(
       createServices((conversationId, payload) =>
