@@ -1167,24 +1167,12 @@ async function handleResponsesCreate(
     payload.json,
     selectedTransport,
   );
-  const replayResponseId = buildReplayResponseIdFromHash(replayLoopHash);
-  const suppressedConversationId = resolveSuppressedResponsesConversationId(
-    request,
-    payload.json,
-    parsedRequest,
-    selectedTransport,
-    conversationStore,
-    responseStore,
-  );
-  const trailingAssistantReplay = detectAssistantTailReplayWithoutNewUserTurn(
-    parsedRequest.inputItemsForStorage,
-  );
   if (responseStore.hasRecentRequestHash(requestHash)) {
     responseHeaders.set("x-m365-request-hash-replayed", "true");
     const replayConversationId =
       responseStore.getRecentRequestHashConversationId(requestHash) ??
       responseStore.getRecentRequestHashConversationId(replayLoopHash) ??
-      suppressedConversationId;
+      null;
     rememberResponsesReplayHashes(
       responseStore,
       requestHash,
@@ -1207,33 +1195,12 @@ async function handleResponsesCreate(
         storedReplayResponse,
       );
     }
-    return buildSuppressedReplayResponsesResult(
+    return writeOpenAiError(
       services,
-      parsedRequest,
-      responseHeaders,
-      replayConversationId,
-      trailingAssistantReplay,
-      replayResponseId,
-    );
-  }
-  if (trailingAssistantReplay) {
-    const replayConversationId =
-      responseStore.getRecentRequestHashConversationId(requestHash) ??
-      responseStore.getRecentRequestHashConversationId(replayLoopHash) ??
-      suppressedConversationId;
-    rememberResponsesReplayHashes(
-      responseStore,
-      requestHash,
-      replayLoopHash,
-      replayConversationId,
-    );
-    return buildSuppressedReplayResponsesResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      replayConversationId,
-      trailingAssistantReplay,
-      replayResponseId,
+      409,
+      "A duplicate response request was received after its replay body expired.",
+      "invalid_request_error",
+      "duplicate_response_replay_unavailable",
     );
   }
   const conversationSelection = selectConversation(

@@ -1496,7 +1496,7 @@ describe("simulated transform mode proxy flow", () => {
   });
 
 
-  test("responses short-circuits repeated trailing assistant replay loop for non-stream requests", async () => {
+  test("does not infer replay from a trailing assistant tail", async () => {
     let chatCallCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
@@ -1543,8 +1543,8 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(chatCallCount).toBe(0);
-    expect(response.headers.get("x-m365-replay-suppressed")).toBe("true");
+    expect(chatCallCount).toBe(1);
+    expect(response.headers.get("x-m365-replay-suppressed")).toBeNull();
     expect(response.headers.get("x-m365-conversation-id")).toBe(
       "conv_replay_guard_non_stream",
     );
@@ -1559,10 +1559,10 @@ describe("simulated transform mode proxy flow", () => {
     );
     expect(Array.isArray(body.output)).toBeTrue();
     expect((body.output as unknown[]).length).toBe(1);
-    expect(tryGetString(body, "output_text") ?? "").toBe("Hi");
+    expect(tryGetString(body, "output_text") ?? "").toBe("unused");
   });
 
-  test("responses short-circuits repeated trailing assistant replay loop for streaming requests", async () => {
+  test("does not infer streaming replay from a trailing assistant tail", async () => {
     let chatCallCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
@@ -1609,8 +1609,8 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(chatCallCount).toBe(0);
-    expect(response.headers.get("x-m365-replay-suppressed")).toBe("true");
+    expect(chatCallCount).toBe(1);
+    expect(response.headers.get("x-m365-replay-suppressed")).toBeNull();
     expect(response.headers.get("x-m365-conversation-id")).toBe(
       "conv_replay_guard_stream",
     );
@@ -1664,11 +1664,11 @@ describe("simulated transform mode proxy flow", () => {
     );
     expect(Array.isArray(completed.output)).toBeTrue();
     expect((completed.output as unknown[]).length).toBe(1);
-    expect(tryGetString(completed, "output_text") ?? "").toBe("Hi");
+    expect(tryGetString(completed, "output_text") ?? "").toBe("unused");
     expect(sawDone).toBeTrue();
   });
 
-  test("responses suppresses replay loop even with a single trailing assistant message", async () => {
+  test("does not infer replay from one assistant item", async () => {
     let chatCallCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
@@ -1710,16 +1710,16 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(chatCallCount).toBe(0);
-    expect(response.headers.get("x-m365-replay-suppressed")).toBe("true");
+    expect(chatCallCount).toBe(1);
+    expect(response.headers.get("x-m365-replay-suppressed")).toBeNull();
     const body = (await response.json()) as JsonObject;
     expect(tryGetString(body, "status")).toBe("completed");
     expect(Array.isArray(body.output)).toBeTrue();
     expect((body.output as unknown[]).length).toBe(1);
-    expect(tryGetString(body, "output_text") ?? "").toBe("Hi");
+    expect(tryGetString(body, "output_text") ?? "").toBe("unused");
   });
 
-  test("responses replay suppression keeps conversation header when body conversation is disabled", async () => {
+  test("keeps explicit conversation header without content-tail replay", async () => {
     const app = createProxyApp(
       createServices(
         (conversationId, payload) =>
@@ -1764,17 +1764,17 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("x-m365-replay-suppressed")).toBe("true");
+    expect(response.headers.get("x-m365-replay-suppressed")).toBeNull();
     expect(response.headers.get("x-m365-conversation-id")).toBe(
       "conv_header_only_replay",
     );
     const body = (await response.json()) as JsonObject;
     expect(tryGetString(body, "conversation")).toBeNull();
     expect(tryGetString(body, "conversation_id")).toBeNull();
-    expect(tryGetString(body, "output_text") ?? "").toBe("Hi");
+    expect(tryGetString(body, "output_text") ?? "").toBe("unused");
   });
 
-  test("responses replay suppression uses stable replay id for growing assistant tails", async () => {
+  test("continues growing assistant tails unless request identity repeats", async () => {
     let chatCallCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
@@ -1847,12 +1847,12 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
     expect(replayOne.status).toBe(200);
-    expect(chatCallCount).toBe(1);
-    expect(replayOne.headers.get("x-m365-replay-suppressed")).toBe("true");
+    expect(chatCallCount).toBe(2);
+    expect(replayOne.headers.get("x-m365-replay-suppressed")).toBeNull();
     expect(replayOne.headers.get("x-m365-conversation-id")).toBe("conv_simulated_1");
     const replayOneBody = (await replayOne.json()) as JsonObject;
     const replayOneId = tryGetString(replayOneBody, "id");
-    expect(replayOneId?.startsWith("resp_replay_")).toBeTrue();
+    expect(replayOneId?.startsWith("resp_")).toBeTrue();
     expect(tryGetString(replayOneBody, "output_text") ?? "").toBe("Hi");
 
     const replayTwo = await app.fetch(
@@ -1883,8 +1883,8 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
     expect(replayTwo.status).toBe(200);
-    expect(chatCallCount).toBe(1);
-    expect(replayTwo.headers.get("x-m365-replay-suppressed")).toBe("true");
+    expect(chatCallCount).toBe(3);
+    expect(replayTwo.headers.get("x-m365-replay-suppressed")).toBeNull();
     expect(replayTwo.headers.get("x-m365-conversation-id")).toBe("conv_simulated_1");
     const replayTwoBody = (await replayTwo.json()) as JsonObject;
     expect(tryGetString(replayTwoBody, "id")).toBe(replayOneId);
