@@ -198,7 +198,7 @@ Model to Substrate `tone` mapping:
 
 Notes:
 
-- If `model` is omitted, the proxy uses `defaultModel` from config (defaults to `m365-copilot`).
+- If `model` is omitted, the proxy uses `defaultModel` from config (defaults to `gpt-5.6-sol`).
 - `GET /v1/models` (and `GET /openai/v1/models`) returns the full supported model list above.
 - The GPT-5.5 reasoning tone (`Gpt_5_5_Reasoning`) and updated Substrate defaults are based on current Microsoft 365 Copilot web traffic captured in May 2026.
 

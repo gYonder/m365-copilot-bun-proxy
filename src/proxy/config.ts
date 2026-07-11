@@ -173,7 +173,7 @@ const WrapperOptionsSchema = z.object({
       incrementalSimulatedContentStreaming: z.boolean().default(false),
     })
     .default({}),
-  defaultModel: z.string().default("m365-copilot"),
+  defaultModel: z.string().default("gpt-5.6-sol"),
   defaultTimeZone: z.string().default("America/New_York"),
   conversationTtlMinutes: z.number().int().default(180),
   maxAdditionalContextMessages: z.number().int().default(16),

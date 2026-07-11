@@ -7,7 +7,7 @@ wire_api = "responses"
 
 [profiles.m365-copilot]
 model_provider = "m365-copilot-bun-proxy"
-model = "gpt-5.5"
-model_reasoning_effort = "xhigh"
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
 approval_policy = "never"
 sandbox_mode = "workspace-write"

@@ -32,7 +32,7 @@ describe("simulated transform mode proxy flow", () => {
           buildGraphChatResult(conversationId, payload, "unused"),
         (options) => {
           options.openAiTransformMode = OpenAiTransformModes.Mapped;
-          options.defaultModel = "gpt-5.5";
+          options.defaultModel = "gpt-5.6-sol";
         },
       ),
     );
@@ -43,7 +43,7 @@ describe("simulated transform mode proxy flow", () => {
     const body = (await response.json()) as JsonObject;
     expect(body.status).toBe("ok");
     expect(body.openAiTransformMode).toBe(OpenAiTransformModes.Mapped);
-    expect(body.defaultModel).toBe("gpt-5.5");
+    expect(body.defaultModel).toBe("gpt-5.6-sol");
   });
 
   test("mapped responses prompt inlines required local tool contract", () => {
@@ -116,28 +116,15 @@ describe("simulated transform mode proxy flow", () => {
     expect(openAiBody).toEqual(body);
     const data = Array.isArray(body.data) ? (body.data as JsonObject[]) : [];
     const ids = data.map((item) => tryGetString(item, "id"));
-    expect(ids).toEqual([
-      "m365-copilot-quick",
-      "m365-copilot-reasoning",
-      "m365-copilot-gpt5.2-quick",
-      "m365-copilot-gpt5.2-reasoning",
-      "m365-copilot-gpt5.4-quick",
-      "m365-copilot-gpt5.4-reasoning",
-      "m365-copilot-gpt5.5-quick",
-      "m365-copilot-gpt5.5-reasoning",
-      "gpt-5.5",
-      "m365-copilot",
-      "m365-copilot-auto",
-      "m365-copilot-magic",
-    ]);
+    expect(ids).toEqual(["gpt-5.6-sol"]);
     const codexModels = Array.isArray(body.models)
       ? (body.models as JsonObject[])
       : [];
     expect(codexModels.map((item) => tryGetString(item, "slug"))).toEqual(ids);
-    expect(codexModels[8]?.shell_type).toBe("shell_command");
-    expect(codexModels[8]?.default_reasoning_level).toBe("xhigh");
-    expect(codexModels[8]?.apply_patch_tool_type).toBe("freeform");
-    expect(codexModels[8]?.supports_parallel_tool_calls).toBe(true);
+    expect(codexModels[0]?.shell_type).toBe("shell_command");
+    expect(codexModels[0]?.default_reasoning_level).toBe("high");
+    expect(codexModels[0]?.apply_patch_tool_type).toBe("freeform");
+    expect(codexModels[0]?.supports_parallel_tool_calls).toBe(true);
   });
 
   test("chat/completions non-stream wraps incoming JSON and returns parsed JSON block", async () => {

@@ -740,27 +740,8 @@ export function buildInvocationPayload(
 export function resolveSubstrateTone(model: string | null | undefined): string {
   const normalizedModel = model?.trim().toLowerCase() ?? "";
   switch (normalizedModel) {
-    case "m365-copilot-quick":
-      return "Chat";
-    case "m365-copilot-reasoning":
-      return "Reasoning";
-    case "m365-copilot-gpt5.2-quick":
-      return "Gpt_5_2_Chat";
-    case "m365-copilot-gpt5.2-reasoning":
-      return "Gpt_5_2_Reasoning";
-    case "m365-copilot-gpt5.4-quick":
-      return "Gpt_5_4_Chat";
-    case "m365-copilot-gpt5.4-reasoning":
-      return "Gpt_5_4_Reasoning";
-    case "m365-copilot-gpt5.5-quick":
-      return "Gpt_5_5_Chat";
-    case "m365-copilot-gpt5.5-reasoning":
-    case "gpt-5.5":
-      return "Gpt_5_5_Reasoning";
-    case "m365-copilot":
-    case "m365-copilot-auto":
-    case "m365-copilot-magic":
-      return "magic";
+    case "gpt-5.6-sol":
+      return "Gpt_5_6_Reasoning";
     default:
       return "magic";
   }

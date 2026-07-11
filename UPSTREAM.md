@@ -8,15 +8,16 @@ It tracks the upstream project at:
 https://github.com/edlaver/m365-copilot-bun-proxy.git
 ```
 
-This local checkout is not expected to push changes upstream. Local commits are an intentional overlay for the Companion M365 Copilot + Codex workflow.
+`origin` is the owned canonical repository for this Codex M365 workflow. Do
+not merge or rebase research repositories into this checkout.
 
 ## Local Policy
 
-- Keep upstream as a read-only source of proxy updates.
-- Keep local overlay commits small and reviewable.
+- Keep owned commits small and reviewable.
 - Do not discard local commits or uncommitted changes during upstream sync.
 - Do not commit raw tokens, browser state, cookies, HAR files, account identifiers, or debug traces.
-- Treat `gpt-5.5` as the local proxy alias for M365 Copilot `Gpt_5_5_Reasoning`.
+- Expose only `gpt-5.6-sol` at `high`; route it to M365
+  `Gpt_5_6_Reasoning`.
 
 ## Safe Sync Workflow
 
@@ -28,13 +29,14 @@ tools/sync-proxy-upstream.sh
 
 The helper fetches upstream metadata and reports divergence. It refuses to modify history when the proxy worktree is dirty.
 
-If upstream has new commits and the worktree is clean, review the commits first:
+If the owned canonical branch has new commits and the worktree is clean, review
+them first:
 
 ```bash
 git -C m365-copilot-bun-proxy log --oneline --decorate --left-right --cherry-pick main...origin/main
 ```
 
-Then choose a normal git operation deliberately, usually rebase for a linear local overlay:
+Then choose a normal git operation deliberately:
 
 ```bash
 git -C m365-copilot-bun-proxy rebase origin/main
@@ -62,7 +64,7 @@ For a full stack check from the companion root, run:
 Upstream sync should preserve these local capabilities unless intentionally replaced:
 
 - Codex Responses API provider compatibility.
-- `gpt-5.5` model alias and GPT-5.5 Substrate tone mapping.
+- `gpt-5.6-sol` model alias and `Gpt_5_6_Reasoning` Substrate selector.
 - local shell/file tool-call response shaping.
 - headless and visible M365 token refresh flow.
 - cached token metadata support for non-JWT substrate tokens.
