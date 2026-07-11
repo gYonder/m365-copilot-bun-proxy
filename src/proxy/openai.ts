@@ -700,8 +700,28 @@ function tryBuildToolCall(
   const argumentsJson = offeredTool?.type === "custom"
     ? normalizeCustomToolInput(rawArguments)
     : normalizeArgumentsJson(rawArguments);
+  if (
+    offeredTool !== undefined &&
+    offeredTool.type !== "custom" &&
+    !hasRequiredToolArguments(argumentsJson, offeredTool.parameters)
+  ) {
+    return null;
+  }
   const id = pickString(callObject.id) ?? `call_${randomUUID().replaceAll("-", "")}`;
   return { id, name, type: offeredTool?.type ?? "function", argumentsJson };
+}
+
+function hasRequiredToolArguments(
+  argumentsJson: string,
+  parameters: JsonObject,
+): boolean {
+  const required = parameters.required;
+  if (!Array.isArray(required) || required.length === 0) return true;
+  const parsed = tryParseJsonNode(argumentsJson);
+  if (!isJsonObject(parsed)) return false;
+  return required.every(
+    (name) => typeof name === "string" && parsed[name] !== undefined,
+  );
 }
 
 function normalizeCustomToolInput(input: JsonValue | null): string {

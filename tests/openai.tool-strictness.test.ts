@@ -69,18 +69,15 @@ describe("buildAssistantResponse strict tool behavior", () => {
 
 
   test("extracts M365-style tool call aliases into canonical JSON arguments", () => {
-    const request = createRequest(ToolChoiceModes.Required, null, {
-      toolName: "write_to_file",
-    });
+    const request = createRequest(ToolChoiceModes.Required, null);
     const response = buildAssistantResponse(
       request,
       JSON.stringify({
         tool_calls: [
           {
-            recipient_name: "write_to_file",
+            recipient_name: "get_time",
             parameters: {
-              path: "tests/agent-tests/fallback.ts",
-              content: "export const ok = true;",
+              zone: "UTC",
             },
           },
         ],
@@ -90,9 +87,8 @@ describe("buildAssistantResponse strict tool behavior", () => {
     expect(response.strictToolErrorMessage).toBeNull();
     expect(response.finishReason).toBe("tool_calls");
     expect(response.toolCalls.length).toBe(1);
-    expect(response.toolCalls[0]?.name).toBe("write_to_file");
-    expect(response.toolCalls[0]?.argumentsJson).toContain("\"path\"");
-    expect(response.toolCalls[0]?.argumentsJson).toContain("\"content\"");
+    expect(response.toolCalls[0]?.name).toBe("get_time");
+    expect(response.toolCalls[0]?.argumentsJson).toContain("\"zone\"");
   });
 
   test("does not fabricate a tool call when strict local exec output is missing", () => {
@@ -109,6 +105,26 @@ describe("buildAssistantResponse strict tool behavior", () => {
     expect(response.toolCalls.length).toBe(0);
     expect(response.finishReason).toBe("stop");
     expect(response.strictToolErrorMessage).not.toBeNull();
+  });
+
+  test("rejects a function call missing required arguments", () => {
+    const response = buildAssistantResponse(
+      createRequest(ToolChoiceModes.Required, null),
+      '{"tool_calls":[{"name":"get_time","arguments":{}}]}',
+    );
+
+    expect(response.toolCalls).toEqual([]);
+    expect(response.strictToolErrorMessage).toContain("tool_calls");
+  });
+
+  test("rejects an unknown offered tool under strict choice", () => {
+    const response = buildAssistantResponse(
+      createRequest(ToolChoiceModes.Required, null),
+      '{"tool_calls":[{"name":"not_offered","arguments":{"zone":"UTC"}}]}',
+    );
+
+    expect(response.toolCalls).toEqual([]);
+    expect(response.strictToolErrorMessage).toContain("tool_calls");
   });
 });
 
