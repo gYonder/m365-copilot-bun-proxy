@@ -1044,6 +1044,8 @@ function listenToWebSocketEvent(
       event: string,
       handler: (event: { data?: unknown; error?: unknown }) => void,
     ) => void;
+    onmessage?: ((event: { data?: unknown }) => void) | null;
+    onerror?: ((event: { error?: unknown }) => void) | null;
   };
 
   if (once && typeof emitter.once === "function") {
@@ -1087,6 +1089,25 @@ function listenToWebSocketEvent(
     };
     emitter.addEventListener(event, wrapped, once ? { once: true } : undefined);
     return () => emitter.removeEventListener?.(event, wrapped);
+  }
+
+  // Bun's native WebSocket can expose property handlers without the Node or
+  // DOM listener methods. Support that shape for the live Substrate client.
+  if (event === "message" && "onmessage" in emitter) {
+    const previous = emitter.onmessage;
+    const wrapped = (domEvent: { data?: unknown }) => handler(domEvent.data);
+    emitter.onmessage = wrapped;
+    return () => {
+      if (emitter.onmessage === wrapped) emitter.onmessage = previous ?? null;
+    };
+  }
+  if (event === "error" && "onerror" in emitter) {
+    const previous = emitter.onerror;
+    const wrapped = (domEvent: { error?: unknown }) => handler(domEvent.error ?? domEvent);
+    emitter.onerror = wrapped;
+    return () => {
+      if (emitter.onerror === wrapped) emitter.onerror = previous ?? null;
+    };
   }
 
   throw new Error(`Unsupported WebSocket event API for '${event}'.`);
