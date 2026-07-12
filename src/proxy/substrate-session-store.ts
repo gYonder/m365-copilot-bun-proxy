@@ -5,10 +5,38 @@ type SessionEntry = {
   expiresAtUtc: number;
 };
 
+const DefaultMaxEntries = 512;
+const MaxWaitersPerConversation = 32;
+
+type TurnWaiter = {
+  resolve: () => void;
+  reject: (error: TurnQueueWaitError) => void;
+  signal: AbortSignal | null;
+  abortHandler: (() => void) | null;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+export class TurnQueueWaitError extends Error {
+  constructor(readonly reason: "cancelled" | "deadline" | "overloaded") {
+    super(
+      reason === "cancelled"
+        ? "Substrate turn cancelled while waiting for the conversation lock."
+        : reason === "deadline"
+          ? "M365 task-level deadline exceeded while waiting for the conversation lock."
+          : "Too many Substrate turns are queued for this conversation.",
+    );
+  }
+}
+
 export class SubstrateSessionStore {
   private readonly entries = new Map<string, SessionEntry>();
+  private readonly activeTurns = new Set<string>();
+  private readonly turnQueues = new Map<string, TurnWaiter[]>();
 
-  constructor(private readonly ttlMinutes: number) {}
+  constructor(
+    private readonly ttlMinutes: number,
+    private readonly maxEntries: number = DefaultMaxEntries,
+  ) {}
 
   getOrCreate(
     conversationId: string,
@@ -23,6 +51,7 @@ export class SubstrateSessionStore {
 
     const existing = this.entries.get(normalizedConversationId);
     if (existing) {
+      this.entries.delete(normalizedConversationId);
       this.entries.set(normalizedConversationId, {
         sessionId: existing.sessionId,
         expiresAtUtc: this.computeExpiry(nowUtcMs),
@@ -35,6 +64,7 @@ export class SubstrateSessionStore {
       sessionId,
       expiresAtUtc: this.computeExpiry(nowUtcMs),
     });
+    this.trimToLimit();
     return sessionId;
   }
 
@@ -53,6 +83,27 @@ export class SubstrateSessionStore {
       sessionId: normalizedSessionId,
       expiresAtUtc: this.computeExpiry(nowUtcMs),
     });
+    this.trimToLimit();
+  }
+
+  async runExclusive<T>(
+    conversationId: string,
+    task: () => Promise<T>,
+    signal: AbortSignal | null = null,
+    deadlineMs: number | null = null,
+  ): Promise<T> {
+    const key = conversationId.trim();
+    if (!key) {
+      return task();
+    }
+
+    await this.acquireTurn(key, signal, deadlineMs);
+    try {
+      return await task();
+    } finally {
+      this.releaseTurn(key);
+      this.trimToLimit();
+    }
   }
 
   private computeExpiry(nowUtcMs: number): number {
@@ -69,6 +120,103 @@ export class SubstrateSessionStore {
       if (entry.expiresAtUtc <= nowUtcMs) {
         this.entries.delete(conversationId);
       }
+    }
+  }
+
+  private trimToLimit(): void {
+    if (this.maxEntries <= 0) {
+      return;
+    }
+    for (const conversationId of this.entries.keys()) {
+      if (this.entries.size <= this.maxEntries) {
+        return;
+      }
+      if (!this.activeTurns.has(conversationId)) {
+        this.entries.delete(conversationId);
+      }
+    }
+  }
+
+  private acquireTurn(
+    key: string,
+    signal: AbortSignal | null,
+    deadlineMs: number | null,
+  ): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new TurnQueueWaitError("cancelled"));
+    }
+    if (deadlineMs !== null && deadlineMs <= Date.now()) {
+      return Promise.reject(new TurnQueueWaitError("deadline"));
+    }
+    if (!this.activeTurns.has(key)) {
+      this.activeTurns.add(key);
+      return Promise.resolve();
+    }
+    const existingQueue = this.turnQueues.get(key);
+    if ((existingQueue?.length ?? 0) >= MaxWaitersPerConversation) {
+      return Promise.reject(new TurnQueueWaitError("overloaded"));
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const waiter: TurnWaiter = {
+        resolve: () => {
+          this.cleanupWaiter(waiter);
+          resolve();
+        },
+        reject,
+        signal,
+        abortHandler: null,
+        timer: null,
+      };
+      const rejectAndRemove = (reason: "cancelled" | "deadline") => {
+        const queue = this.turnQueues.get(key);
+        if (queue) {
+          const index = queue.indexOf(waiter);
+          if (index >= 0) {
+            queue.splice(index, 1);
+          }
+          if (queue.length === 0) {
+            this.turnQueues.delete(key);
+          }
+        }
+        this.cleanupWaiter(waiter);
+        reject(new TurnQueueWaitError(reason));
+      };
+      if (signal) {
+        waiter.abortHandler = () => rejectAndRemove("cancelled");
+        signal.addEventListener("abort", waiter.abortHandler, { once: true });
+      }
+      if (deadlineMs !== null) {
+        waiter.timer = setTimeout(
+          () => rejectAndRemove("deadline"),
+          Math.max(0, deadlineMs - Date.now()),
+        );
+      }
+      const queue = this.turnQueues.get(key) ?? [];
+      queue.push(waiter);
+      this.turnQueues.set(key, queue);
+    });
+  }
+
+  private releaseTurn(key: string): void {
+    const queue = this.turnQueues.get(key);
+    const next = queue?.shift();
+    if (queue && queue.length === 0) {
+      this.turnQueues.delete(key);
+    }
+    if (next) {
+      next.resolve();
+      return;
+    }
+    this.activeTurns.delete(key);
+  }
+
+  private cleanupWaiter(waiter: TurnWaiter): void {
+    if (waiter.abortHandler && waiter.signal) {
+      waiter.signal.removeEventListener("abort", waiter.abortHandler);
+    }
+    if (waiter.timer) {
+      clearTimeout(waiter.timer);
     }
   }
 }

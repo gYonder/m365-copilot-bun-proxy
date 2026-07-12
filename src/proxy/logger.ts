@@ -455,11 +455,9 @@ function buildFrameLogEntry(
   }
   if (analysis.messageText) {
     entry.messageTextLength = analysis.messageText.length;
-    entry.messagePreview = truncate(analysis.messageText, 200);
   }
   if (analysis.writeAtCursor) {
     entry.writeAtCursorLength = analysis.writeAtCursor.length;
-    entry.writeAtCursorPreview = truncate(analysis.writeAtCursor, 120);
   }
   if (analysis.error) {
     entry.error = analysis.error;
@@ -713,13 +711,6 @@ function collectMessages(json: JsonObject): JsonObject[] {
   }
 
   return messages;
-}
-
-function truncate(value: string, maxLength: number): string {
-  if (value.length <= maxLength) {
-    return value;
-  }
-  return `${value.slice(0, maxLength)}...`;
 }
 
 function redactHeaderValue(header: string, value: string): string {

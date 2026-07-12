@@ -9,6 +9,8 @@ type MutableTraceRecord = ProxyVizTraceRecord & {
   expiresAtUnix: number;
 };
 
+const MaxTraceEntries = 256;
+
 export class ProxyVizTraceStore {
   private readonly traces = new Map<string, MutableTraceRecord>();
 
@@ -38,6 +40,13 @@ export class ProxyVizTraceStore {
       expiresAtUnix: now + this.ttlSeconds,
     });
     this.cleanup(now);
+    while (this.traces.size > MaxTraceEntries) {
+      const oldest = this.traces.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      this.traces.delete(oldest.value);
+    }
   }
 
   setPane3(traceId: string, pane3: JsonValue | null): void {

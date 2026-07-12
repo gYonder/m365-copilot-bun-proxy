@@ -1,5 +1,7 @@
 import type { WrapperOptions } from "./types";
 
+const MaxConversationEntries = 1_024;
+
 export class ConversationStore {
   private readonly entries = new Map<
     string,
@@ -18,6 +20,8 @@ export class ConversationStore {
       this.entries.delete(key);
       return null;
     }
+    this.entries.delete(key);
+    this.entries.set(key, entry);
     return entry.conversationId;
   }
 
@@ -30,7 +34,15 @@ export class ConversationStore {
       ttlMinutes <= 0
         ? Number.MAX_SAFE_INTEGER
         : Date.now() + ttlMinutes * 60_000;
+    this.entries.delete(key);
     this.entries.set(key, { conversationId, expiresAtUtc });
+    while (this.entries.size > MaxConversationEntries) {
+      const oldest = this.entries.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      this.entries.delete(oldest.value);
+    }
   }
 
   private purgeExpired(): void {

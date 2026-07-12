@@ -27,7 +27,10 @@ import {
   tryGetInt,
 } from "./utils";
 import { DebugMarkdownLogger } from "./logger";
-import { SubstrateSessionStore } from "./substrate-session-store";
+import {
+  SubstrateSessionStore,
+  TurnQueueWaitError,
+} from "./substrate-session-store";
 
 export class CopilotGraphClient {
   constructor(
@@ -204,6 +207,7 @@ export class CopilotSubstrateClient {
     isStartOfSession: boolean,
     onStreamUpdate?: (update: SubstrateStreamUpdate) => Promise<void>,
     signal: AbortSignal | null = null,
+    taskDeadlineMs: number | null = null,
   ): Promise<ChatResult> {
     return this.chatCore(
       authorizationHeader,
@@ -212,6 +216,7 @@ export class CopilotSubstrateClient {
       isStartOfSession,
       onStreamUpdate ?? null,
       signal,
+      taskDeadlineMs,
     );
   }
 
@@ -222,6 +227,7 @@ export class CopilotSubstrateClient {
     isStartOfSession: boolean,
     onStreamUpdate: (update: SubstrateStreamUpdate) => Promise<void>,
     signal: AbortSignal | null = null,
+    taskDeadlineMs: number | null = null,
   ): Promise<ChatResult> {
     return this.chatCore(
       authorizationHeader,
@@ -230,6 +236,7 @@ export class CopilotSubstrateClient {
       isStartOfSession,
       onStreamUpdate,
       signal,
+      taskDeadlineMs,
     );
   }
 
@@ -240,6 +247,50 @@ export class CopilotSubstrateClient {
     isStartOfSession: boolean,
     onStreamUpdate: ((update: SubstrateStreamUpdate) => Promise<void>) | null,
     signal: AbortSignal | null = null,
+    taskDeadlineMs: number | null = null,
+  ): Promise<ChatResult> {
+    const sessionId = this.sessionStore.getOrCreate(conversationId);
+    try {
+      return await this.sessionStore.runExclusive(
+        sessionId,
+        () =>
+          this.chatCoreUnlocked(
+            authorizationHeader,
+            conversationId,
+            sessionId,
+            request,
+            isStartOfSession,
+            onStreamUpdate,
+            signal,
+            taskDeadlineMs,
+          ),
+        signal,
+        taskDeadlineMs,
+      );
+    } catch (error) {
+      if (error instanceof TurnQueueWaitError) {
+        return buildFailure(
+          error.reason === "cancelled"
+            ? 499
+            : error.reason === "deadline"
+              ? 504
+              : 429,
+          error.message,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async chatCoreUnlocked(
+    authorizationHeader: string,
+    conversationId: string,
+    sessionId: string,
+    request: ParsedOpenAiRequest,
+    isStartOfSession: boolean,
+    onStreamUpdate: ((update: SubstrateStreamUpdate) => Promise<void>) | null,
+    signal: AbortSignal | null = null,
+    taskDeadlineMs: number | null = null,
   ): Promise<ChatResult> {
     if (signal?.aborted) {
       return buildFailure(499, "Substrate turn cancelled before start.");
@@ -268,7 +319,6 @@ export class CopilotSubstrateClient {
     }
 
     const clientRequestId = randomUUID();
-    const sessionId = this.sessionStore.getOrCreate(conversationId);
     const requestUri = buildSubstrateHubUri(
       this.options,
       objectId,
@@ -278,21 +328,64 @@ export class CopilotSubstrateClient {
       sessionId,
       conversationId,
     );
-    const { invocationTimeoutMs: timeoutMs, handshakeTimeoutMs, turnDeadlineMs } =
+    const {
+      invocationTimeoutMs: configuredTimeoutMs,
+      handshakeTimeoutMs: configuredHandshakeTimeoutMs,
+      turnDeadlineMs: configuredTurnDeadlineMs,
+    } =
       resolveSubstrateDeadlines(this.options.substrate, Date.now());
-    const ws = await this.connect(
-      requestUri,
-      this.options.substrate.origin ?? undefined,
-      timeoutMs,
-      this.options.substrate.keepAliveSeconds > 0
-        ? this.options.substrate.keepAliveSeconds * 1000
-        : 15_000,
-    ).catch((error) => error as Error);
+    const effectiveTaskDeadlineMs =
+      taskDeadlineMs === null
+        ? Number.POSITIVE_INFINITY
+        : taskDeadlineMs;
+    const remainingTaskMs = effectiveTaskDeadlineMs - Date.now();
+    if (remainingTaskMs <= 0) {
+      return buildFailure(504, "M365 task-level deadline exceeded.");
+    }
+    const timeoutMs = Math.min(configuredTimeoutMs, remainingTaskMs);
+    const handshakeTimeoutMs = Math.min(
+      configuredHandshakeTimeoutMs,
+      remainingTaskMs,
+    );
+    const turnDeadlineMs = Math.min(
+      configuredTurnDeadlineMs,
+      effectiveTaskDeadlineMs,
+    );
+    const ws = await connectWithAbort(
+      this.connect(
+        requestUri,
+        this.options.substrate.origin ?? undefined,
+        timeoutMs,
+        this.options.substrate.keepAliveSeconds > 0
+          ? this.options.substrate.keepAliveSeconds * 1000
+          : 15_000,
+      ),
+      signal,
+    );
     if (ws instanceof Error) {
+      if (ws.name === "AbortError") {
+        return buildFailure(
+          499,
+          "Substrate turn cancelled during websocket connection.",
+        );
+      }
       return buildFailure(
         502,
         `Substrate websocket request failed. ${ws.message}`,
       );
+    }
+    const remainingHandshakeMs = Math.min(
+      handshakeTimeoutMs,
+      turnDeadlineMs - Date.now(),
+      effectiveTaskDeadlineMs - Date.now(),
+    );
+    if (remainingHandshakeMs <= 0) {
+      try {
+        ws.close(1000, "task deadline exceeded");
+      } catch {
+        // ignore
+      }
+      return buildFailure(504, "M365 task-level deadline exceeded.");
     }
 
     const transcript: string[] = [];
@@ -318,8 +411,12 @@ export class CopilotSubstrateClient {
         protocol: "json",
         version: 1,
       });
-      const handshakePayload = await receiver.next(handshakeTimeoutMs);
+      const handshakeDeadlineMs = Date.now() + remainingHandshakeMs;
+      const handshakePayload = await receiver.next(remainingHandshakeMs);
       if (handshakePayload === null) {
+        if (Date.now() >= handshakeDeadlineMs) {
+          return buildFailure(504, "Substrate websocket handshake timed out.");
+        }
         return buildFailure(
           502,
           "Substrate websocket closed during handshake.",
@@ -377,6 +474,7 @@ export class CopilotSubstrateClient {
       let assistantText = "";
       let deltaBuilder = "";
       let responseError: string | null = null;
+      let responseErrorCode: string | null = null;
       let completed = false;
       let activeBotMessageId: string | null = null;
       const logDeltaSource = async (
@@ -405,6 +503,14 @@ export class CopilotSubstrateClient {
         }
         const payload = await receiver.next(remainingMs);
         if (payload === null) {
+          if (Date.now() >= turnDeadlineMs) {
+            return buildFailure(
+              504,
+              "Substrate websocket turn timed out.",
+              invocationPayload,
+              buildSubstrateTranscriptPayload(transcript),
+            );
+          }
           break;
         }
         await this.logger.logSubstrateFrame(
@@ -430,6 +536,10 @@ export class CopilotSubstrateClient {
             continue;
           }
           const frameType = tryGetInt(json, "type");
+          if (frameType === 6) {
+            await sendFrame(ws, requestUri, this.logger, { type: 6 });
+            continue;
+          }
 
           const frameRequestId = extractSubstrateRequestId(json);
           if (frameRequestId && frameRequestId !== clientRequestId) {
@@ -479,6 +589,14 @@ export class CopilotSubstrateClient {
             }
           }
 
+          const disengagedMessage = extractSubstrateDisengagedMessage(json);
+          if (disengagedMessage) {
+            responseError = disengagedMessage;
+            responseErrorCode = "substrate_disengaged";
+            completed = true;
+            break;
+          }
+
           const extractedAssistantText = extractSubstrateAssistantText(json);
           if (extractedAssistantText) {
             assistantText = extractedAssistantText;
@@ -495,6 +613,7 @@ export class CopilotSubstrateClient {
                   conversationId: resolvedConversationId,
                 });
               }
+
             }
 
             if (
@@ -555,7 +674,13 @@ export class CopilotSubstrateClient {
       // partially streamed message into a successful Codex turn: that would
       // make a failed write or patch look completed to the client.
       if (responseError) {
-        return buildFailure(502, `Substrate chat failed. ${responseError}`);
+        return buildFailure(
+          502,
+          `Substrate chat failed. ${responseError}`,
+          invocationPayload,
+          buildSubstrateTranscriptPayload(transcript),
+          responseErrorCode,
+        );
       }
 
       if (!assistantText && deltaBuilder) {
@@ -633,14 +758,16 @@ function buildFailure(
   message: string,
   upstreamRequestPayload: JsonValue | null = null,
   upstreamResponsePayload: JsonValue | null = null,
+  errorCode: string | null = null,
 ): ChatResult {
   return {
     isSuccess: false,
     statusCode,
     responseJson: null,
-    rawBody: JSON.stringify({ message }),
+    rawBody: JSON.stringify({ message, code: errorCode }),
     assistantText: null,
     conversationId: null,
+    errorCode,
     upstreamRequestPayload,
     upstreamResponsePayload,
   };
@@ -901,6 +1028,46 @@ function buildSubstrateTranscriptPayload(transcript: string[]): JsonValue {
     frameCount: frames.length,
     frames,
   };
+}
+
+async function connectWithAbort(
+  connectPromise: Promise<WebSocket>,
+  signal: AbortSignal | null,
+): Promise<WebSocket | Error> {
+  if (!signal) {
+    return connectPromise.catch((error) => error as Error);
+  }
+  if (signal.aborted) {
+    const error = new Error("WebSocket connection aborted.");
+    error.name = "AbortError";
+    return error;
+  }
+
+  return new Promise<WebSocket | Error>((resolve) => {
+    let settled = false;
+    const finish = (value: WebSocket | Error) => {
+      if (settled) {
+        if (!(value instanceof Error)) {
+          try {
+            value.close(1000, "client disconnected");
+          } catch {
+            // ignore
+          }
+        }
+        return;
+      }
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+    const onAbort = () => {
+      const error = new Error("WebSocket connection aborted.");
+      error.name = "AbortError";
+      finish(error);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    connectPromise.then(finish).catch((error) => finish(error as Error));
+  });
 }
 
 async function connectWebSocket(
@@ -1230,9 +1397,10 @@ function extractSubstrateAssistantText(envelope: JsonObject): string | null {
     const messageType = (
       tryGetString(message, "messageType") ?? "Chat"
     ).toLowerCase();
-    if (messageType !== "chat" && messageType !== "disengaged") {
+    if (messageType !== "chat") {
       continue;
     }
+
     const text =
       tryGetString(message, "text") ??
       tryGetString(message, "hiddenText") ??
@@ -1242,6 +1410,26 @@ function extractSubstrateAssistantText(envelope: JsonObject): string | null {
     }
   }
   return fallback ?? extractSubstrateResultMessage(envelope);
+}
+
+function extractSubstrateDisengagedMessage(envelope: JsonObject): string | null {
+  for (const message of collectMessageObjects(envelope)) {
+    if ((tryGetString(message, "author") ?? "").toLowerCase() !== "bot") {
+      continue;
+    }
+    if (
+      (tryGetString(message, "messageType") ?? "").toLowerCase() !== "disengaged"
+    ) {
+      continue;
+    }
+    return (
+      tryGetString(message, "text") ??
+      tryGetString(message, "hiddenText") ??
+      tryGetString(message, "spokenText") ??
+      "M365 Copilot disengaged from the request."
+    );
+  }
+  return null;
 }
 
 function extractSubstrateDeltaText(envelope: JsonObject): string | null {

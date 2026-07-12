@@ -13,20 +13,23 @@ type ConversationLinkEntry = {
 type RequestHashEntry = {
   expiresAtUtc: number;
   conversationId: string | null;
-};
-
-type ReplayBodyEntry = {
-  expiresAtUtc: number;
   response: JsonObject;
 };
 
+type TaskDeadlineEntry = {
+  deadlineMs: number;
+  expiresAtUtc: number;
+};
+
 const RequestHashGuardTtlMs = 60_000;
+const MaxStoredResponses = 1_024;
+const MaxRequestHashes = 2_048;
 
 export class ResponseStore {
   private readonly entries = new Map<string, StoredOpenAiResponseRecord>();
   private readonly conversationLinks = new Map<string, ConversationLinkEntry>();
   private readonly requestHashes = new Map<string, RequestHashEntry>();
-  private readonly replayBodies = new Map<string, ReplayBodyEntry>();
+  private readonly taskDeadlines = new Map<string, TaskDeadlineEntry>();
 
   constructor(private readonly options: WrapperOptions) {}
 
@@ -34,6 +37,7 @@ export class ResponseStore {
     responseId: string,
     response: JsonObject,
     conversationId: string | null,
+    taskDeadlineMs: number | null = null,
   ): void {
     if (!responseId.trim()) {
       return;
@@ -45,17 +49,17 @@ export class ResponseStore {
       response: cloneJsonValue(response),
       conversationId: conversationId?.trim() ? conversationId : null,
       expiresAtUtc: this.resolveExpiryMs(),
+      taskDeadlineMs,
     };
     this.entries.set(responseId, record);
+    trimOldest(this.entries, MaxStoredResponses);
 
     if (conversationId?.trim()) {
       this.conversationLinks.set(responseId, {
         conversationId: conversationId.trim(),
         expiresAtUtc: record.expiresAtUtc,
       });
-      // Cache the completed body for idempotent replay of a byte-identical
-      // retry inside the guard window (see rememberReplayResponse).
-      this.rememberReplayResponse(conversationId.trim(), response);
+      trimOldest(this.conversationLinks, MaxStoredResponses);
     }
   }
 
@@ -71,6 +75,39 @@ export class ResponseStore {
       return null;
     }
     return cloneJsonValue(entry.response);
+  }
+
+  tryGetTaskDeadline(responseId: string): number | null {
+    this.purgeExpired();
+    const entry = this.entries.get(responseId);
+    if (!entry || entry.expiresAtUtc <= Date.now()) {
+      return null;
+    }
+    return entry.taskDeadlineMs;
+  }
+
+  getOrCreateTaskDeadline(
+    taskKey: string,
+    createDeadline: () => number,
+  ): number {
+    const normalizedKey = taskKey.trim();
+    if (!normalizedKey) {
+      return createDeadline();
+    }
+    this.purgeExpired();
+    const existing = this.taskDeadlines.get(normalizedKey);
+    if (existing && existing.expiresAtUtc > Date.now()) {
+      this.taskDeadlines.delete(normalizedKey);
+      this.taskDeadlines.set(normalizedKey, existing);
+      return existing.deadlineMs;
+    }
+    const deadlineMs = createDeadline();
+    this.taskDeadlines.set(normalizedKey, {
+      deadlineMs,
+      expiresAtUtc: Math.max(deadlineMs, Date.now()) + RequestHashGuardTtlMs,
+    });
+    trimOldest(this.taskDeadlines, MaxStoredResponses);
+    return deadlineMs;
   }
 
   tryDelete(responseId: string): boolean {
@@ -126,43 +163,34 @@ export class ResponseStore {
     return entry.conversationId;
   }
 
-  hasRecentRequestHash(requestHash: string): boolean {
-    const normalizedHash = requestHash.trim();
-    if (!normalizedHash) {
-      return false;
-    }
-    this.purgeExpired();
-    const entry = this.requestHashes.get(normalizedHash);
-    if (!entry) {
-      return false;
-    }
-    if (entry.expiresAtUtc <= Date.now()) {
-      this.requestHashes.delete(normalizedHash);
-      return false;
-    }
-    return true;
-  }
-
-  getRecentRequestHashConversationId(requestHash: string): string | null {
-    const normalizedHash = requestHash.trim();
-    if (!normalizedHash) {
-      return null;
-    }
-    this.purgeExpired();
-    const entry = this.requestHashes.get(normalizedHash);
-    if (!entry) {
-      return null;
-    }
-    if (entry.expiresAtUtc <= Date.now()) {
-      this.requestHashes.delete(normalizedHash);
-      return null;
-    }
-    return entry.conversationId;
-  }
-
-  rememberRequestHash(
+  tryGetRequestReplay(
     requestHash: string,
-    conversationId: string | null = null,
+  ): { conversationId: string | null; response: JsonObject } | null {
+    const normalizedHash = requestHash.trim();
+    if (!normalizedHash) {
+      return null;
+    }
+    this.purgeExpired();
+    const entry = this.requestHashes.get(normalizedHash);
+    if (!entry) {
+      return null;
+    }
+    if (entry.expiresAtUtc <= Date.now()) {
+      this.requestHashes.delete(normalizedHash);
+      return null;
+    }
+    this.requestHashes.delete(normalizedHash);
+    this.requestHashes.set(normalizedHash, entry);
+    return {
+      conversationId: entry.conversationId,
+      response: cloneJsonValue(entry.response),
+    };
+  }
+
+  rememberCompletedRequest(
+    requestHash: string,
+    conversationId: string | null,
+    response: JsonObject,
   ): void {
     const normalizedHash = requestHash.trim();
     if (!normalizedHash) {
@@ -172,54 +200,9 @@ export class ResponseStore {
     this.requestHashes.set(normalizedHash, {
       expiresAtUtc: Date.now() + RequestHashGuardTtlMs,
       conversationId: conversationId?.trim() ? conversationId.trim() : null,
-    });
-  }
-
-  // Cache the real completed response body per conversation so a byte-identical
-  // retry inside the guard window can be answered with the same body (crucially,
-  // any function_call output items) instead of an empty suppressed message.
-  // Keyed by conversationId — the one join key available both here (via set())
-  // and at the guard hit site (via getRecentRequestHashConversationId). For a
-  // byte-identical retry the client never received turn N's response (that is
-  // why it retries), so it cannot have advanced the conversation past N, and the
-  // latest cached body for the conversation is turn N's. Guard TTL; kept out of
-  // the entries map so it never surfaces in list().
-  rememberReplayResponse(conversationId: string, response: JsonObject): void {
-    const normalizedId = conversationId.trim();
-    if (!normalizedId) {
-      return;
-    }
-    // Only cache responses that carry useful output (a function_call item or
-    // non-empty assistant text). Empty / tool-less bodies are left uncached so a
-    // byte-identical retry falls through to a fresh upstream attempt instead of
-    // being permanently answered with an empty replay — this preserves the
-    // stochastic "retry until the model emits the forced tool call" flow while
-    // still replaying real tool/text turns idempotently.
-    if (!responseHasUsefulOutput(response)) {
-      return;
-    }
-    this.purgeExpired();
-    this.replayBodies.set(normalizedId, {
-      expiresAtUtc: Date.now() + RequestHashGuardTtlMs,
       response: cloneJsonValue(response),
     });
-  }
-
-  tryGetReplayResponse(conversationId: string): JsonObject | null {
-    const normalizedId = conversationId.trim();
-    if (!normalizedId) {
-      return null;
-    }
-    this.purgeExpired();
-    const entry = this.replayBodies.get(normalizedId);
-    if (!entry) {
-      return null;
-    }
-    if (entry.expiresAtUtc <= Date.now()) {
-      this.replayBodies.delete(normalizedId);
-      return null;
-    }
-    return cloneJsonValue(entry.response);
+    trimOldest(this.requestHashes, MaxRequestHashes);
   }
 
   private resolveExpiryMs(): number {
@@ -259,14 +242,25 @@ export class ResponseStore {
       }
     }
 
-    if (this.replayBodies.size > 0) {
+    if (this.taskDeadlines.size > 0) {
       const now = Date.now();
-      for (const [id, entry] of this.replayBodies.entries()) {
+      for (const [key, entry] of this.taskDeadlines.entries()) {
         if (entry.expiresAtUtc <= now) {
-          this.replayBodies.delete(id);
+          this.taskDeadlines.delete(key);
         }
       }
     }
+
+  }
+}
+
+function trimOldest<K, V>(entries: Map<K, V>, maxEntries: number): void {
+  while (entries.size > maxEntries) {
+    const oldest = entries.keys().next();
+    if (oldest.done) {
+      return;
+    }
+    entries.delete(oldest.value);
   }
 }
 
@@ -293,43 +287,4 @@ function readCreatedAt(response: JsonObject): number {
     }
   }
   return nowUnix();
-}
-
-// A response is worth caching for idempotent replay only if it carries output a
-// retry would want back: a function_call (tool) item, or a message with
-// non-empty text. Empty / tool-less bodies return false so they are not cached.
-function responseHasUsefulOutput(response: JsonObject): boolean {
-  const output = response.output;
-  if (!Array.isArray(output)) {
-    return false;
-  }
-  for (const item of output) {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      continue;
-    }
-    const typed = item as Record<string, unknown>;
-    const itemType = typeof typed.type === "string" ? typed.type : "";
-    if (itemType === "function_call" || itemType === "custom_tool_call") {
-      return true;
-    }
-    if (itemType === "message" || itemType === "") {
-      const content = typed.content;
-      if (!Array.isArray(content)) {
-        continue;
-      }
-      for (const part of content) {
-        if (typeof part !== "object" || part === null || Array.isArray(part)) {
-          continue;
-        }
-        const partTyped = part as Record<string, unknown>;
-        if (
-          typeof partTyped.text === "string" &&
-          partTyped.text.trim().length > 0
-        ) {
-          return true;
-        }
-      }
-    }
-  }
-  return false;
 }

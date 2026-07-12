@@ -40,7 +40,13 @@ describe("DebugMarkdownLogger substrate response logging", () => {
       arguments: [
         {
           requestId: "req-1",
-          messages: [{ author: "bot", messageId: "msg-1", text: "```" }],
+          messages: [
+            {
+              author: "bot",
+              messageId: "msg-1",
+              text: "SECRET-CONVERSATION-CONTENT",
+            },
+          ],
         },
       ],
     };
@@ -115,12 +121,69 @@ describe("DebugMarkdownLogger substrate response logging", () => {
     expect(Array.isArray(parsed.frames)).toBeTrue();
 
     const frames = parsed.frames as JsonObject[];
+    expect(content.includes("SECRET-CONVERSATION-CONTENT")).toBeFalse();
+    expect(content.includes("SECRET-CURSOR-CONTENT")).toBeFalse();
     const reasons = frames
       .map((frame) => String(frame.reason ?? ""))
       .filter((value) => value.length > 0);
     expect(reasons.includes("first_text")).toBeTrue();
     expect(reasons.includes("complete_markdown_json")).toBeTrue();
     expect(reasons.includes("terminal")).toBeTrue();
+    for (const frame of frames) {
+      expect("messagePreview" in frame).toBeFalse();
+      expect("writeAtCursorPreview" in frame).toBeFalse();
+    }
+    const secretTextFrameLog = frames.find(
+      (frame) => frame.messageTextLength === "SECRET-CONVERSATION-CONTENT".length,
+    );
+    expect(secretTextFrameLog?.messageTextLength).toBe(
+      "SECRET-CONVERSATION-CONTENT".length,
+    );
+  });
+
+  test("trace mode retains SignalR structure without conversation previews", async () => {
+    const debugPath = mkdtempSync(path.join(tmpdir(), "proxy-logger-"));
+    tempDirs.push(debugPath);
+    const logger = new DebugMarkdownLogger(
+      createOptions(debugPath, LogLevels.Trace),
+      true,
+    );
+
+    const payload = `${JSON.stringify({
+      type: 1,
+      target: "update",
+      arguments: [
+        {
+          requestId: "req-trace",
+          writeAtCursor: "TRACE-CURSOR-CONTENT",
+          messages: [
+            {
+              author: "bot",
+              messageId: "msg-trace",
+              text: "TRACE-CONVERSATION-CONTENT",
+            },
+          ],
+        },
+      ],
+    })}\u001e`;
+
+    await logger.logSubstrateFrame(
+      "wss://substrate.office.com/m365Copilot/Chathub",
+      "request",
+      payload,
+    );
+
+    const files = readdirSync(debugPath).filter((name) =>
+      name.endsWith("-substrate-request.md"),
+    );
+    expect(files.length).toBe(1);
+    const content = readFileSync(path.join(debugPath, files[0]), "utf8");
+    expect(content.includes("TRACE-CONVERSATION-CONTENT")).toBeFalse();
+    expect(content.includes("TRACE-CURSOR-CONTENT")).toBeFalse();
+    expect(content.includes("\"messageTextLength\": 26")).toBeTrue();
+    expect(content.includes("\"writeAtCursorLength\": 20")).toBeTrue();
+    expect(content.includes("\"requestId\": \"req-trace\"")).toBeTrue();
+    expect(content.includes("\"type\": 1")).toBeTrue();
   });
 
   test("trace mode writes simulated streaming diagnostics", async () => {

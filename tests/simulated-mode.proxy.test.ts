@@ -1490,6 +1490,61 @@ describe("simulated transform mode proxy flow", () => {
     expect(tryGetString(secondOutput[0], "input")).toBe("*** Begin Patch\n*** End Patch");
   });
 
+  test("does not replay identical bodies across explicit conversation headers", async () => {
+    let chatCallCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        chatCallCount += 1;
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            id: `resp-${conversationId}`,
+            object: "response",
+            status: "completed",
+            model: "simulated-model",
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: conversationId }],
+              },
+            ],
+            output_text: conversationId,
+          }),
+        );
+      }),
+    );
+    const body = JSON.stringify({
+      model: "m365-copilot",
+      stream: false,
+      input: "same body",
+    });
+    const send = (conversationId: string) =>
+      app.fetch(
+        new Request("http://localhost/v1/responses", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-m365-transport": TransportNames.Graph,
+            "x-m365-conversation-id": conversationId,
+          },
+          body,
+        }),
+      );
+
+    const first = await send("conversation-a");
+    const second = await send("conversation-b");
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(chatCallCount).toBe(2);
+    expect(second.headers.get("x-m365-request-hash-replayed")).toBeNull();
+    expect(tryGetString((await second.json()) as JsonObject, "output_text")).toBe(
+      "conversation-b",
+    );
+  });
+
   test("streams the full custom tool-call input lifecycle in order with a stable item id", async () => {
     const app = createProxyApp(
       createServices((conversationId, payload) =>

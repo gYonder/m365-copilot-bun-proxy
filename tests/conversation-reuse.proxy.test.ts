@@ -121,6 +121,150 @@ describe("conversation reuse", () => {
     expect(second.headers.get("x-m365-conversation-created")).toBeNull();
     expect(createConversationCount).toBe(1);
   });
+
+  test("allows an identical retry after an aborted Responses stream before upstream completion", async () => {
+    const options = createOptions();
+    const conversationStore = new ConversationStore(options);
+    const responseStore = new ResponseStore(options);
+    let upstreamCallCount = 0;
+    const releaseUpstream: Array<() => void> = [];
+
+    const graphClient = {
+      createConversation: async (): Promise<CreateConversationResult> => ({
+        isSuccess: true,
+        statusCode: 200,
+        conversationId: "conv-stream-race",
+        rawBody: "{}",
+      }),
+      chat: async (): Promise<ChatResult> => {
+        throw new Error("not used");
+      },
+      chatOverStream: async (): Promise<Response> => {
+        const callNumber = ++upstreamCallCount;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            let closed = false;
+            controller.enqueue(
+              new TextEncoder().encode(
+                `data: ${JSON.stringify({
+                  id: "conv-stream-race",
+                  messages: [{ text: `reply-${callNumber}` }],
+                })}\n\n`,
+              ),
+            );
+            releaseUpstream[callNumber - 1] = () => {
+              if (!closed) {
+                closed = true;
+                controller.close();
+              }
+            };
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    } as unknown as CopilotGraphClient;
+
+    const substrateClient = {
+      createConversation: (): CreateConversationResult => ({
+        isSuccess: true,
+        statusCode: 200,
+        conversationId: "conv-substrate",
+        rawBody: "{}",
+      }),
+      chat: async (): Promise<ChatResult> => {
+        throw new Error("not used");
+      },
+      chatStream: async (): Promise<ChatResult> => {
+        throw new Error("not used");
+      },
+    } as unknown as CopilotSubstrateClient;
+
+    const debugLogger = {
+      logIncomingRequest: async () => {},
+      logOutgoingResponse: async () => {},
+      logUpstreamRequest: async () => {},
+      logUpstreamResponse: async () => {},
+      logSubstrateFrame: async () => {},
+      logOutgoingStreamBody: async () => {},
+    } as unknown as DebugMarkdownLogger;
+
+    const tokenProvider = {
+      resolveAuthorizationHeader: async () => "******",
+    } as unknown as ProxyTokenProvider;
+
+    const app = createProxyApp({
+      options,
+      debugLogger,
+      graphClient,
+      substrateClient,
+      conversationStore,
+      responseStore,
+      tokenProvider,
+    });
+    const server = Bun.serve({
+      port: 0,
+      fetch: app.fetch,
+    });
+
+    const requestBody = JSON.stringify({
+      model: "m365-copilot",
+      stream: true,
+      input: "hello",
+    });
+    const headers = {
+      "content-type": "application/json",
+      "x-m365-transport": TransportNames.Graph,
+    };
+    const firstAbort = new AbortController();
+
+    try {
+      const first = await fetch(`http://localhost:${server.port}/v1/responses`, {
+        method: "POST",
+        headers,
+        body: requestBody,
+        signal: firstAbort.signal,
+      });
+      expect(first.status).toBe(200);
+      expect(first.body).not.toBeNull();
+
+      const firstReader = first.body?.getReader();
+      expect(firstReader).toBeDefined();
+      let firstText = "";
+      while (!firstText.includes('"delta":"reply-1"')) {
+        const next = await firstReader?.read();
+        if (!next || next.done) {
+          break;
+        }
+        firstText += new TextDecoder().decode(next.value);
+      }
+      expect(firstText).toContain('"delta":"reply-1"');
+      firstAbort.abort();
+      await firstReader?.cancel();
+
+      const retryPromise = fetch(`http://localhost:${server.port}/v1/responses`, {
+        method: "POST",
+        headers,
+        body: requestBody,
+      });
+      while (upstreamCallCount < 2) {
+        await Bun.sleep(1);
+      }
+      releaseUpstream[1]?.();
+
+      const retry = await retryPromise;
+      expect(retry.status).toBe(200);
+      expect(retry.status).not.toBe(409);
+      await retry.text();
+      expect(upstreamCallCount).toBe(2);
+    } finally {
+      releaseUpstream[0]?.();
+      releaseUpstream[1]?.();
+      server.stop(true);
+    }
+  });
 });
 
 function createOptions(): WrapperOptions {

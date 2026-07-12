@@ -522,6 +522,7 @@ async function handleChat(
   }
   const shouldBufferAssistant =
     requiresBufferedAssistantResponse(parsedRequest);
+  const taskDeadlineMs = resolveTaskDeadlineMs(options);
 
   const executeChatTurn = async (): Promise<ChatResult> => {
     if (selectedTransport === TransportNames.Substrate) {
@@ -534,6 +535,7 @@ async function handleChat(
           traceSubstrateStreamUpdate(services, trace, update);
         },
         request.signal,
+        taskDeadlineMs,
       );
       tracePane3(services, trace, result.upstreamRequestPayload ?? null);
       tracePane4(
@@ -1116,45 +1118,17 @@ async function handleResponsesCreate(
     payload.rawText,
     payload.json,
     selectedTransport,
+    request,
   );
-  const replayLoopHash = computeResponsesReplayLoopHash(
-    payload.json,
-    selectedTransport,
-  );
-  if (responseStore.hasRecentRequestHash(requestHash)) {
+  const storedRequestReplay = responseStore.tryGetRequestReplay(requestHash);
+  if (storedRequestReplay) {
     responseHeaders.set("x-m365-request-hash-replayed", "true");
-    const replayConversationId =
-      responseStore.getRecentRequestHashConversationId(requestHash) ??
-      responseStore.getRecentRequestHashConversationId(replayLoopHash) ??
-      null;
-    rememberResponsesReplayHashes(
-      responseStore,
-      requestHash,
-      replayLoopHash,
-      replayConversationId,
-    );
-    // Prefer replaying the real stored response for this conversation so a
-    // byte-identical retry keeps its function_call output items (patch / shell)
-    // instead of collapsing to an empty message. Empty suppression stays as the
-    // fallback when no body was cached (e.g. the first turn errored upstream).
-    const storedReplayResponse = replayConversationId
-      ? responseStore.tryGetReplayResponse(replayConversationId)
-      : null;
-    if (storedReplayResponse) {
-      return buildStoredReplayResponsesResult(
-        services,
-        parsedRequest,
-        responseHeaders,
-        replayConversationId,
-        storedReplayResponse,
-      );
-    }
-    return writeOpenAiError(
+    return buildStoredReplayResponsesResult(
       services,
-      409,
-      "A duplicate response request was received after its replay body expired.",
-      "invalid_request_error",
-      "duplicate_response_replay_unavailable",
+      parsedRequest,
+      responseHeaders,
+      storedRequestReplay.conversationId,
+      storedRequestReplay.response,
     );
   }
   const conversationSelection = selectConversation(
@@ -1246,6 +1220,11 @@ async function handleResponsesCreate(
   }
 
   const graphPayload = buildCopilotRequestPayload(baseRequest);
+  const taskDeadlineMs = resolveResponsesTaskDeadlineMs(
+    payload.json,
+    responseStore,
+    options,
+  );
   if (selectedTransport === TransportNames.Graph) {
     tracePane3(services, trace, graphPayload);
   }
@@ -1262,6 +1241,7 @@ async function handleResponsesCreate(
           traceSubstrateStreamUpdate(services, trace, update);
         },
         request.signal,
+        taskDeadlineMs,
       );
       tracePane3(services, trace, result.upstreamRequestPayload ?? null);
       tracePane4(
@@ -1421,12 +1401,6 @@ async function handleResponsesCreate(
             "invalid_simulated_payload",
           );
         }
-        rememberResponsesReplayHashes(
-          responseStore,
-          requestHash,
-          replayLoopHash,
-          conversationId,
-        );
         return buildSimulatedResponsesStreamResponse(
           services,
           parsedRequest,
@@ -1434,6 +1408,8 @@ async function handleResponsesCreate(
           normalized.responseBody,
           responseHeaders,
           trace,
+          requestHash,
+          taskDeadlineMs,
         );
       }
 
@@ -1482,12 +1458,6 @@ async function handleResponsesCreate(
       if (strictToolError) {
         return strictToolError;
       }
-      rememberResponsesReplayHashes(
-        responseStore,
-        requestHash,
-        replayLoopHash,
-        conversationId,
-      );
       return buildBufferedResponsesStreamResponse(
         services,
         parsedRequest,
@@ -1495,6 +1465,8 @@ async function handleResponsesCreate(
         assistantResponse,
         responseHeaders,
         trace,
+        requestHash,
+        taskDeadlineMs,
       );
     }
 
@@ -1513,12 +1485,6 @@ async function handleResponsesCreate(
           "graph_error",
         );
       }
-      rememberResponsesReplayHashes(
-        responseStore,
-        requestHash,
-        replayLoopHash,
-        conversationId,
-      );
       return transformGraphStreamToResponses(
         services,
         graphResponse,
@@ -1527,15 +1493,11 @@ async function handleResponsesCreate(
         scopedConversationKey,
         responseHeaders,
         trace,
+        requestHash,
+        taskDeadlineMs,
       );
     }
 
-    rememberResponsesReplayHashes(
-      responseStore,
-      requestHash,
-      replayLoopHash,
-      conversationId,
-    );
     return streamSubstrateAsResponses(
       services,
       authorizationHeader,
@@ -1545,6 +1507,8 @@ async function handleResponsesCreate(
       scopedConversationKey,
       responseHeaders,
       trace,
+      requestHash,
+      taskDeadlineMs,
       request.signal,
     );
   }
@@ -1667,12 +1631,17 @@ async function handleResponsesCreate(
       );
     }
 
-    responseStore.set(normalized.responseId, normalized.responseBody, conversationId);
+    responseStore.set(
+      normalized.responseId,
+      normalized.responseBody,
+      conversationId,
+      taskDeadlineMs,
+    );
     rememberResponsesReplayHashes(
       responseStore,
       requestHash,
-      replayLoopHash,
       conversationId,
+      normalized.responseBody,
     );
     responseHeaders.set("content-type", "application/json");
     const body = JSON.stringify(normalized.responseBody);
@@ -1739,12 +1708,12 @@ async function handleResponsesCreate(
     options.includeConversationIdInResponseBody,
     conversationId,
   );
-  responseStore.set(responseId, responseBody, conversationId);
+  responseStore.set(responseId, responseBody, conversationId, taskDeadlineMs);
   rememberResponsesReplayHashes(
     responseStore,
     requestHash,
-    replayLoopHash,
     conversationId,
+    responseBody,
   );
 
   responseHeaders.set("content-type", "application/json");
@@ -2172,6 +2141,8 @@ async function buildBufferedResponsesStreamResponse(
   assistantResponse: ReturnType<typeof buildAssistantResponse>,
   headers: Headers,
   trace: TraceContext | null,
+  requestHash: string,
+  taskDeadlineMs: number,
 ): Promise<Response> {
   const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
@@ -2298,7 +2269,18 @@ async function buildBufferedResponsesStreamResponse(
           includeConversationId ? conversationId : null,
         );
         writeDataEvent(buildResponseCompletedEvent(completed));
-        services.responseStore.set(responseId, completed, conversationId);
+        services.responseStore.set(
+          responseId,
+          completed,
+          conversationId,
+          taskDeadlineMs,
+        );
+        rememberResponsesReplayHashes(
+          services.responseStore,
+          requestHash,
+          conversationId,
+          completed,
+        );
         tracePane2(services, trace, completed, 200);
         traceComplete(services, trace, 200);
       } catch (error) {
@@ -3019,6 +3001,8 @@ async function buildSimulatedResponsesStreamResponse(
   payload: JsonObject,
   headers: Headers,
   trace: TraceContext | null,
+  requestHash: string,
+  taskDeadlineMs: number,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
   const normalized = normalizeSimulatedResponsesPayload(
@@ -3143,7 +3127,18 @@ async function buildSimulatedResponsesStreamResponse(
         responseConversationId,
       );
       writeDataEvent(buildResponseCompletedEvent(completed));
-      services.responseStore.set(responseId, completed, conversationId);
+      services.responseStore.set(
+        responseId,
+        completed,
+        conversationId,
+        taskDeadlineMs,
+      );
+      rememberResponsesReplayHashes(
+        services.responseStore,
+        requestHash,
+        conversationId,
+        completed,
+      );
       tracePane2(services, trace, completed, 200);
       traceComplete(services, trace, 200);
       enqueueSseDoneEvent(controller, encoder);
@@ -3190,6 +3185,7 @@ function computeResponsesRequestHash(
   rawRequestText: string | null,
   requestJson: JsonObject,
   transport: string,
+  request: Request,
 ): string {
   const payloadText =
     rawRequestText?.trim() && rawRequestText.trim().length > 0
@@ -3198,62 +3194,63 @@ function computeResponsesRequestHash(
   return createHash("sha256")
     .update(transport)
     .update("\n")
+    .update(request.headers.get(TransformModeHeaderName) ?? "")
+    .update("\n")
+    .update(request.headers.get("x-m365-conversation-id") ?? "")
+    .update("\n")
+    .update(request.headers.get("x-m365-conversation-key") ?? "")
+    .update("\n")
+    .update(request.headers.get("x-m365-new-conversation") ?? "")
+    .update("\n")
     .update(payloadText)
     .digest("hex");
-}
-
-function computeResponsesReplayLoopHash(
-  requestJson: JsonObject,
-  transport: string,
-): string {
-  const canonicalRequestJson = buildReplayLoopCanonicalRequestJson(requestJson);
-  return computeResponsesRequestHash(null, canonicalRequestJson, transport);
-}
-
-function buildReplayLoopCanonicalRequestJson(requestJson: JsonObject): JsonObject {
-  const inputItems = Array.isArray(requestJson.input) ? requestJson.input : null;
-  if (!inputItems || inputItems.length === 0) {
-    return requestJson;
-  }
-
-  let lastNonAssistantIndex = inputItems.length - 1;
-  while (
-    lastNonAssistantIndex >= 0 &&
-    isAssistantInputItem(inputItems[lastNonAssistantIndex])
-  ) {
-    lastNonAssistantIndex -= 1;
-  }
-
-  if (
-    lastNonAssistantIndex < 0 ||
-    lastNonAssistantIndex >= inputItems.length - 1
-  ) {
-    return requestJson;
-  }
-
-  return {
-    ...requestJson,
-    input: inputItems.slice(0, lastNonAssistantIndex + 1),
-  };
-}
-
-function isAssistantInputItem(inputItem: unknown): boolean {
-  if (!isJsonObject(inputItem)) {
-    return false;
-  }
-  return (tryGetString(inputItem, "role") ?? "").toLowerCase() === "assistant";
 }
 
 function rememberResponsesReplayHashes(
   responseStore: ResponseStore,
   requestHash: string,
-  replayLoopHash: string,
   conversationId: string | null,
+  response: JsonObject,
 ): void {
-  responseStore.rememberRequestHash(requestHash, conversationId);
-  if (replayLoopHash !== requestHash) {
-    responseStore.rememberRequestHash(replayLoopHash, conversationId);
-  }
+  responseStore.rememberCompletedRequest(requestHash, conversationId, response);
+}
+
+function resolveTaskDeadlineMs(options: WrapperOptions): number {
+  const configuredSeconds = options.substrate.taskTimeoutSeconds ?? 150;
+  return Date.now() + Math.max(1, configuredSeconds) * 1_000;
+}
+
+export function resolveResponsesTaskDeadlineMs(
+  requestJson: JsonObject,
+  responseStore: ResponseStore,
+  options: WrapperOptions,
+): number {
+  return responseStore.getOrCreateTaskDeadline(
+    computeResponsesTaskKey(requestJson),
+    () => resolveTaskDeadlineMs(options),
+  );
+}
+
+export function computeResponsesTaskKey(requestJson: JsonObject): string {
+  const input = Array.isArray(requestJson.input)
+    ? requestJson.input.filter((item) => {
+        if (!isJsonObject(item)) {
+          return true;
+        }
+        const type = (tryGetString(item, "type") ?? "").toLowerCase();
+        return (
+          type !== "function_call" &&
+          type !== "function_call_output" &&
+          type !== "custom_tool_call" &&
+          type !== "custom_tool_call_output"
+        );
+      })
+    : requestJson.input;
+  const canonical = JSON.stringify({
+    prompt_cache_key: tryGetString(requestJson, "prompt_cache_key"),
+    input,
+  });
+  return createHash("sha256").update(canonical).digest("hex");
 }
 
 function buildReplayResponseIdFromHash(requestHash: string): string {
@@ -3576,6 +3573,8 @@ async function transformGraphStreamToResponses(
   scopedConversationKey: string | null,
   headers: Headers,
   trace: TraceContext | null,
+  requestHash: string,
+  taskDeadlineMs: number,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
   const responseId = createOpenAiResponseId();
@@ -3716,7 +3715,18 @@ async function transformGraphStreamToResponses(
           includeConversationId ? conversationId : null,
         );
         writeDataEvent(buildResponseCompletedEvent(completed));
-        services.responseStore.set(responseId, completed, conversationId);
+        services.responseStore.set(
+          responseId,
+          completed,
+          conversationId,
+          taskDeadlineMs,
+        );
+        rememberResponsesReplayHashes(
+          services.responseStore,
+          requestHash,
+          conversationId,
+          completed,
+        );
         tracePane4(
           services,
           trace,
@@ -3771,6 +3781,8 @@ async function streamSubstrateAsResponses(
   scopedConversationKey: string | null,
   headers: Headers,
   trace: TraceContext | null,
+  requestHash: string,
+  taskDeadlineMs: number,
   signal?: AbortSignal,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
@@ -3855,6 +3867,7 @@ async function streamSubstrateAsResponses(
           );
         },
         signal,
+        taskDeadlineMs,
       );
       tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
       tracePane4(
@@ -3932,8 +3945,19 @@ async function streamSubstrateAsResponses(
         parsedRequest,
         includeConversationId ? conversationId : null,
       );
+      services.responseStore.set(
+        responseId,
+        completed,
+        conversationId,
+        taskDeadlineMs,
+      );
+      rememberResponsesReplayHashes(
+        services.responseStore,
+        requestHash,
+        conversationId,
+        completed,
+      );
       writeDataEvent(buildResponseCompletedEvent(completed));
-      services.responseStore.set(responseId, completed, conversationId);
       tracePane2(services, trace, completed, 200);
       traceComplete(services, trace, 200);
       enqueueSseDoneEvent(controller, encoder);
@@ -4056,12 +4080,16 @@ async function writeFromUpstreamFailure(
 ): Promise<Response> {
   const { statusCode: normalizedStatusCode, message } =
     summarizeUpstreamFailure(statusCode, responseBody, fallbackMessage);
+  const upstreamErrorCode = tryGetString(
+    tryParseJsonObject(responseBody ?? ""),
+    "code",
+  );
   return writeOpenAiError(
     services,
     normalizedStatusCode,
     message,
     "api_error",
-    errorCode,
+    upstreamErrorCode ?? errorCode,
   );
 }
 
@@ -4397,6 +4425,7 @@ async function streamSubstrateAsSimulatedOpenAi(
   signal?: AbortSignal,
 ): Promise<Response> {
   const completionId = `chatcmpl-${randomUUID().replaceAll("-", "")}`;
+  const taskDeadlineMs = resolveTaskDeadlineMs(services.options);
   const created = nowUnix();
   let conversationId = initialConversationId;
   let isStartOfSession = createdConversation;
@@ -4658,6 +4687,7 @@ async function streamSubstrateAsSimulatedOpenAi(
             traceSubstrateStreamUpdate(services, trace, update);
           },
           signal,
+          taskDeadlineMs,
         );
         if (
           shouldRetrySubstrateNoAssistantContent(
@@ -4684,6 +4714,7 @@ async function streamSubstrateAsSimulatedOpenAi(
                 traceSubstrateStreamUpdate(services, trace, update);
               },
               signal,
+              taskDeadlineMs,
             );
           }
         }
@@ -4747,6 +4778,7 @@ async function streamSubstrateAsSimulatedOpenAi(
           }
         },
         signal,
+        taskDeadlineMs,
       );
       tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
       tracePane4(
@@ -4951,6 +4983,7 @@ async function streamSubstrateAsOpenAi(
   signal?: AbortSignal,
 ): Promise<Response> {
   const completionId = `chatcmpl-${randomUUID().replaceAll("-", "")}`;
+  const taskDeadlineMs = resolveTaskDeadlineMs(services.options);
   const created = nowUnix();
   let conversationId = initialConversationId;
   let streamInitialized = false;
@@ -5011,6 +5044,7 @@ async function streamSubstrateAsOpenAi(
           writeChunk(null, update.deltaText, null);
         },
         signal,
+        taskDeadlineMs,
       );
       tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
       tracePane4(

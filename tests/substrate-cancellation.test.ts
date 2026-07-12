@@ -179,6 +179,275 @@ describe("Substrate client cancellation via AbortSignal", () => {
   });
 });
 
+describe("Substrate client lifecycle hardening", () => {
+  test("echoes SignalR type-6 pings during a turn", async () => {
+    const sentFrames: string[] = [];
+    const { connect, createReceiver } = makeFrameTransport(
+      [
+        "{}",
+        `${JSON.stringify({ type: 6 })}\u001e`,
+        `${JSON.stringify({
+          type: 1,
+          target: "update",
+          arguments: [
+            {
+              messages: [
+                {
+                  author: "bot",
+                  messageType: "Chat",
+                  messageId: "message-1",
+                  text: "done",
+                },
+              ],
+            },
+          ],
+        })}\u001e`,
+        `${JSON.stringify({ type: 3, invocationId: "0" })}\u001e`,
+      ],
+      sentFrames,
+    );
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-ping",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeTrue();
+    expect(
+      sentFrames.filter((frame) => frame.includes('"type":6')).length,
+    ).toBe(2);
+  });
+
+  test("returns a typed failure for Disengaged messages", async () => {
+    const { connect, createReceiver } = makeFrameTransport([
+      "{}",
+      `${JSON.stringify({
+        type: 1,
+        target: "update",
+        arguments: [
+          {
+            messages: [
+              {
+                author: "bot",
+                messageType: "Disengaged",
+                messageId: "message-2",
+                text: "Request declined.",
+              },
+            ],
+          },
+        ],
+      })}\u001e`,
+    ]);
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-disengaged",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.statusCode).toBe(502);
+    expect(result.errorCode).toBe("substrate_disengaged");
+    expect(result.rawBody).toContain("Request declined.");
+  });
+
+  test("honors an already-expired task-level deadline", async () => {
+    let connectCalls = 0;
+    const connect: SubstrateWebSocketConnector = async () => {
+      connectCalls += 1;
+      return {} as unknown as FakeWebSocket;
+    };
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      () => {
+        throw new Error("receiver must not be created after task timeout");
+      },
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-task-timeout",
+      makeRequest(),
+      true,
+      undefined,
+      null,
+      Date.now() - 1,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.statusCode).toBe(504);
+    expect(connectCalls).toBe(0);
+  });
+
+  test("rechecks the task deadline after websocket connection", async () => {
+    let receiverCalls = 0;
+    const ws = {
+      readyState: 1,
+      send: () => {},
+      close: () => {
+        (ws as { readyState: number }).readyState = 3;
+      },
+    };
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      async () => {
+        await Bun.sleep(5);
+        return ws as unknown as FakeWebSocket;
+      },
+      () => {
+        receiverCalls += 1;
+        throw new Error("receiver must not be created after task timeout");
+      },
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-connect-timeout",
+      makeRequest(),
+      true,
+      undefined,
+      null,
+      Date.now() + 1,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.statusCode).toBe(504);
+    expect(receiverCalls).toBe(0);
+  });
+
+  test("cancels while websocket connection is still pending", async () => {
+    const controller = new AbortController();
+    let resolveConnect!: (socket: FakeWebSocket) => void;
+    let markConnectStarted!: () => void;
+    let closeReason: string | undefined;
+    const connectPromise = new Promise<FakeWebSocket>((resolve) => {
+      resolveConnect = resolve;
+    });
+    const connectStarted = new Promise<void>((resolve) => {
+      markConnectStarted = resolve;
+    });
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      async () => {
+        markConnectStarted();
+        return connectPromise;
+      },
+      () => {
+        throw new Error("receiver must not be created after connect cancellation");
+      },
+    );
+
+    const resultPromise = client.chat(
+      makeJwtAuthHeader(),
+      "conv-connect-cancel",
+      makeRequest(),
+      true,
+      undefined,
+      controller.signal,
+    );
+    await connectStarted;
+    controller.abort();
+    const result = await resultPromise;
+    resolveConnect({
+      readyState: 1,
+      send: () => {},
+      close: (_code?: number, reason?: string) => {
+        closeReason = reason;
+      },
+    } as unknown as FakeWebSocket);
+    await Bun.sleep(5);
+
+    expect(result.statusCode).toBe(499);
+    expect(closeReason).toBe("client disconnected");
+  });
+
+  test("reports a handshake deadline as 504 instead of socket closure", async () => {
+    const ws = {
+      readyState: 1,
+      send: () => {},
+      close: () => {
+        (ws as { readyState: number }).readyState = 3;
+      },
+    };
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      async () => ws as unknown as FakeWebSocket,
+      () => ({
+        next: async () => {
+          await Bun.sleep(5);
+          return null;
+        },
+        dispose: () => {},
+      }),
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-handshake-timeout",
+      makeRequest(),
+      true,
+      undefined,
+      null,
+      Date.now() + 1,
+    );
+
+    expect(result.statusCode).toBe(504);
+    expect(result.rawBody).toContain("handshake timed out");
+  });
+});
+
+function makeFrameTransport(
+  frames: string[],
+  sentFrames: string[] = [],
+): {
+  connect: SubstrateWebSocketConnector;
+  createReceiver: SubstrateReceiverFactory;
+} {
+  const ws = {
+    readyState: 1,
+    send: (payload: string) => {
+      sentFrames.push(String(payload));
+    },
+    close: () => {
+      (ws as { readyState: number }).readyState = 3;
+    },
+  };
+  let index = 0;
+  return {
+    connect: async () => ws as unknown as FakeWebSocket,
+    createReceiver: () => ({
+      next: async () => frames[index++] ?? null,
+      dispose: () => {},
+    }),
+  };
+}
+
 function createOptions(): WrapperOptions {
   return {
     listenUrl: "http://localhost:4000",

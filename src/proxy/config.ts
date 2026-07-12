@@ -107,6 +107,7 @@ const WrapperOptionsSchema = z.object({
       invocationTimeoutSeconds: z.number().int().default(120),
       handshakeTimeoutSeconds: z.number().int().positive().optional(),
       turnTimeoutSeconds: z.number().int().positive().optional(),
+      taskTimeoutSeconds: z.number().int().positive().default(150),
       keepAliveSeconds: z.number().int().default(15),
       optionsSets: z
         .array(z.string())

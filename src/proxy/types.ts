@@ -136,6 +136,7 @@ export type ChatResult = {
   rawBody: string;
   assistantText: string | null;
   conversationId: string | null;
+  errorCode?: string | null;
   upstreamRequestPayload?: JsonValue | null;
   upstreamResponsePayload?: JsonValue | null;
 };
@@ -165,6 +166,7 @@ export type StoredOpenAiResponseRecord = {
   response: JsonObject;
   conversationId: string | null;
   expiresAtUtc: number;
+  taskDeadlineMs: number | null;
 };
 
 export type SubstrateStreamUpdate = {
@@ -197,6 +199,7 @@ export type SubstrateOptions = {
   invocationTimeoutSeconds: number;
   handshakeTimeoutSeconds?: number;
   turnTimeoutSeconds?: number;
+  taskTimeoutSeconds?: number;
   keepAliveSeconds: number;
   optionsSets: string[];
   allowedMessageTypes: string[];
