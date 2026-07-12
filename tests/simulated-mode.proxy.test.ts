@@ -1490,6 +1490,168 @@ describe("simulated transform mode proxy flow", () => {
     expect(tryGetString(secondOutput[0], "input")).toBe("*** Begin Patch\n*** End Patch");
   });
 
+  test("streams the full custom tool-call input lifecycle in order with a stable item id", async () => {
+    const app = createProxyApp(
+      createServices((conversationId, payload) =>
+        buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            id: "resp_custom_stream",
+            object: "response",
+            created_at: 1700000000,
+            status: "completed",
+            model: "simulated-model",
+            output: [
+              {
+                type: "custom_tool_call",
+                status: "completed",
+                call_id: "call_stream_patch",
+                name: "apply_patch",
+                input: "*** Begin Patch\n*** End Patch",
+              },
+            ],
+          }),
+        ),
+      ),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: true,
+          conversation: "conv_custom_stream",
+          input: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "input_text",
+                  text: "Change probe.txt from hello to world using apply_patch.",
+                },
+              ],
+            },
+          ],
+          tools: [
+            {
+              type: "function",
+              name: "apply_patch",
+              format: { type: "grammar", syntax: "lark", definition: "patch" },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(
+      (response.headers.get("content-type") ?? "").includes("text/event-stream"),
+    ).toBeTrue();
+    expect(response.body).not.toBeNull();
+
+    const orderedTypes: string[] = [];
+    let addedItemId: string | null = null;
+    let deltaItemId: string | null = null;
+    let doneItemId: string | null = null;
+    let itemDoneId: string | null = null;
+    let deltaText: string | null = null;
+    let doneInput: string | null = null;
+    let completedResponse: JsonObject | null = null;
+
+    for await (const event of readSseEvents(response.body!)) {
+      const data = event.data.trim();
+      if (!data) {
+        continue;
+      }
+      if (data.toLowerCase() === "[done]") {
+        break;
+      }
+      const parsed = tryParseJsonObject(data);
+      if (!parsed) {
+        continue;
+      }
+      const type = tryGetString(parsed, "type");
+      if (!type) {
+        continue;
+      }
+      orderedTypes.push(type);
+      if (type === "response.output_item.added") {
+        const item = isJsonObject(parsed.item) ? (parsed.item as JsonObject) : null;
+        if (item && tryGetString(item, "type") === "custom_tool_call") {
+          addedItemId = tryGetString(item, "id");
+          expect(tryGetString(item, "call_id")).toBe("call_stream_patch");
+          expect(tryGetString(item, "name")).toBe("apply_patch");
+        }
+      }
+      if (type === "response.custom_tool_call_input.delta") {
+        deltaItemId = tryGetString(parsed, "item_id");
+        deltaText = tryGetString(parsed, "delta");
+      }
+      if (type === "response.custom_tool_call_input.done") {
+        doneItemId = tryGetString(parsed, "item_id");
+        doneInput = tryGetString(parsed, "input");
+      }
+      if (type === "response.output_item.done") {
+        const item = isJsonObject(parsed.item) ? (parsed.item as JsonObject) : null;
+        if (item && tryGetString(item, "type") === "custom_tool_call") {
+          itemDoneId = tryGetString(item, "id");
+        }
+      }
+      if (type === "response.completed" && isJsonObject(parsed.response)) {
+        completedResponse = parsed.response as JsonObject;
+      }
+    }
+
+    // Exact custom tool-call streaming lifecycle order (handover item 4). The
+    // filter keeps only the lifecycle-defining events so the comparison is
+    // insensitive to unrelated keep-alive or text events but strict on order.
+    const lifecycle = orderedTypes.filter((eventType) =>
+      [
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.custom_tool_call_input.delta",
+        "response.custom_tool_call_input.done",
+        "response.output_item.done",
+        "response.completed",
+      ].includes(eventType),
+    );
+    expect(lifecycle).toEqual([
+      "response.created",
+      "response.in_progress",
+      "response.output_item.added",
+      "response.custom_tool_call_input.delta",
+      "response.custom_tool_call_input.done",
+      "response.output_item.done",
+      "response.completed",
+    ]);
+
+    // The item id must stay stable across added -> delta -> done -> item.done so
+    // Codex can correlate the custom tool-call input stream to one output item.
+    expect(addedItemId).toBeTruthy();
+    expect(deltaItemId).toBe(addedItemId);
+    expect(doneItemId).toBe(addedItemId);
+    expect(itemDoneId).toBe(addedItemId);
+
+    // Freeform patch bytes are preserved verbatim through delta and done.
+    expect(deltaText).toBe("*** Begin Patch\n*** End Patch");
+    expect(doneInput).toBe("*** Begin Patch\n*** End Patch");
+
+    // The completed response carries the correlated custom tool call.
+    expect(isJsonObject(completedResponse)).toBeTrue();
+    const output = (completedResponse as JsonObject).output as JsonObject[];
+    expect(output[0]?.type).toBe("custom_tool_call");
+    expect(tryGetString(output[0], "call_id")).toBe("call_stream_patch");
+    expect(tryGetString(output[0], "name")).toBe("apply_patch");
+  });
+
 
   test("does not infer replay from a trailing assistant tail", async () => {
     let chatCallCount = 0;
