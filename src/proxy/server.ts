@@ -2312,6 +2312,22 @@ async function buildBufferedResponsesStreamResponse(
                 { type: "output_text", text: content },
               ),
             );
+          } else if (item.type === "custom_tool_call") {
+            const input = tryGetString(item, "input") ?? "";
+            writeDataEvent({
+              type: "response.custom_tool_call_input.delta",
+              response_id: responseId,
+              output_index: index,
+              item_id: String(item.id ?? ""),
+              delta: input,
+            });
+            writeDataEvent({
+              type: "response.custom_tool_call_input.done",
+              response_id: responseId,
+              output_index: index,
+              item_id: String(item.id ?? ""),
+              input,
+            });
           }
           writeDataEvent(buildResponseOutputItemDoneEvent(responseId, index, item));
         }
