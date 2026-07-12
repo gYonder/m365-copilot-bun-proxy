@@ -255,6 +255,10 @@ export class CopilotSubstrateClient {
       (this.options.substrate.invocationTimeoutSeconds > 0
         ? this.options.substrate.invocationTimeoutSeconds
         : 120) * 1000;
+    const handshakeTimeoutMs =
+      (this.options.substrate.handshakeTimeoutSeconds ?? timeoutMs / 1000) * 1000;
+    const turnDeadlineMs = Date.now() +
+      (this.options.substrate.turnTimeoutSeconds ?? timeoutMs / 1000) * 1000;
 
     const ws = await connectWebSocket(
       requestUri,
@@ -280,7 +284,7 @@ export class CopilotSubstrateClient {
         protocol: "json",
         version: 1,
       });
-      const handshakePayload = await receiver.next(timeoutMs);
+      const handshakePayload = await receiver.next(handshakeTimeoutMs);
       if (handshakePayload === null) {
         return buildFailure(
           502,
@@ -358,7 +362,11 @@ export class CopilotSubstrateClient {
       };
 
       while (!completed && ws.readyState === WebSocket.OPEN) {
-        const payload = await receiver.next(timeoutMs);
+        const remainingMs = turnDeadlineMs - Date.now();
+        if (remainingMs <= 0) {
+          return buildFailure(504, "Substrate websocket turn timed out.");
+        }
+        const payload = await receiver.next(remainingMs);
         if (payload === null) {
           break;
         }

@@ -105,6 +105,8 @@ const WrapperOptionsSchema = z.object({
       deviceType: z.string().default("Desktop"),
       productThreadType: z.string().default("Office"),
       invocationTimeoutSeconds: z.number().int().default(120),
+      handshakeTimeoutSeconds: z.number().int().positive().optional(),
+      turnTimeoutSeconds: z.number().int().positive().optional(),
       keepAliveSeconds: z.number().int().default(15),
       optionsSets: z
         .array(z.string())

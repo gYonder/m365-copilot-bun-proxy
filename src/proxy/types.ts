@@ -195,6 +195,8 @@ export type SubstrateOptions = {
   deviceType?: string;
   productThreadType: string;
   invocationTimeoutSeconds: number;
+  handshakeTimeoutSeconds?: number;
+  turnTimeoutSeconds?: number;
   keepAliveSeconds: number;
   optionsSets: string[];
   allowedMessageTypes: string[];
