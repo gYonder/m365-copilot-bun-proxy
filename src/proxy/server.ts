@@ -3169,6 +3169,11 @@ async function buildSimulatedResponsesStreamResponse(
         }
 
         writeDataEvent(buildResponseOutputItemAddedEvent(responseId, index, item));
+        if ((tryGetString(item, "type") ?? "").toLowerCase() === "custom_tool_call") {
+          const input = tryGetString(item, "input") ?? "";
+          writeDataEvent({ type: "response.custom_tool_call_input.delta", response_id: responseId, output_index: index, item_id: itemId, delta: input });
+          writeDataEvent({ type: "response.custom_tool_call_input.done", response_id: responseId, output_index: index, item_id: itemId, input });
+        }
         writeDataEvent(buildResponseOutputItemDoneEvent(responseId, index, item));
       }
 
