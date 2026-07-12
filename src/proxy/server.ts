@@ -582,6 +582,7 @@ async function handleChat(
         async (update) => {
           traceSubstrateStreamUpdate(services, trace, update);
         },
+        request.signal,
       );
       tracePane3(services, trace, result.upstreamRequestPayload ?? null);
       tracePane4(
@@ -643,6 +644,7 @@ async function handleChat(
         scopedConversationKey,
         responseHeaders,
         trace,
+        request.signal,
       );
     }
 
@@ -861,6 +863,7 @@ async function handleChat(
       scopedConversationKey,
       responseHeaders,
       trace,
+      request.signal,
     );
   }
 
@@ -1307,6 +1310,7 @@ async function handleResponsesCreate(
         async (update) => {
           traceSubstrateStreamUpdate(services, trace, update);
         },
+        request.signal,
       );
       tracePane3(services, trace, result.upstreamRequestPayload ?? null);
       tracePane4(
@@ -1590,6 +1594,7 @@ async function handleResponsesCreate(
       scopedConversationKey,
       responseHeaders,
       trace,
+      request.signal,
     );
   }
 
@@ -3815,6 +3820,7 @@ async function streamSubstrateAsResponses(
   scopedConversationKey: string | null,
   headers: Headers,
   trace: TraceContext | null,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
   const responseId = createOpenAiResponseId();
@@ -3897,6 +3903,7 @@ async function streamSubstrateAsResponses(
             ),
           );
         },
+        signal,
       );
       tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
       tracePane4(
@@ -4436,6 +4443,7 @@ async function streamSubstrateAsSimulatedOpenAi(
   scopedConversationKey: string | null,
   headers: Headers,
   trace: TraceContext | null,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const completionId = `chatcmpl-${randomUUID().replaceAll("-", "")}`;
   const created = nowUnix();
@@ -4698,6 +4706,7 @@ async function streamSubstrateAsSimulatedOpenAi(
           async (update) => {
             traceSubstrateStreamUpdate(services, trace, update);
           },
+          signal,
         );
         if (
           shouldRetrySubstrateNoAssistantContent(
@@ -4723,6 +4732,7 @@ async function streamSubstrateAsSimulatedOpenAi(
               async (update) => {
                 traceSubstrateStreamUpdate(services, trace, update);
               },
+              signal,
             );
           }
         }
@@ -4785,6 +4795,7 @@ async function streamSubstrateAsSimulatedOpenAi(
             tryEmitIncrementalContentFromAccumulatedText();
           }
         },
+        signal,
       );
       tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
       tracePane4(
@@ -4986,6 +4997,7 @@ async function streamSubstrateAsOpenAi(
   scopedConversationKey: string | null,
   headers: Headers,
   trace: TraceContext | null,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const completionId = `chatcmpl-${randomUUID().replaceAll("-", "")}`;
   const created = nowUnix();
@@ -5047,6 +5059,7 @@ async function streamSubstrateAsOpenAi(
           emitted += update.deltaText;
           writeChunk(null, update.deltaText, null);
         },
+        signal,
       );
       tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
       tracePane4(
