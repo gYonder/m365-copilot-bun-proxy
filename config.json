@@ -37,6 +37,8 @@
     "deviceType": "Desktop",
     "productThreadType": "Office",
     "invocationTimeoutSeconds": 120,
+    "handshakeTimeoutSeconds": 30,
+    "turnTimeoutSeconds": 120,
     "keepAliveSeconds": 15,
     "optionsSets": [
       "search_result_progress_messages_with_search_queries",
