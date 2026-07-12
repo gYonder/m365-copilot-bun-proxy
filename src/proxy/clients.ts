@@ -483,7 +483,7 @@ export class CopilotSubstrateClient {
 
           if (
             frameType !== null &&
-            (frameType === 2 || frameType === 3 || frameType === 7)
+            (frameType === 3 || frameType === 7)
           ) {
             completed = true;
             break;
