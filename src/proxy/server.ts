@@ -2851,7 +2851,7 @@ function hasUsableSimulatedResponsesPayload(responseBody: JsonObject): boolean {
       continue;
     }
     const type = (tryGetString(item, "type") ?? "").toLowerCase();
-    if (type === "function_call") {
+    if (type === "function_call" || type === "custom_tool_call") {
       return true;
     }
     if (extractMessageOutputText(item).trim()) {
@@ -2889,7 +2889,7 @@ function shouldRetrySimulatedToollessResponsesPayload(
       continue;
     }
     const type = (tryGetString(item, "type") ?? "").toLowerCase();
-    if (type === "function_call") {
+    if (type === "function_call" || type === "custom_tool_call") {
       hasFunctionCall = true;
       break;
     }
@@ -3483,7 +3483,9 @@ function normalizeSimulatedResponsesFunctionCallItem(
   const itemId = tryGetString(item, "id") ?? createOpenAiOutputItemId("fc");
   return {
     id: itemId,
-    type: "function_call",
+    type: (tryGetString(item, "type") ?? "").toLowerCase() === "custom_tool_call"
+      ? "custom_tool_call"
+      : "function_call",
     status: tryGetString(item, "status") ?? "completed",
     call_id:
       tryGetString(item, "call_id") ??
@@ -3491,20 +3493,18 @@ function normalizeSimulatedResponsesFunctionCallItem(
       tryGetString(functionCallNode, "call_id") ??
       itemId,
     name,
-    arguments: normalizeSimulatedToolArguments(
-      firstDefined(
-        functionCallNode?.arguments,
-        functionCallNode?.args,
-        functionCallNode?.input_json,
-        functionCallNode?.parameters,
-        functionCallNode?.input,
-        item.arguments,
-        item.args,
-        item.input_json,
-        item.parameters,
-        item.input,
-      ),
-    ),
+    ...((tryGetString(item, "type") ?? "").toLowerCase() === "custom_tool_call"
+      ? { input: tryGetString(item, "input") ?? "" }
+      : {
+          arguments: normalizeSimulatedToolArguments(
+            firstDefined(
+              functionCallNode?.arguments, functionCallNode?.args,
+              functionCallNode?.input_json, functionCallNode?.parameters,
+              functionCallNode?.input, item.arguments, item.args,
+              item.input_json, item.parameters, item.input,
+            ),
+          ),
+        }),
   };
 }
 

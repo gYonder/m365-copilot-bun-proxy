@@ -1409,7 +1409,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(tryGetString(secondBody, "output_text") ?? "").toBe("hello once");
   });
 
-  test("responses request-hash guard replays function_call tool output on duplicate (patch/write regression)", async () => {
+  test("responses request-hash guard replays custom patch calls on duplicate", async () => {
     let chatCallCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
@@ -1425,11 +1425,11 @@ describe("simulated transform mode proxy flow", () => {
             model: "simulated-model",
             output: [
               {
-                type: "function_call",
+                type: "custom_tool_call",
                 status: "completed",
                 call_id: "call_abc123",
-                name: "shell",
-                arguments: '{"command":["sh","-c","printf world > hello.txt"]}',
+                name: "apply_patch",
+                input: "*** Begin Patch\n*** End Patch",
               },
             ],
           }),
@@ -1449,11 +1449,8 @@ describe("simulated transform mode proxy flow", () => {
       tools: [
         {
           type: "function",
-          name: "shell",
-          parameters: {
-            type: "object",
-            properties: { command: { type: "array", items: { type: "string" } } },
-          },
+          name: "apply_patch",
+          format: { type: "grammar", syntax: "lark", definition: "patch" },
         },
       ],
       tool_choice: "auto",
@@ -1475,7 +1472,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(first.status).toBe(200);
     const firstBody = (await first.json()) as JsonObject;
     const firstOutput = firstBody.output as JsonObject[];
-    expect(firstOutput[0]?.type).toBe("function_call");
+    expect(firstOutput[0]?.type).toBe("custom_tool_call");
 
     const second = await makeRequest();
     expect(second.status).toBe(200);
@@ -1484,15 +1481,13 @@ describe("simulated transform mode proxy flow", () => {
 
     const secondBody = (await second.json()) as JsonObject;
     const secondOutput = secondBody.output as JsonObject[];
-    // The retried tool turn MUST still carry the function_call so Codex can
+    // The retried tool turn MUST still carry the freeform patch so Codex can
     // apply the patch / run the shell command — not an empty message.
     expect(Array.isArray(secondOutput)).toBeTrue();
-    expect(secondOutput[0]?.type).toBe("function_call");
-    expect(tryGetString(secondOutput[0], "name")).toBe("shell");
+    expect(secondOutput[0]?.type).toBe("custom_tool_call");
+    expect(tryGetString(secondOutput[0], "name")).toBe("apply_patch");
     expect(tryGetString(secondOutput[0], "call_id")).toBe("call_abc123");
-    expect(tryGetString(secondOutput[0], "arguments")).toBe(
-      '{"command":["sh","-c","printf world > hello.txt"]}',
-    );
+    expect(tryGetString(secondOutput[0], "input")).toBe("*** Begin Patch\n*** End Patch");
   });
 
 

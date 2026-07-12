@@ -309,7 +309,7 @@ function responseHasUsefulOutput(response: JsonObject): boolean {
     }
     const typed = item as Record<string, unknown>;
     const itemType = typeof typed.type === "string" ? typed.type : "";
-    if (itemType === "function_call") {
+    if (itemType === "function_call" || itemType === "custom_tool_call") {
       return true;
     }
     if (itemType === "message" || itemType === "") {
