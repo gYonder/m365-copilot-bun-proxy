@@ -60,7 +60,7 @@ describe("Responses task deadlines", () => {
       options,
     );
 
-    expect(deadline).toBeGreaterThanOrEqual(before + 149_000);
+    expect(deadline).toBeGreaterThanOrEqual(before + 899_000);
     expect(computeResponsesTaskKey(initial)).not.toBe(
       computeResponsesTaskKey(
         request([
@@ -117,7 +117,7 @@ function createOptions(): WrapperOptions {
       clientPlatform: "web",
       productThreadType: "Office",
       invocationTimeoutSeconds: 120,
-      taskTimeoutSeconds: 150,
+      taskTimeoutSeconds: 900,
       keepAliveSeconds: 15,
       optionsSets: [],
       allowedMessageTypes: [],

@@ -47,7 +47,7 @@ function buildCodexModelInfo(
     truncation_policy: { mode: "tokens", limit: 10_000 },
     supports_parallel_tool_calls: true,
     supports_image_detail_original: false,
-    context_window: 272_000,
+    context_window: 128_000,
     experimental_supported_tools: [],
     input_modalities: ["text"],
   };

@@ -96,7 +96,8 @@ export class ResponseStore {
     }
     this.purgeExpired();
     const existing = this.taskDeadlines.get(normalizedKey);
-    if (existing && existing.expiresAtUtc > Date.now()) {
+    const now = Date.now();
+    if (existing && existing.deadlineMs > now && existing.expiresAtUtc > now) {
       this.taskDeadlines.delete(normalizedKey);
       this.taskDeadlines.set(normalizedKey, existing);
       return existing.deadlineMs;

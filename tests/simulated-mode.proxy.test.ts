@@ -181,6 +181,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(codexModels[0]?.default_reasoning_level).toBe("high");
     expect(codexModels[0]?.apply_patch_tool_type).toBe("freeform");
     expect(codexModels[0]?.supports_parallel_tool_calls).toBe(true);
+    expect(codexModels[0]?.context_window).toBe(128_000);
   });
 
   test("chat/completions non-stream wraps incoming JSON and returns parsed JSON block", async () => {

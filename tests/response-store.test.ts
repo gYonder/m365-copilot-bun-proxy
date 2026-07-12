@@ -32,6 +32,25 @@ describe("ResponseStore replay identity", () => {
   });
 });
 
+describe("ResponseStore task deadlines", () => {
+  test("replaces an expired deadline during its retention grace period", async () => {
+    const store = new ResponseStore(createOptions());
+    const expired = store.getOrCreateTaskDeadline(
+      "task-1",
+      () => Date.now() + 5,
+    );
+    await Bun.sleep(10);
+
+    const refreshed = store.getOrCreateTaskDeadline(
+      "task-1",
+      () => Date.now() + 1_000,
+    );
+
+    expect(refreshed).toBeGreaterThan(expired);
+    expect(refreshed).toBeGreaterThan(Date.now());
+  });
+});
+
 function response(id: string, text: string): JsonObject {
   return {
     id,
@@ -76,6 +95,7 @@ function createOptions(): WrapperOptions {
       clientPlatform: "web",
       productThreadType: "Office",
       invocationTimeoutSeconds: 120,
+      taskTimeoutSeconds: 900,
       keepAliveSeconds: 15,
       optionsSets: [],
       allowedMessageTypes: [],

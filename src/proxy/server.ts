@@ -3216,7 +3216,7 @@ function rememberResponsesReplayHashes(
 }
 
 function resolveTaskDeadlineMs(options: WrapperOptions): number {
-  const configuredSeconds = options.substrate.taskTimeoutSeconds ?? 150;
+  const configuredSeconds = options.substrate.taskTimeoutSeconds ?? 900;
   return Date.now() + Math.max(1, configuredSeconds) * 1_000;
 }
 
