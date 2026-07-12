@@ -12,6 +12,7 @@ import type {
   JsonObject,
   JsonValue,
   ParsedOpenAiRequest,
+  SubstrateOptions,
   SubstrateStreamUpdate,
   WrapperOptions,
 } from "./types";
@@ -251,15 +252,8 @@ export class CopilotSubstrateClient {
       sessionId,
       conversationId,
     );
-    const timeoutMs =
-      (this.options.substrate.invocationTimeoutSeconds > 0
-        ? this.options.substrate.invocationTimeoutSeconds
-        : 120) * 1000;
-    const handshakeTimeoutMs =
-      (this.options.substrate.handshakeTimeoutSeconds ?? timeoutMs / 1000) * 1000;
-    const turnDeadlineMs = Date.now() +
-      (this.options.substrate.turnTimeoutSeconds ?? timeoutMs / 1000) * 1000;
-
+    const { invocationTimeoutMs: timeoutMs, handshakeTimeoutMs, turnDeadlineMs } =
+      resolveSubstrateDeadlines(this.options.substrate, Date.now());
     const ws = await connectWebSocket(
       requestUri,
       this.options.substrate.origin ?? undefined,
@@ -746,6 +740,27 @@ export function buildInvocationPayload(
         ? options.substrate.invocationType
         : 1,
   };
+}
+
+export type SubstrateDeadlines = {
+  invocationTimeoutMs: number;
+  handshakeTimeoutMs: number;
+  turnDeadlineMs: number;
+};
+
+export function resolveSubstrateDeadlines(
+  substrate: SubstrateOptions,
+  nowMs: number,
+): SubstrateDeadlines {
+  const invocationTimeoutMs =
+    (substrate.invocationTimeoutSeconds > 0
+      ? substrate.invocationTimeoutSeconds
+      : 120) * 1000;
+  const handshakeTimeoutMs =
+    (substrate.handshakeTimeoutSeconds ?? invocationTimeoutMs / 1000) * 1000;
+  const turnDeadlineMs =
+    nowMs + (substrate.turnTimeoutSeconds ?? invocationTimeoutMs / 1000) * 1000;
+  return { invocationTimeoutMs, handshakeTimeoutMs, turnDeadlineMs };
 }
 
 export function resolveSubstrateTone(model: string | null | undefined): string {
