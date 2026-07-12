@@ -480,7 +480,9 @@ function buildFrameLogEntry(
     entry.isTerminal = true;
   }
   if (includePayload) {
-    entry.payload = analysis.json ? analysis.json : analysis.raw;
+    // SignalR payloads can contain bearer material and conversation content.
+    // Keep only structural diagnostics even under explicit trace logging.
+    entry.payload = { redacted: true, kind: analysis.json ? "json" : "text" };
   }
   return entry;
 }
