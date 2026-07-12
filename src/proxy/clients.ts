@@ -161,6 +161,22 @@ export class CopilotGraphClient {
   }
 }
 
+export type SubstrateWebSocketConnector = (
+  url: URL,
+  origin: string | undefined,
+  timeoutMs: number,
+  keepAliveMs: number,
+) => Promise<WebSocket>;
+
+export type SubstrateWebSocketReceiver = {
+  next: (timeoutMs: number) => Promise<string | null>;
+  dispose: () => void;
+};
+
+export type SubstrateReceiverFactory = (
+  ws: WebSocket,
+) => SubstrateWebSocketReceiver;
+
 export class CopilotSubstrateClient {
   constructor(
     private readonly options: WrapperOptions,
@@ -168,6 +184,8 @@ export class CopilotSubstrateClient {
     private readonly sessionStore = new SubstrateSessionStore(
       options.conversationTtlMinutes,
     ),
+    private readonly connect: SubstrateWebSocketConnector = connectWebSocket,
+    private readonly createReceiver: SubstrateReceiverFactory = createWebSocketReceiver,
   ) {}
 
   createConversation(): CreateConversationResult {
@@ -185,6 +203,7 @@ export class CopilotSubstrateClient {
     request: ParsedOpenAiRequest,
     isStartOfSession: boolean,
     onStreamUpdate?: (update: SubstrateStreamUpdate) => Promise<void>,
+    signal: AbortSignal | null = null,
   ): Promise<ChatResult> {
     return this.chatCore(
       authorizationHeader,
@@ -192,6 +211,7 @@ export class CopilotSubstrateClient {
       request,
       isStartOfSession,
       onStreamUpdate ?? null,
+      signal,
     );
   }
 
@@ -201,6 +221,7 @@ export class CopilotSubstrateClient {
     request: ParsedOpenAiRequest,
     isStartOfSession: boolean,
     onStreamUpdate: (update: SubstrateStreamUpdate) => Promise<void>,
+    signal: AbortSignal | null = null,
   ): Promise<ChatResult> {
     return this.chatCore(
       authorizationHeader,
@@ -208,6 +229,7 @@ export class CopilotSubstrateClient {
       request,
       isStartOfSession,
       onStreamUpdate,
+      signal,
     );
   }
 
@@ -217,7 +239,11 @@ export class CopilotSubstrateClient {
     request: ParsedOpenAiRequest,
     isStartOfSession: boolean,
     onStreamUpdate: ((update: SubstrateStreamUpdate) => Promise<void>) | null,
+    signal: AbortSignal | null = null,
   ): Promise<ChatResult> {
+    if (signal?.aborted) {
+      return buildFailure(499, "Substrate turn cancelled before start.");
+    }
     const rawToken = extractBearerToken(authorizationHeader);
     if (!rawToken) {
       return buildFailure(401, "Missing Bearer token.");
@@ -254,7 +280,7 @@ export class CopilotSubstrateClient {
     );
     const { invocationTimeoutMs: timeoutMs, handshakeTimeoutMs, turnDeadlineMs } =
       resolveSubstrateDeadlines(this.options.substrate, Date.now());
-    const ws = await connectWebSocket(
+    const ws = await this.connect(
       requestUri,
       this.options.substrate.origin ?? undefined,
       timeoutMs,
@@ -272,7 +298,21 @@ export class CopilotSubstrateClient {
     const transcript: string[] = [];
     let invocationPayload: JsonObject | null = null;
     let resolvedConversationId = conversationId;
-    const receiver = createWebSocketReceiver(ws);
+    const receiver = this.createReceiver(ws);
+    const onAbort = () => {
+      try {
+        ws.close(1000, "client disconnected");
+      } catch {
+        // ignore
+      }
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+      } else {
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+    }
     try {
       await sendFrame(ws, requestUri, this.logger, {
         protocol: "json",
@@ -356,6 +396,9 @@ export class CopilotSubstrateClient {
       };
 
       while (!completed && ws.readyState === WebSocket.OPEN) {
+        if (signal?.aborted) {
+          break;
+        }
         const remainingMs = turnDeadlineMs - Date.now();
         if (remainingMs <= 0) {
           return buildFailure(504, "Substrate websocket turn timed out.");
@@ -499,6 +542,15 @@ export class CopilotSubstrateClient {
         // ignore
       }
 
+      if (signal?.aborted) {
+        return buildFailure(
+          499,
+          "Substrate turn cancelled by client disconnect.",
+          invocationPayload,
+          buildSubstrateTranscriptPayload(transcript),
+        );
+      }
+
       // SignalR type 7/error frames are terminal failures. Never turn a
       // partially streamed message into a successful Codex turn: that would
       // make a failed write or patch look completed to the client.
@@ -550,6 +602,9 @@ export class CopilotSubstrateClient {
         buildSubstrateTranscriptPayload(transcript),
       );
     } finally {
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
       receiver.dispose();
       try {
         ws.close();
