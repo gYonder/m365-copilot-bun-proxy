@@ -2818,7 +2818,14 @@ function normalizeSimulatedResponsesPayload(
       buildMessageOutputItem(createOpenAiOutputItemId("msg"), outputText, "completed"),
     ];
   } else {
-    responseBody.output = normalizeSimulatedResponseOutputItems(rawOutputItems);
+    responseBody.output = normalizeSimulatedResponseOutputItems(
+      rawOutputItems,
+      new Set(
+        parsedRequest.base.tooling.tools
+          .filter((tool) => tool.type === "custom")
+          .map((tool) => tool.name),
+      ),
+    );
   }
   if (responseBody.outputs !== undefined) {
     delete responseBody.outputs;
@@ -3395,7 +3402,10 @@ function extractAssistantInputItemText(inputItem: unknown): string | null {
   return normalized ? normalized : null;
 }
 
-function normalizeSimulatedResponseOutputItems(outputItems: unknown[]): JsonObject[] {
+function normalizeSimulatedResponseOutputItems(
+  outputItems: unknown[],
+  customToolNames = new Set<string>(),
+): JsonObject[] {
   const normalized: JsonObject[] = [];
 
   for (const item of outputItems) {
@@ -3416,7 +3426,7 @@ function normalizeSimulatedResponseOutputItems(outputItems: unknown[]): JsonObje
 
     if (isSimulatedResponsesFunctionCallOutputItem(item)) {
       normalized.push(
-        normalizeSimulatedResponsesFunctionCallItem(item) ?? item,
+        normalizeSimulatedResponsesFunctionCallItem(item, customToolNames) ?? item,
       );
       continue;
     }
@@ -3463,6 +3473,7 @@ function isSimulatedResponsesFunctionCallOutputItem(item: JsonObject): boolean {
 
 function normalizeSimulatedResponsesFunctionCallItem(
   item: JsonObject,
+  customToolNames = new Set<string>(),
 ): JsonObject | null {
   const functionCallNode = isJsonObject(item.function_call)
     ? item.function_call
@@ -3481,11 +3492,11 @@ function normalizeSimulatedResponsesFunctionCallItem(
   }
 
   const itemId = tryGetString(item, "id") ?? createOpenAiOutputItemId("fc");
+  const isCustom = customToolNames.has(name) ||
+    (tryGetString(item, "type") ?? "").toLowerCase() === "custom_tool_call";
   return {
     id: itemId,
-    type: (tryGetString(item, "type") ?? "").toLowerCase() === "custom_tool_call"
-      ? "custom_tool_call"
-      : "function_call",
+    type: isCustom ? "custom_tool_call" : "function_call",
     status: tryGetString(item, "status") ?? "completed",
     call_id:
       tryGetString(item, "call_id") ??
@@ -3493,8 +3504,8 @@ function normalizeSimulatedResponsesFunctionCallItem(
       tryGetString(functionCallNode, "call_id") ??
       itemId,
     name,
-    ...((tryGetString(item, "type") ?? "").toLowerCase() === "custom_tool_call"
-      ? { input: tryGetString(item, "input") ?? "" }
+    ...(isCustom
+      ? { input: tryGetString(item, "input") ?? tryGetString(item, "arguments") ?? "" }
       : {
           arguments: normalizeSimulatedToolArguments(
             firstDefined(
