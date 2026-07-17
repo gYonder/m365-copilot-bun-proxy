@@ -41,6 +41,10 @@ import {
   createOpenAiResponseId,
 } from "./responses-api";
 import {
+  estimateResponsesContext,
+  resolveContextInputTokens,
+} from "./context-accounting";
+import {
   buildCopilotRequestPayload,
   isSupportedOpenAiTransformMode,
   isSupportedTransport,
@@ -1089,6 +1093,16 @@ async function handleResponsesCreate(
   }
   const parsedRequest = parsed.request;
   const baseRequest = parsedRequest.base;
+
+  const currentContextEstimate = estimateResponsesContext(payload.json).inputTokens;
+  const previousContextUsage = parsedRequest.previousResponseId
+    ? responseStore.tryGetContextUsage(parsedRequest.previousResponseId)
+    : null;
+  parsedRequest.contextInputTokens = resolveContextInputTokens(
+    currentContextEstimate,
+    parsedRequest.contextWindowId,
+    previousContextUsage,
+  );
 
   if (!isSupportedTransport(selectedTransport)) {
     traceError(
@@ -2793,6 +2807,19 @@ function normalizeSimulatedResponsesPayload(
     responseBody.conversation = conversationId;
     responseBody.conversation_id = conversationId;
   }
+
+  const rebuilt = buildOpenAiResponseObject(
+    responseId,
+    resolveResponseCreatedAt(responseBody.created_at),
+    tryGetString(responseBody, "model") ?? parsedRequest.base.model,
+    tryGetString(responseBody, "status") ?? "completed",
+    Array.isArray(responseBody.output)
+      ? responseBody.output.filter(isJsonObject)
+      : [],
+    parsedRequest,
+    includeConversationId ? conversationId : null,
+  );
+  responseBody.usage = rebuilt.usage;
 
   return { responseId, responseBody };
 }

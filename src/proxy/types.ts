@@ -115,6 +115,9 @@ export type ParsedResponsesRequest = {
   inputItemsForStorage: JsonValue[];
   instructions: string | null;
   store: boolean;
+  rawRequest: JsonObject;
+  contextWindowId: string | null;
+  contextInputTokens: number | null;
 };
 
 export type JsonPayload = {
@@ -167,6 +170,8 @@ export type StoredOpenAiResponseRecord = {
   conversationId: string | null;
   expiresAtUtc: number;
   taskDeadlineMs: number | null;
+  contextInputTokens: number | null;
+  contextWindowId: string | null;
 };
 
 export type SubstrateStreamUpdate = {

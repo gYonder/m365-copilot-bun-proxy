@@ -38,11 +38,14 @@ export class ResponseStore {
     response: JsonObject,
     conversationId: string | null,
     taskDeadlineMs: number | null = null,
+    contextInputTokens: number | null = null,
+    contextWindowId: string | null = null,
   ): void {
     if (!responseId.trim()) {
       return;
     }
     this.purgeExpired();
+    const inferredContext = readContextUsage(response);
     const record: StoredOpenAiResponseRecord = {
       responseId,
       createdAtUnix: readCreatedAt(response),
@@ -50,6 +53,8 @@ export class ResponseStore {
       conversationId: conversationId?.trim() ? conversationId : null,
       expiresAtUtc: this.resolveExpiryMs(),
       taskDeadlineMs,
+      contextInputTokens: contextInputTokens ?? inferredContext.inputTokens,
+      contextWindowId: contextWindowId ?? inferredContext.windowId,
     };
     this.entries.set(responseId, record);
     trimOldest(this.entries, MaxStoredResponses);
@@ -61,6 +66,16 @@ export class ResponseStore {
       });
       trimOldest(this.conversationLinks, MaxStoredResponses);
     }
+  }
+
+  tryGetContextUsage(responseId: string): {
+    inputTokens: number;
+    windowId: string | null;
+  } | null {
+    this.purgeExpired();
+    const entry = this.entries.get(responseId);
+    if (!entry || entry.contextInputTokens === null) return null;
+    return { inputTokens: entry.contextInputTokens, windowId: entry.contextWindowId };
   }
 
   tryGet(responseId: string): JsonObject | null {
@@ -253,6 +268,26 @@ export class ResponseStore {
     }
 
   }
+}
+
+function readContextUsage(response: JsonObject): {
+  inputTokens: number | null;
+  windowId: string | null;
+} {
+  const usage = response.usage;
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) {
+    return { inputTokens: null, windowId: null };
+  }
+  const inputTokens = usage.x_m365_context_input_tokens;
+  const windowId = usage.x_m365_context_window_id;
+  return {
+    inputTokens:
+      typeof inputTokens === "number" && Number.isFinite(inputTokens)
+        ? Math.max(0, Math.trunc(inputTokens))
+        : null,
+    windowId:
+      typeof windowId === "string" && windowId.trim() ? windowId.trim() : null,
+  };
 }
 
 function trimOldest<K, V>(entries: Map<K, V>, maxEntries: number): void {

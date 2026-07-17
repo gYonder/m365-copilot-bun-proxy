@@ -22,6 +22,7 @@ import {
   tryGetString,
   isJsonObject,
   cloneJsonValue,
+  tryParseJsonObject,
 } from "./utils";
 
 export function normalizeTransport(
@@ -301,6 +302,7 @@ export function tryParseResponsesRequest(
   | { ok: true; request: ParsedResponsesRequest }
   | { ok: false; error: string } {
   const previousResponseId = tryGetString(requestJson, "previous_response_id");
+  const contextWindowId = extractContextWindowId(requestJson);
   const store = tryGetBoolean(requestJson, "store") !== false;
   const specConversationId = extractSpecConversationId(requestJson);
   if (previousResponseId && specConversationId) {
@@ -322,6 +324,9 @@ export function tryParseResponsesRequest(
         inputItemsForStorage: normalizedInput.inputItemsForStorage,
         instructions: tryGetString(requestJson, "instructions"),
         store,
+        rawRequest: cloneJsonValue(requestJson),
+        contextWindowId,
+        contextInputTokens: null,
       },
     };
   }
@@ -370,8 +375,23 @@ export function tryParseResponsesRequest(
       inputItemsForStorage: normalizedInput.inputItemsForStorage,
       instructions,
       store,
+      rawRequest: cloneJsonValue(requestJson),
+      contextWindowId,
+      contextInputTokens: null,
     },
   };
+}
+
+function extractContextWindowId(requestJson: JsonObject): string | null {
+  const metadata = isJsonObject(requestJson.client_metadata)
+    ? requestJson.client_metadata
+    : null;
+  const direct = tryGetString(metadata, "x-codex-window-id");
+  if (direct) return direct;
+  const encoded = tryGetString(metadata, "x-codex-turn-metadata");
+  if (!encoded) return null;
+  const parsed = tryParseJsonObject(encoded);
+  return tryGetString(parsed, "window_id");
 }
 
 function buildSimulatedOpenAiRequest(

@@ -30,6 +30,15 @@ describe("ResponseStore replay identity", () => {
     expect(store.tryGet("resp-0")).toBeNull();
     expect(store.tryGet("resp-1024")?.id).toBe("resp-1024");
   });
+
+  test("stores context usage with its response chain identity", () => {
+    const store = new ResponseStore(createOptions());
+    store.set("resp-context", response("resp-context", "ok"), "conversation-1", null, 42_000, "window-1");
+    expect(store.tryGetContextUsage("resp-context")).toEqual({
+      inputTokens: 42_000,
+      windowId: "window-1",
+    });
+  });
 });
 
 describe("ResponseStore task deadlines", () => {
