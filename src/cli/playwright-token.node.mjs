@@ -151,6 +151,12 @@ async function fetchTokenWithPlaywrightNode(
           }
         : await extractStoredSubstrateAccountClaims(page);
 
+      await waitForResourceAuthentication(
+        context,
+        page,
+        options.tokenTimeoutMs,
+      );
+
       console.log(
         "[playwright] No browser-stored substrate token found yet; falling back to WebSocket capture.",
       );
@@ -239,7 +245,17 @@ async function fillChatEditor(page, text) {
     throw new Error("M365 chat editor was not found.");
   }
 
-  await page.keyboard.type(text, { delay: 10 });
+  // Lexical ignores Playwright's key-by-key typing in the current M365
+  // composer, while insertText dispatches the input event that activates Send.
+  await page.keyboard.insertText(text);
+  await page.waitForFunction(
+    (expectedText) => {
+      const editor = document.querySelector("#m365-chat-editor-target-element");
+      return (editor?.textContent ?? "").includes(String(expectedText));
+    },
+    text,
+    { timeout: 5_000 },
+  );
 }
 
 async function maybeHandleAuthDialog(page, timeoutMs = 5_000) {
@@ -255,6 +271,68 @@ async function maybeHandleAuthDialog(page, timeoutMs = 5_000) {
   await continueButton.waitFor({ state: "hidden", timeout: 15_000 }).catch(() => {});
   await page.waitForTimeout(3_000);
   return true;
+}
+
+async function waitForResourceAuthentication(context, page, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let sawAuthentication = false;
+  let reportedWaiting = false;
+  let settledSince = null;
+
+  while (Date.now() < deadline) {
+    const continueButton = page
+      .getByRole("button", { name: /^continue$/i })
+      .first();
+    const continueVisible = await continueButton
+      .isVisible()
+      .catch(() => false);
+    if (continueVisible) {
+      sawAuthentication = true;
+      settledSince = null;
+      await continueButton.click({ timeout: 10_000 }).catch(() => {});
+    }
+
+    const authenticationPages = context.pages().filter((candidatePage) => {
+      if (candidatePage === page || candidatePage.isClosed()) {
+        return false;
+      }
+      try {
+        const hostname = new URL(candidatePage.url()).hostname.toLowerCase();
+        return (
+          hostname === "login.microsoftonline.com" ||
+          hostname.endsWith(".login.microsoftonline.com")
+        );
+      } catch {
+        return false;
+      }
+    });
+
+    if (authenticationPages.length > 0) {
+      sawAuthentication = true;
+      settledSince = null;
+      if (!reportedWaiting) {
+        console.log(
+          "[playwright] Microsoft resource authentication is open in Edge. Complete the approval there to continue.",
+        );
+        reportedWaiting = true;
+      }
+    } else if (!continueVisible) {
+      if (!sawAuthentication) {
+        return;
+      }
+      settledSince ??= Date.now();
+      if (Date.now() - settledSince >= 3_000) {
+        console.log("[playwright] Microsoft resource authentication completed.");
+        return;
+      }
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  throw new Error(
+    `Timed out waiting for Microsoft resource authentication after ${timeoutMs / 1000}s.`,
+  );
 }
 
 async function waitForStoredSubstrateToken(page, timeoutMs) {
@@ -525,6 +603,7 @@ async function waitForEditorToClear(page, timeoutMs) {
         const editor = document.querySelector("#m365-chat-editor-target-element");
         return !!editor && !(editor.textContent ?? "").trim();
       },
+      undefined,
       { timeout: timeoutMs },
     );
     return true;
