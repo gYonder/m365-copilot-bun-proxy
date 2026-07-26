@@ -860,6 +860,184 @@ describe("simulated transform mode proxy flow", () => {
     expect(body.output_text).toBe("hello from responses mode");
   });
 
+  test("responses auto tool choice accepts final assistant text without resend", async () => {
+    let upstreamCalls = 0;
+    const payload: JsonObject = {
+      id: "resp_auto_text",
+      object: "response",
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "done" }],
+        },
+      ],
+      output_text: "done",
+    };
+    const app = createProxyApp(
+      createServices((conversationId, requestPayload) => {
+        upstreamCalls += 1;
+        return buildGraphChatResult(
+          conversationId,
+          requestPayload,
+          toMarkdownJson(payload),
+        );
+      }),
+    );
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          input: [
+            {
+              type: "function_call",
+              call_id: "call_1",
+              name: "noop",
+              arguments: "{}",
+            },
+            {
+              type: "function_call_output",
+              call_id: "call_1",
+              output: "ok",
+            },
+            { role: "user", content: "Give the final answer." },
+          ],
+          tools: [
+            {
+              type: "function",
+              name: "noop",
+              parameters: { type: "object" },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as JsonObject;
+    expect(body.output_text).toBe("done");
+    expect(upstreamCalls).toBe(1);
+  });
+
+  test("responses stream wraps direct final assistant text without resend", async () => {
+    let upstreamCalls = 0;
+    const app = createProxyApp(
+      createServices((conversationId, requestPayload) => {
+        upstreamCalls += 1;
+        return buildGraphChatResult(
+          conversationId,
+          requestPayload,
+          "done",
+        );
+      }),
+    );
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: true,
+          input: [
+            {
+              type: "function_call",
+              call_id: "call_1",
+              name: "noop",
+              arguments: "{}",
+            },
+            {
+              type: "function_call_output",
+              call_id: "call_1",
+              output: "ok",
+            },
+            { role: "user", content: "Give the final answer." },
+          ],
+          tools: [
+            {
+              type: "function",
+              name: "noop",
+              parameters: { type: "object" },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+    expect(response.status).toBe(200);
+    let completedOutput = "";
+    let sawFailure = false;
+    for await (const event of readSseEvents(response.body!)) {
+      if (event.event === "response.failed" || event.event === "error") {
+        sawFailure = true;
+      }
+      if (event.event !== "response.completed") continue;
+      const parsed = tryParseJsonObject(event.data);
+      const completed = parsed?.response;
+      if (isJsonObject(completed)) {
+        completedOutput = tryGetString(completed, "output_text") ?? "";
+      }
+    }
+    expect(completedOutput).toBe("done");
+    expect(sawFailure).toBeFalse();
+    expect(upstreamCalls).toBe(1);
+  });
+
+  test("responses required tool choice rejects final assistant text without resend", async () => {
+    let upstreamCalls = 0;
+    const app = createProxyApp(
+      createServices((conversationId, requestPayload) => {
+        upstreamCalls += 1;
+        return buildGraphChatResult(
+          conversationId,
+          requestPayload,
+          toMarkdownJson({
+            id: "resp_required_text",
+            object: "response",
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "done" }],
+              },
+            ],
+            output_text: "done",
+          }),
+        );
+      }),
+    );
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          input: "Use the required tool, then answer.",
+          tools: [
+            {
+              type: "function",
+              name: "noop",
+              parameters: { type: "object" },
+            },
+          ],
+          tool_choice: "required",
+        }),
+      }),
+    );
+    expect(response.status).toBe(502);
+    expect(upstreamCalls).toBe(1);
+  });
+
   test("responses non-stream normalizes output_text output items", async () => {
     const simulatedResponse: JsonObject = {
       id: "resp_simulated_output_text_item",

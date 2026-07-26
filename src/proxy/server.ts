@@ -1137,26 +1137,51 @@ async function handleResponsesCreate(
           assistantText,
           "responses",
         );
-        const normalized = simulatedPayload
-          ? normalizeSimulatedResponsesPayload(
-              simulatedPayload,
-              parsedRequest,
-              conversationId,
-              options.includeConversationIdInResponseBody,
-            )
-          : null;
+        if (simulatedPayload) {
+          const normalized = normalizeSimulatedResponsesPayload(
+            simulatedPayload,
+            parsedRequest,
+            conversationId,
+            options.includeConversationIdInResponseBody,
+          );
 
+          if (
+            !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
+            shouldRetrySimulatedInvalidResponsesToolPayload(
+              normalized.responseBody,
+            ) ||
+            shouldRetrySimulatedToollessResponsesPayload(
+              options,
+              baseRequest,
+              normalized.responseBody,
+            )
+          ) {
+            return writeOpenAiError(
+              services,
+              502,
+              "Simulated mode response did not include a usable response output payload.",
+              "api_error",
+              "invalid_simulated_payload",
+            );
+          }
+          return buildSimulatedResponsesStreamResponse(
+            services,
+            parsedRequest,
+            conversationId,
+            normalized.responseBody,
+            responseHeaders,
+            trace,
+            requestHash,
+            taskDeadlineMs,
+          );
+        }
+
+        // M365 occasionally returns the final assistant text directly after a
+        // tool result instead of wrapping it in a simulated Responses object.
+        // Convert that first response locally; never resend the upstream turn.
         if (
-          !normalized ||
-          !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
-          shouldRetrySimulatedInvalidResponsesToolPayload(
-            normalized.responseBody,
-          ) ||
-          shouldRetrySimulatedToollessResponsesPayload(
-            options,
-            baseRequest,
-            normalized.responseBody,
-          )
+          !assistantText.trim() ||
+          looksLikeForeignSandboxLeak(assistantText)
         ) {
           return writeOpenAiError(
             services,
@@ -1166,16 +1191,6 @@ async function handleResponsesCreate(
             "invalid_simulated_payload",
           );
         }
-        return buildSimulatedResponsesStreamResponse(
-          services,
-          parsedRequest,
-          conversationId,
-          normalized.responseBody,
-          responseHeaders,
-          trace,
-          requestHash,
-          taskDeadlineMs,
-        );
       }
 
       const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
@@ -1273,25 +1288,73 @@ async function handleResponsesCreate(
       assistantText,
       "responses",
     );
-    const normalized = simulatedPayload
-      ? normalizeSimulatedResponsesPayload(
-          simulatedPayload,
-          parsedRequest,
-          conversationId,
-          options.includeConversationIdInResponseBody,
-        )
-      : null;
+    if (simulatedPayload) {
+      const normalized = normalizeSimulatedResponsesPayload(
+        simulatedPayload,
+        parsedRequest,
+        conversationId,
+        options.includeConversationIdInResponseBody,
+      );
 
-    if (
-      !normalized ||
-      !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
-      shouldRetrySimulatedInvalidResponsesToolPayload(normalized.responseBody) ||
-      shouldRetrySimulatedToollessResponsesPayload(
-        options,
-        baseRequest,
+      if (
+        !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
+        shouldRetrySimulatedInvalidResponsesToolPayload(
+          normalized.responseBody,
+        ) ||
+        shouldRetrySimulatedToollessResponsesPayload(
+          options,
+          baseRequest,
+          normalized.responseBody,
+        )
+      ) {
+        traceError(
+          services,
+          trace,
+          {
+            message:
+              "Simulated mode response did not include a usable response output payload.",
+            type: "api_error",
+            param: null,
+            code: "invalid_simulated_payload",
+          },
+          502,
+        );
+        return writeOpenAiError(
+          services,
+          502,
+          "Simulated mode response did not include a usable response output payload.",
+          "api_error",
+          "invalid_simulated_payload",
+        );
+      }
+
+      responseStore.set(
+        normalized.responseId,
         normalized.responseBody,
-      )
-    ) {
+        conversationId,
+        taskDeadlineMs,
+      );
+      rememberResponsesReplayHashes(
+        responseStore,
+        requestHash,
+        conversationId,
+        normalized.responseBody,
+      );
+      responseHeaders.set("content-type", "application/json");
+      const body = JSON.stringify(normalized.responseBody);
+      tracePane2(services, trace, normalized.responseBody, 200);
+      traceComplete(services, trace, 200);
+      await debugLogger.logOutgoingResponse(
+        200,
+        responseHeaders.entries(),
+        body,
+      );
+      return new Response(body, { status: 200, headers: responseHeaders });
+    }
+
+    // Accept a direct final answer after tool output by converting the first
+    // upstream response locally. Empty or hosted-sandbox answers remain invalid.
+    if (!assistantText.trim() || looksLikeForeignSandboxLeak(assistantText)) {
       traceError(
         services,
         trace,
@@ -1312,25 +1375,6 @@ async function handleResponsesCreate(
         "invalid_simulated_payload",
       );
     }
-
-    responseStore.set(
-      normalized.responseId,
-      normalized.responseBody,
-      conversationId,
-      taskDeadlineMs,
-    );
-    rememberResponsesReplayHashes(
-      responseStore,
-      requestHash,
-      conversationId,
-      normalized.responseBody,
-    );
-    responseHeaders.set("content-type", "application/json");
-    const body = JSON.stringify(normalized.responseBody);
-    tracePane2(services, trace, normalized.responseBody, 200);
-    traceComplete(services, trace, 200);
-    await debugLogger.logOutgoingResponse(200, responseHeaders.entries(), body);
-    return new Response(body, { status: 200, headers: responseHeaders });
   }
 
   const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
@@ -2528,6 +2572,14 @@ function shouldRetrySimulatedToollessResponsesPayload(
   // the model ignored the local tool output. Re-ask so it uses the real result.
   if (hasSandboxLeak) {
     return true;
+  }
+  // Auto tool choice may legitimately finish with assistant text. Only
+  // required/function choices must reject a tool-less final answer.
+  if (
+    request.tooling.toolChoiceMode !== ToolChoiceModes.Required &&
+    request.tooling.toolChoiceMode !== ToolChoiceModes.Function
+  ) {
+    return false;
   }
   if (hasMessageText) {
     return true;
