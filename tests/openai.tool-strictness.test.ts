@@ -91,6 +91,31 @@ describe("buildAssistantResponse strict tool behavior", () => {
     expect(response.toolCalls[0]?.argumentsJson).toContain("\"zone\"");
   });
 
+  test("unwraps a single code field for Codex custom tools", () => {
+    const request = createRequest(ToolChoiceModes.Required, null);
+    request.tooling.tools = [{
+      name: "apply_patch",
+      type: "custom",
+      description: "Apply a patch",
+      parameters: {},
+      format: null,
+    }];
+    const patch = "*** Begin Patch\n*** End Patch";
+    const response = buildAssistantResponse(
+      request,
+      JSON.stringify({
+        name: "apply_patch",
+        input: { input: patch },
+      }),
+    );
+
+    expect(response.strictToolErrorMessage).toBeNull();
+    expect(response.finishReason).toBe("tool_calls");
+    expect(response.toolCalls).toHaveLength(1);
+    expect(response.toolCalls[0]?.type).toBe("custom");
+    expect(response.toolCalls[0]?.argumentsJson).toBe(patch);
+  });
+
   test("does not fabricate a tool call when strict local exec output is missing", () => {
     const request = createRequest(ToolChoiceModes.Required, null, {
       promptText:

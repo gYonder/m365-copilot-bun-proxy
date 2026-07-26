@@ -5,12 +5,14 @@ import { CopilotGraphClient, CopilotSubstrateClient } from "./clients";
 import { loadWrapperOptions } from "./config";
 import { ConversationStore } from "./conversation-store";
 import { DebugMarkdownLogger } from "./logger";
+import { DurableStateStore } from "./durable-state";
 import { ResponseStore } from "./response-store";
 import { createProxyApp } from "./server";
 import { ProxyTokenProvider } from "./token-provider";
 import { ProxyVizTraceStore } from "./viz-trace-store";
 import type { WrapperOptions } from "./types";
 import { parseListenUrl } from "./utils";
+import { SubstrateSessionStore } from "./substrate-session-store";
 
 const loadedOptions = await loadWrapperOptions(process.cwd());
 const debugEnabled = parseDebugFlag();
@@ -20,9 +22,19 @@ if (debugEnabled && options.debugPath?.trim()) {
 }
 const debugLogger = new DebugMarkdownLogger(options, debugEnabled);
 const graphClient = new CopilotGraphClient(options, debugLogger);
-const substrateClient = new CopilotSubstrateClient(options, debugLogger);
-const conversationStore = new ConversationStore(options);
-const responseStore = new ResponseStore(options);
+const durableState = new DurableStateStore();
+const substrateSessionStore = new SubstrateSessionStore(
+  options.conversationTtlMinutes,
+  undefined,
+  durableState,
+);
+const substrateClient = new CopilotSubstrateClient(
+  options,
+  debugLogger,
+  substrateSessionStore,
+);
+const conversationStore = new ConversationStore(options, durableState);
+const responseStore = new ResponseStore(options, durableState);
 const vizTraceStore = new ProxyVizTraceStore(options.conversationTtlMinutes * 60);
 const tokenProvider = new ProxyTokenProvider({
   ignoreIncomingAuthorizationHeader: options.ignoreIncomingAuthorizationHeader,

@@ -24,8 +24,16 @@ function buildCodexModelInfo(
   id: (typeof AvailableModelIds)[number],
   index: number,
 ): JsonObject {
+  // M365 exposes one verified GPT-5.6 reasoning selector. All Codex effort
+  // levels map to that selector; retaining the standard levels keeps
+  // continuation requests valid without inventing unobserved M365 tones.
   const supportedReasoningLevels = [
+    { effort: "none", description: "No extra reasoning" },
+    { effort: "low", description: "Light reasoning" },
+    { effort: "medium", description: "Balanced reasoning" },
     { effort: "high", description: "Deep reasoning" },
+    { effort: "xhigh", description: "Very deep reasoning" },
+    { effort: "max", description: "Maximum reasoning" },
   ];
 
   return {
@@ -47,7 +55,7 @@ function buildCodexModelInfo(
     truncation_policy: { mode: "tokens", limit: 10_000 },
     supports_parallel_tool_calls: true,
     supports_image_detail_original: false,
-    context_window: 128_000,
+    context_window: 400_000,
     experimental_supported_tools: [],
     input_modalities: ["text"],
   };

@@ -727,7 +727,32 @@ function hasRequiredToolArguments(
 function normalizeCustomToolInput(input: JsonValue | null): string {
   if (typeof input === "string") return input;
   if (input === null) return "";
+  // Some substrate turns emit custom-tool input as a JSON object wrapping the
+  // code string under an "input" (or "code"/"command"/"script") key, mirroring
+  // function-call argument shape. Codex evals custom-tool input as JS, so a
+  // wrapped object like {"input":"const ..."} produces
+  // "SyntaxError: Unexpected token ':'" and the agent retries the same call in
+  // a loop. Unwrap the single-string-key form back to the bare code string.
+  if (isJsonObject(input)) {
+    const unwrapped = tryUnwrapSingleStringCodeField(input);
+    if (unwrapped !== null) {
+      return unwrapped;
+    }
+  }
   return JSON.stringify(input);
+}
+
+function tryUnwrapSingleStringCodeField(obj: JsonObject): string | null {
+  const keys = Object.keys(obj);
+  if (keys.length !== 1) {
+    return null;
+  }
+  const key = keys[0];
+  if (!/^(input|code|command|script|source)$/i.test(key)) {
+    return null;
+  }
+  const value = obj[key];
+  return typeof value === "string" ? value : null;
 }
 
 function normalizeArgumentsJson(argumentsNode: JsonValue | null): string {

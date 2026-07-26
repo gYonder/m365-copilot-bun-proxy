@@ -1,4 +1,6 @@
 import type { WrapperOptions } from "./types";
+import { createHash } from "node:crypto";
+import { DurableStateStore } from "./durable-state";
 
 const MaxConversationEntries = 1_024;
 
@@ -7,20 +9,30 @@ export class ConversationStore {
     string,
     { conversationId: string; expiresAtUtc: number }
   >();
-
-  constructor(private readonly options: WrapperOptions) {}
+  constructor(
+    private readonly options: WrapperOptions,
+    private readonly durable = new DurableStateStore(),
+  ) {
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(this.durable.state.conversations)) {
+      if (entry.expiresAtUtc > now) this.entries.set(key, entry);
+    }
+  }
 
   tryGet(key: string): string | null {
     this.purgeExpired();
-    const entry = this.entries.get(key);
+    const hashedKey = durableKey(key);
+    const entry = this.entries.get(key) ?? this.entries.get(hashedKey);
     if (!entry) {
       return null;
     }
     if (entry.expiresAtUtc <= Date.now()) {
       this.entries.delete(key);
+      this.entries.delete(hashedKey);
       return null;
     }
     this.entries.delete(key);
+    this.entries.delete(hashedKey);
     this.entries.set(key, entry);
     return entry.conversationId;
   }
@@ -43,6 +55,11 @@ export class ConversationStore {
       }
       this.entries.delete(oldest.value);
     }
+    this.durable.state.conversations[durableKey(key)] = {
+      conversationId,
+      expiresAtUtc,
+    };
+    this.durable.save();
   }
 
   private purgeExpired(): void {
@@ -56,4 +73,8 @@ export class ConversationStore {
       }
     }
   }
+}
+
+function durableKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
 }

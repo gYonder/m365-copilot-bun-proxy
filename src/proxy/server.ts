@@ -564,27 +564,10 @@ async function handleChat(
     return result;
   };
   const executeChatTurnWithRecovery = async (): Promise<ChatResult> => {
-    let result = await executeChatTurn();
-    if (
-      shouldRetrySubstrateNoAssistantContent(
-        selectedTransport,
-        createdConversation,
-        result,
-      )
-    ) {
-      const createRetryConversation = substrateClient.createConversation();
-      if (createRetryConversation.isSuccess && createRetryConversation.conversationId) {
-        conversationId = createRetryConversation.conversationId;
-        createdConversation = true;
-        responseHeaders.set("x-m365-conversation-id", conversationId);
-        responseHeaders.set("x-m365-conversation-created", "true");
-        if (scopedConversationKey) {
-          conversationStore.set(scopedConversationKey, conversationId);
-        }
-        result = await executeChatTurn();
-      }
-    }
-    return result;
+    // A 502 after the upstream send is ambiguous: retrying can duplicate the
+    // user turn. Only the substrate client may retry failures proven to occur
+    // before send; preserve the first result here.
+    return executeChatTurn();
   };
 
   if (parsedRequest.stream) {
@@ -637,11 +620,11 @@ async function handleChat(
         ) ??
         "";
       if (parsedRequest.transformMode === OpenAiTransformModes.Simulated) {
-        let simulatedPayload = tryExtractSimulatedResponsePayload(
+        const simulatedPayload = tryExtractSimulatedResponsePayload(
           assistantText,
           "chat.completions",
         );
-        let normalizedSimulatedPayload = simulatedPayload
+        const normalizedSimulatedPayload = simulatedPayload
           ? normalizeSimulatedChatCompletionPayload(
               simulatedPayload,
               parsedRequest.model,
@@ -659,52 +642,6 @@ async function handleChat(
             parsedRequest,
             normalizedSimulatedPayload,
           )
-        ) {
-          const retryResult = await executeChatTurnWithRecovery();
-          if (!retryResult.isSuccess) {
-            return writeFromUpstreamFailure(
-              services,
-              retryResult.statusCode,
-              retryResult.rawBody,
-              selectedTransport === TransportNames.Substrate
-                ? "Substrate chat request failed."
-                : "Microsoft Graph chat request failed.",
-              selectedTransport === TransportNames.Substrate
-                ? "substrate_error"
-                : "graph_error",
-            );
-          }
-          if (retryResult.conversationId) {
-            conversationId = retryResult.conversationId;
-            responseHeaders.set("x-m365-conversation-id", conversationId);
-            if (scopedConversationKey) {
-              conversationStore.set(scopedConversationKey, conversationId);
-            }
-          }
-          const retryAssistantText =
-            retryResult.assistantText ??
-            extractCopilotAssistantText(
-              retryResult.responseJson,
-              parsedRequest.promptText,
-            ) ??
-            "";
-          simulatedPayload = tryExtractSimulatedResponsePayload(
-            retryAssistantText,
-            "chat.completions",
-          );
-          normalizedSimulatedPayload = simulatedPayload
-            ? normalizeSimulatedChatCompletionPayload(
-                simulatedPayload,
-                parsedRequest.model,
-                conversationId,
-                options.includeConversationIdInResponseBody,
-              )
-            : null;
-        }
-
-        if (
-          !normalizedSimulatedPayload ||
-          !hasUsableSimulatedChatCompletionPayload(normalizedSimulatedPayload)
         ) {
           return writeOpenAiError(
             services,
@@ -725,47 +662,10 @@ async function handleChat(
         );
       }
 
-      let assistantResponse = buildAssistantResponse(
+      const assistantResponse = buildAssistantResponse(
         parsedRequest,
         assistantText,
       );
-      if (
-        shouldRetryStrictToolOutput(
-          selectedTransport,
-          parsedRequest,
-          assistantResponse,
-        )
-      ) {
-        const retryResult = await executeChatTurnWithRecovery();
-        if (!retryResult.isSuccess) {
-          return writeFromUpstreamFailure(
-            services,
-            retryResult.statusCode,
-            retryResult.rawBody,
-            selectedTransport === TransportNames.Substrate
-              ? "Substrate chat request failed."
-              : "Microsoft Graph chat request failed.",
-            selectedTransport === TransportNames.Substrate
-              ? "substrate_error"
-              : "graph_error",
-          );
-        }
-        if (retryResult.conversationId) {
-          conversationId = retryResult.conversationId;
-          responseHeaders.set("x-m365-conversation-id", conversationId);
-          if (scopedConversationKey) {
-            conversationStore.set(scopedConversationKey, conversationId);
-          }
-        }
-        const retryAssistantText =
-          retryResult.assistantText ??
-          extractCopilotAssistantText(
-            retryResult.responseJson,
-            parsedRequest.promptText,
-          ) ??
-          "";
-        assistantResponse = buildAssistantResponse(parsedRequest, retryAssistantText);
-      }
       const strictToolError = await tryWriteStrictToolOutputError(
         services,
         assistantResponse,
@@ -855,11 +755,11 @@ async function handleChat(
     ) ??
     "";
   if (parsedRequest.transformMode === OpenAiTransformModes.Simulated) {
-    let simulatedPayload = tryExtractSimulatedResponsePayload(
+    const simulatedPayload = tryExtractSimulatedResponsePayload(
       assistantText,
       "chat.completions",
     );
-    let normalized = simulatedPayload
+    const normalized = simulatedPayload
       ? normalizeSimulatedChatCompletionPayload(
           simulatedPayload,
           parsedRequest.model,
@@ -873,52 +773,6 @@ async function handleChat(
       !hasUsableSimulatedChatCompletionPayload(normalized) ||
       shouldRetrySimulatedInvalidChatToolPayload(normalized) ||
       shouldRetrySimulatedToollessChatPayload(options, parsedRequest, normalized)
-    ) {
-      const retryResult = await executeChatTurnWithRecovery();
-      if (!retryResult.isSuccess) {
-        return writeFromUpstreamFailure(
-          services,
-          retryResult.statusCode,
-          retryResult.rawBody,
-          selectedTransport === TransportNames.Substrate
-            ? "Substrate chat request failed."
-            : "Microsoft Graph chat request failed.",
-          selectedTransport === TransportNames.Substrate
-            ? "substrate_error"
-            : "graph_error",
-        );
-      }
-      if (retryResult.conversationId) {
-        conversationId = retryResult.conversationId;
-        responseHeaders.set("x-m365-conversation-id", conversationId);
-        if (scopedConversationKey) {
-          conversationStore.set(scopedConversationKey, conversationId);
-        }
-      }
-      const retryAssistantText =
-        retryResult.assistantText ??
-        extractCopilotAssistantText(
-          retryResult.responseJson,
-          parsedRequest.promptText,
-        ) ??
-        "";
-      simulatedPayload = tryExtractSimulatedResponsePayload(
-        retryAssistantText,
-        "chat.completions",
-      );
-      normalized = simulatedPayload
-        ? normalizeSimulatedChatCompletionPayload(
-            simulatedPayload,
-            parsedRequest.model,
-            conversationId,
-            options.includeConversationIdInResponseBody,
-          )
-        : null;
-    }
-
-    if (
-      !normalized ||
-      !hasUsableSimulatedChatCompletionPayload(normalized)
     ) {
       traceError(
         services,
@@ -948,47 +802,10 @@ async function handleChat(
     return new Response(body, { status: 200, headers: responseHeaders });
   }
 
-  let assistantResponse = buildAssistantResponse(
+  const assistantResponse = buildAssistantResponse(
     parsedRequest,
     assistantText,
   );
-  if (
-    shouldRetryStrictToolOutput(
-      selectedTransport,
-      parsedRequest,
-      assistantResponse,
-    )
-  ) {
-    const retryResult = await executeChatTurnWithRecovery();
-    if (!retryResult.isSuccess) {
-      return writeFromUpstreamFailure(
-        services,
-        retryResult.statusCode,
-        retryResult.rawBody,
-        selectedTransport === TransportNames.Substrate
-          ? "Substrate chat request failed."
-          : "Microsoft Graph chat request failed.",
-        selectedTransport === TransportNames.Substrate
-          ? "substrate_error"
-          : "graph_error",
-      );
-    }
-    if (retryResult.conversationId) {
-      conversationId = retryResult.conversationId;
-      responseHeaders.set("x-m365-conversation-id", conversationId);
-      if (scopedConversationKey) {
-        conversationStore.set(scopedConversationKey, conversationId);
-      }
-    }
-    const retryAssistantText =
-      retryResult.assistantText ??
-      extractCopilotAssistantText(
-        retryResult.responseJson,
-        parsedRequest.promptText,
-      ) ??
-      "";
-    assistantResponse = buildAssistantResponse(parsedRequest, retryAssistantText);
-  }
   const strictToolError = await tryWriteStrictToolOutputError(
     services,
     assistantResponse,
@@ -1280,27 +1097,7 @@ async function handleResponsesCreate(
     return result;
   };
   const executeChatTurnWithRecovery = async (): Promise<ChatResult> => {
-    let result = await executeChatTurn();
-    if (
-      shouldRetrySubstrateNoAssistantContent(
-        selectedTransport,
-        createdConversation,
-        result,
-      )
-    ) {
-      const createRetryConversation = substrateClient.createConversation();
-      if (createRetryConversation.isSuccess && createRetryConversation.conversationId) {
-        conversationId = createRetryConversation.conversationId;
-        createdConversation = true;
-        responseHeaders.set("x-m365-conversation-id", conversationId);
-        responseHeaders.set("x-m365-conversation-created", "true");
-        if (scopedConversationKey) {
-          conversationStore.set(scopedConversationKey, conversationId);
-        }
-        result = await executeChatTurn();
-      }
-    }
-    return result;
+    return executeChatTurn();
   };
 
   if (baseRequest.stream) {
@@ -1336,11 +1133,11 @@ async function handleResponsesCreate(
         ) ??
         "";
       if (baseRequest.transformMode === OpenAiTransformModes.Simulated) {
-        let simulatedPayload = tryExtractSimulatedResponsePayload(
+        const simulatedPayload = tryExtractSimulatedResponsePayload(
           assistantText,
           "responses",
         );
-        let normalized = simulatedPayload
+        const normalized = simulatedPayload
           ? normalizeSimulatedResponsesPayload(
               simulatedPayload,
               parsedRequest,
@@ -1360,52 +1157,6 @@ async function handleResponsesCreate(
             baseRequest,
             normalized.responseBody,
           )
-        ) {
-          const retryResult = await executeChatTurnWithRecovery();
-          if (!retryResult.isSuccess) {
-            return writeFromUpstreamFailure(
-              services,
-              retryResult.statusCode,
-              retryResult.rawBody,
-              selectedTransport === TransportNames.Substrate
-                ? "Substrate chat request failed."
-                : "Microsoft Graph chat request failed.",
-              selectedTransport === TransportNames.Substrate
-                ? "substrate_error"
-                : "graph_error",
-            );
-          }
-          if (retryResult.conversationId) {
-            conversationId = retryResult.conversationId;
-            responseHeaders.set("x-m365-conversation-id", conversationId);
-            if (scopedConversationKey) {
-              conversationStore.set(scopedConversationKey, conversationId);
-            }
-          }
-          const retryAssistantText =
-            retryResult.assistantText ??
-            extractCopilotAssistantText(
-              retryResult.responseJson,
-              baseRequest.promptText,
-            ) ??
-            "";
-          simulatedPayload = tryExtractSimulatedResponsePayload(
-            retryAssistantText,
-            "responses",
-          );
-          normalized = simulatedPayload
-            ? normalizeSimulatedResponsesPayload(
-                simulatedPayload,
-                parsedRequest,
-                conversationId,
-                options.includeConversationIdInResponseBody,
-              )
-            : null;
-        }
-
-        if (
-          !normalized ||
-          !hasUsableSimulatedResponsesPayload(normalized.responseBody)
         ) {
           return writeOpenAiError(
             services,
@@ -1427,44 +1178,7 @@ async function handleResponsesCreate(
         );
       }
 
-      let assistantResponse = buildAssistantResponse(baseRequest, assistantText);
-      if (
-        shouldRetryStrictToolOutput(
-          selectedTransport,
-          baseRequest,
-          assistantResponse,
-        )
-      ) {
-        const retryResult = await executeChatTurnWithRecovery();
-        if (!retryResult.isSuccess) {
-          return writeFromUpstreamFailure(
-            services,
-            retryResult.statusCode,
-            retryResult.rawBody,
-            selectedTransport === TransportNames.Substrate
-              ? "Substrate chat request failed."
-              : "Microsoft Graph chat request failed.",
-            selectedTransport === TransportNames.Substrate
-              ? "substrate_error"
-              : "graph_error",
-          );
-        }
-        if (retryResult.conversationId) {
-          conversationId = retryResult.conversationId;
-          responseHeaders.set("x-m365-conversation-id", conversationId);
-          if (scopedConversationKey) {
-            conversationStore.set(scopedConversationKey, conversationId);
-          }
-        }
-        const retryAssistantText =
-          retryResult.assistantText ??
-          extractCopilotAssistantText(
-            retryResult.responseJson,
-            baseRequest.promptText,
-          ) ??
-          "";
-        assistantResponse = buildAssistantResponse(baseRequest, retryAssistantText);
-      }
+      const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
       const strictToolError = await tryWriteStrictToolOutputError(
         services,
         assistantResponse,
@@ -1555,11 +1269,11 @@ async function handleResponsesCreate(
     extractCopilotAssistantText(chatResponse.responseJson, baseRequest.promptText) ??
     "";
   if (baseRequest.transformMode === OpenAiTransformModes.Simulated) {
-    let simulatedPayload = tryExtractSimulatedResponsePayload(
+    const simulatedPayload = tryExtractSimulatedResponsePayload(
       assistantText,
       "responses",
     );
-    let normalized = simulatedPayload
+    const normalized = simulatedPayload
       ? normalizeSimulatedResponsesPayload(
           simulatedPayload,
           parsedRequest,
@@ -1577,52 +1291,6 @@ async function handleResponsesCreate(
         baseRequest,
         normalized.responseBody,
       )
-    ) {
-      const retryResult = await executeChatTurnWithRecovery();
-      if (!retryResult.isSuccess) {
-        return writeFromUpstreamFailure(
-          services,
-          retryResult.statusCode,
-          retryResult.rawBody,
-          selectedTransport === TransportNames.Substrate
-            ? "Substrate chat request failed."
-            : "Microsoft Graph chat request failed.",
-          selectedTransport === TransportNames.Substrate
-            ? "substrate_error"
-            : "graph_error",
-        );
-      }
-      if (retryResult.conversationId) {
-        conversationId = retryResult.conversationId;
-        responseHeaders.set("x-m365-conversation-id", conversationId);
-        if (scopedConversationKey) {
-          conversationStore.set(scopedConversationKey, conversationId);
-        }
-      }
-      const retryAssistantText =
-        retryResult.assistantText ??
-        extractCopilotAssistantText(
-          retryResult.responseJson,
-          baseRequest.promptText,
-        ) ??
-        "";
-      simulatedPayload = tryExtractSimulatedResponsePayload(
-        retryAssistantText,
-        "responses",
-      );
-      normalized = simulatedPayload
-        ? normalizeSimulatedResponsesPayload(
-            simulatedPayload,
-            parsedRequest,
-            conversationId,
-            options.includeConversationIdInResponseBody,
-          )
-        : null;
-    }
-
-    if (
-      !normalized ||
-      !hasUsableSimulatedResponsesPayload(normalized.responseBody)
     ) {
       traceError(
         services,
@@ -1665,44 +1333,7 @@ async function handleResponsesCreate(
     return new Response(body, { status: 200, headers: responseHeaders });
   }
 
-  let assistantResponse = buildAssistantResponse(baseRequest, assistantText);
-  if (
-    shouldRetryStrictToolOutput(
-      selectedTransport,
-      baseRequest,
-      assistantResponse,
-    )
-  ) {
-    const retryResult = await executeChatTurnWithRecovery();
-    if (!retryResult.isSuccess) {
-      return writeFromUpstreamFailure(
-        services,
-        retryResult.statusCode,
-        retryResult.rawBody,
-        selectedTransport === TransportNames.Substrate
-          ? "Substrate chat request failed."
-          : "Microsoft Graph chat request failed.",
-        selectedTransport === TransportNames.Substrate
-          ? "substrate_error"
-          : "graph_error",
-      );
-    }
-    if (retryResult.conversationId) {
-      conversationId = retryResult.conversationId;
-      responseHeaders.set("x-m365-conversation-id", conversationId);
-      if (scopedConversationKey) {
-        conversationStore.set(scopedConversationKey, conversationId);
-      }
-    }
-    const retryAssistantText =
-      retryResult.assistantText ??
-      extractCopilotAssistantText(
-        retryResult.responseJson,
-        baseRequest.promptText,
-      ) ??
-      "";
-    assistantResponse = buildAssistantResponse(baseRequest, retryAssistantText);
-  }
+  const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
   const strictToolError = await tryWriteStrictToolOutputError(
     services,
     assistantResponse,
@@ -4026,43 +3657,6 @@ async function tryWriteStrictToolOutputError(
   );
 }
 
-function shouldRetrySubstrateNoAssistantContent(
-  transport: string,
-  createdConversation: boolean,
-  chatResult: ChatResult,
-): boolean {
-  if (transport !== TransportNames.Substrate || !createdConversation) {
-    return false;
-  }
-  if (chatResult.isSuccess || chatResult.statusCode !== 502) {
-    return false;
-  }
-  const message = extractGraphErrorMessage(chatResult.rawBody);
-  if (!message) {
-    return false;
-  }
-  return message
-    .toLowerCase()
-    .includes("substrate chat returned no assistant content");
-}
-
-function shouldRetryStrictToolOutput(
-  transport: string,
-  request: ParsedOpenAiRequest,
-  assistantResponse: OpenAiAssistantResponse,
-): boolean {
-  if (transport !== TransportNames.Substrate) {
-    return false;
-  }
-  if (!assistantResponse.strictToolErrorMessage) {
-    return false;
-  }
-  return (
-    request.tooling.toolChoiceMode === ToolChoiceModes.Required ||
-    request.tooling.toolChoiceMode === ToolChoiceModes.Function
-  );
-}
-
 function clampListLimit(raw: string | null): number {
   if (!raw || !raw.trim()) {
     return 20;
@@ -4704,52 +4298,6 @@ async function streamSubstrateAsSimulatedOpenAi(
         incrementalEmissionCount += 1;
         writeChunk(null, delta, null);
       };
-      const executeBufferedTurnWithRecovery = async (): Promise<ChatResult> => {
-        let result = await services.substrateClient.chat(
-          authorizationHeader,
-          conversationId,
-          parsedRequest,
-          isStartOfSession,
-          async (update) => {
-            traceSubstrateStreamUpdate(services, trace, update);
-          },
-          signal,
-          taskDeadlineMs,
-        );
-        if (
-          shouldRetrySubstrateNoAssistantContent(
-            TransportNames.Substrate,
-            isStartOfSession,
-            result,
-          )
-        ) {
-          retryReasons.push("substrate_no_assistant_content");
-          const createRetryConversation = services.substrateClient.createConversation();
-          if (createRetryConversation.isSuccess && createRetryConversation.conversationId) {
-            conversationId = createRetryConversation.conversationId;
-            isStartOfSession = true;
-            bufferedRetryCount += 1;
-            if (scopedConversationKey) {
-              services.conversationStore.set(scopedConversationKey, conversationId);
-            }
-            result = await services.substrateClient.chat(
-              authorizationHeader,
-              conversationId,
-              parsedRequest,
-              isStartOfSession,
-              async (update) => {
-                traceSubstrateStreamUpdate(services, trace, update);
-              },
-              signal,
-              taskDeadlineMs,
-            );
-          }
-        }
-        if (result.conversationId) {
-          conversationId = result.conversationId;
-        }
-        return result;
-      };
       const appendAssistantText = (
         chatResult: ChatResult,
         replace: boolean = false,
@@ -4814,17 +4362,6 @@ async function streamSubstrateAsSimulatedOpenAi(
         substrateResponse.upstreamResponsePayload ?? null,
         substrateResponse.statusCode,
       );
-
-      if (!substrateResponse.isSuccess) {
-        if (!streamInitialized) {
-          usedBufferedFallbackAfterStreamFailure = true;
-          retryReasons.push("chat_stream_failed_then_buffered_retry");
-          const bufferedRetry = await executeBufferedTurnWithRecovery();
-          if (bufferedRetry.isSuccess) {
-            substrateResponse = bufferedRetry;
-          }
-        }
-      }
 
       if (!substrateResponse.isSuccess) {
         if (streamInitialized) {
@@ -4897,51 +4434,25 @@ async function streamSubstrateAsSimulatedOpenAi(
       }
       appendAssistantText(substrateResponse);
 
-      let finalParsed = tryEmitFromAccumulatedText();
+      const finalParsed = tryEmitFromAccumulatedText();
       const shouldRetryInvalidToolPayload =
-        finalParsed &&
-        shouldRetrySimulatedInvalidChatToolPayload(finalParsed.payload);
+        finalParsed && shouldRetrySimulatedInvalidChatToolPayload(finalParsed.payload);
       const shouldRetryToollessPayload =
-        finalParsed &&
-        shouldRetrySimulatedToollessChatPayload(
-          services.options,
-          parsedRequest,
-          finalParsed.payload,
-        );
-      const shouldRetrySimulatedPayload =
-        Boolean(shouldRetryInvalidToolPayload || shouldRetryToollessPayload);
-      if (shouldRetrySimulatedPayload && !streamInitialized) {
-        if (shouldRetryInvalidToolPayload) {
-          retryReasons.push("invalid_chat_tool_payload");
-        }
-        if (shouldRetryToollessPayload) {
-          retryReasons.push("toolless_chat_payload");
-        }
-        bufferedRetryCount += 1;
-        const bufferedRetry = await executeBufferedTurnWithRecovery();
-        if (!bufferedRetry.isSuccess) {
-          const failure = await writeFromUpstreamFailure(
-            services,
-            bufferedRetry.statusCode,
-            bufferedRetry.rawBody,
-            "Substrate chat request failed.",
-            "substrate_error",
-          );
-          controller.enqueue(
-            encoder.encode(`event: error\ndata: ${await failure.text()}\n\n`),
-          );
-          controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-          await logStreamingDiagnostics("buffered_retry_failed", {
-            statusCode: bufferedRetry.statusCode,
-          });
-          controller.close();
-          return;
-        }
-        appendAssistantText(bufferedRetry, true);
-        finalParsed = tryParseFromAccumulatedText();
+        finalParsed && shouldRetrySimulatedToollessChatPayload(services.options, parsedRequest, finalParsed.payload);
+      if (
+        (!finalParsed ||
+          shouldRetryInvalidToolPayload ||
+          shouldRetryToollessPayload) &&
+        !streamInitialized
+      ) {
+        if (shouldRetryInvalidToolPayload) retryReasons.push("invalid_chat_tool_payload");
+        if (shouldRetryToollessPayload) retryReasons.push("toolless_chat_payload");
       }
-
-      if (!finalParsed) {
+      if (
+        !finalParsed ||
+        shouldRetryInvalidToolPayload ||
+        shouldRetryToollessPayload
+      ) {
         const message =
           "Simulated mode response did not include a usable assistant message or tool call payload.";
         if (streamInitialized) {

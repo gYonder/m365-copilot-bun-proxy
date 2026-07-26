@@ -4,6 +4,7 @@ import type {
   WrapperOptions,
 } from "./types";
 import { cloneJsonValue, nowUnix } from "./utils";
+import { DurableStateStore } from "./durable-state";
 
 type ConversationLinkEntry = {
   conversationId: string;
@@ -31,7 +32,15 @@ export class ResponseStore {
   private readonly requestHashes = new Map<string, RequestHashEntry>();
   private readonly taskDeadlines = new Map<string, TaskDeadlineEntry>();
 
-  constructor(private readonly options: WrapperOptions) {}
+  constructor(
+    private readonly options: WrapperOptions,
+    private readonly durable = new DurableStateStore(),
+  ) {
+    const now = Date.now();
+    for (const [id, entry] of Object.entries(this.durable.state.responses)) {
+      if (entry.expiresAtUtc > now) this.conversationLinks.set(id, entry);
+    }
+  }
 
   set(
     responseId: string,
@@ -65,6 +74,13 @@ export class ResponseStore {
         expiresAtUtc: record.expiresAtUtc,
       });
       trimOldest(this.conversationLinks, MaxStoredResponses);
+      this.durable.state.responses[responseId] = {
+        conversationId: conversationId.trim(),
+        expiresAtUtc: record.expiresAtUtc,
+        contextInputTokens: record.contextInputTokens ?? undefined,
+        contextWindowId: record.contextWindowId,
+      };
+      this.durable.save();
     }
   }
 
@@ -74,8 +90,24 @@ export class ResponseStore {
   } | null {
     this.purgeExpired();
     const entry = this.entries.get(responseId);
-    if (!entry || entry.contextInputTokens === null) return null;
-    return { inputTokens: entry.contextInputTokens, windowId: entry.contextWindowId };
+    if (entry?.contextInputTokens !== null && entry?.contextInputTokens !== undefined) {
+      return {
+        inputTokens: entry.contextInputTokens,
+        windowId: entry.contextWindowId,
+      };
+    }
+    const durableEntry = this.durable.state.responses[responseId];
+    if (
+      !durableEntry ||
+      durableEntry.expiresAtUtc <= Date.now() ||
+      durableEntry.contextInputTokens === undefined
+    ) {
+      return null;
+    }
+    return {
+      inputTokens: durableEntry.contextInputTokens,
+      windowId: durableEntry.contextWindowId ?? null,
+    };
   }
 
   tryGet(responseId: string): JsonObject | null {
@@ -130,7 +162,11 @@ export class ResponseStore {
     this.purgeExpired();
     const deletedEntry = this.entries.delete(responseId);
     const deletedLink = this.conversationLinks.delete(responseId);
-    return deletedEntry || deletedLink;
+    const deletedDurable = delete this.durable.state.responses[responseId];
+    if (deletedDurable) {
+      this.durable.save();
+    }
+    return deletedEntry || deletedLink || deletedDurable;
   }
 
   list(limit: number): {
@@ -160,10 +196,16 @@ export class ResponseStore {
       return;
     }
     this.purgeExpired();
-    this.conversationLinks.set(responseId, {
+    const entry = {
       conversationId: conversationId.trim(),
       expiresAtUtc: this.resolveExpiryMs(),
-    });
+    };
+    this.conversationLinks.set(responseId, entry);
+    this.durable.state.responses[responseId] = {
+      ...this.durable.state.responses[responseId],
+      ...entry,
+    };
+    this.durable.save();
   }
 
   tryGetConversationLink(responseId: string): string | null {

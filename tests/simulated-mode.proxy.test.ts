@@ -179,9 +179,18 @@ describe("simulated transform mode proxy flow", () => {
     expect(codexModels.map((item) => tryGetString(item, "slug"))).toEqual(ids);
     expect(codexModels[0]?.shell_type).toBe("shell_command");
     expect(codexModels[0]?.default_reasoning_level).toBe("high");
+    expect(codexModels[0]?.supported_reasoning_levels?.map((entry) => entry.effort)).toEqual([
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(codexModels[0]?.context_window).toBe(400_000);
     expect(codexModels[0]?.apply_patch_tool_type).toBe("freeform");
     expect(codexModels[0]?.supports_parallel_tool_calls).toBe(true);
-    expect(codexModels[0]?.context_window).toBe(128_000);
+    expect(codexModels[0]?.context_window).toBe(400_000);
   });
 
   test("chat/completions non-stream wraps incoming JSON and returns parsed JSON block", async () => {
@@ -543,7 +552,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(sawDone).toBeTrue();
   });
 
-  test("chat/completions stream in simulated mode retries toolless payload for strict tool requests", async () => {
+  test("chat/completions stream rejects toolless strict-tool payload without resending", async () => {
     const toollessPayload: JsonObject = {
       id: "chatcmpl_simulated_stream_toolless",
       object: "chat.completion",
@@ -646,7 +655,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(response.status).toBe(200);
     expect(response.body).not.toBeNull();
     expect(chatStreamCallCount).toBe(1);
-    expect(chatCallCount).toBe(1);
+    expect(chatCallCount).toBe(0);
 
     let sawToolDelta = false;
     let sawDone = false;
@@ -683,8 +692,8 @@ describe("simulated transform mode proxy flow", () => {
       }
     }
 
-    expect(sawToolDelta).toBeTrue();
-    expect(finishReason).toBe("tool_calls");
+    expect(sawToolDelta).toBeFalse();
+    expect(finishReason).toBeNull();
     expect(sawDone).toBeTrue();
   });
 
@@ -2536,7 +2545,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(String(parsedArguments.diff)).toContain(">>>>>>> REPLACE");
   });
 
-  test("chat/completions retries once when first simulated payload is empty", async () => {
+  test("chat/completions rejects an empty simulated payload without resending", async () => {
     const emptyPayload: JsonObject = {
       id: "chatcmpl-empty",
       object: "chat.completion",
@@ -2603,17 +2612,13 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
+    expect(response.status).toBe(502);
+    expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
-    const choices = body.choices as JsonObject[];
-    const message = choices[0]?.message as JsonObject;
-    const toolCalls = message.tool_calls as JsonObject[];
-    expect(Array.isArray(toolCalls)).toBeTrue();
-    expect(toolCalls.length).toBe(1);
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
-  test("chat/completions retries once when tool-capable request gets plain text stop payload", async () => {
+  test("chat/completions rejects a toolless payload without resending", async () => {
     const plainTextStopPayload: JsonObject = {
       id: "chatcmpl-plain-stop",
       object: "chat.completion",
@@ -2701,17 +2706,13 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
+    expect(response.status).toBe(502);
+    expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
-    const choices = body.choices as JsonObject[];
-    const message = choices[0]?.message as JsonObject;
-    const toolCalls = message.tool_calls as JsonObject[];
-    expect(Array.isArray(toolCalls)).toBeTrue();
-    expect(toolCalls.length).toBe(1);
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
-  test("chat/completions retries once when first tool payload has empty apply_diff SEARCH", async () => {
+  test("chat/completions rejects invalid apply_diff without resending", async () => {
     const invalidApplyDiffPayload: JsonObject = {
       id: "chatcmpl-invalid-applydiff",
       object: "chat.completion",
@@ -2827,17 +2828,13 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
+    expect(response.status).toBe(502);
+    expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
-    const choices = body.choices as JsonObject[];
-    const message = choices[0]?.message as JsonObject;
-    const toolCalls = message.tool_calls as JsonObject[];
-    const functionNode = (toolCalls[0]?.function ?? {}) as JsonObject;
-    expect(tryGetString(functionNode, "name")).toBe("write_to_file");
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
-  test("chat/completions stream accepts toolless auto-tool payload after one retry", async () => {
+  test("chat/completions stream rejects toolless auto-tool payload without resending", async () => {
     const plainTextStopPayload: JsonObject = {
       id: "chatcmpl-plain-stop-stream",
       object: "chat.completion",
@@ -2898,45 +2895,13 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
-    expect(response.body).not.toBeNull();
-
-    let streamedText = "";
-    let sawDone = false;
-    for await (const event of readSseEvents(response.body!)) {
-      const data = event.data.trim();
-      if (!data) {
-        continue;
-      }
-      if (data.toLowerCase() === "[done]") {
-        sawDone = true;
-        break;
-      }
-      const chunk = tryParseJsonObject(data);
-      const choices = chunk?.choices;
-      if (!Array.isArray(choices) || choices.length === 0) {
-        continue;
-      }
-      const first = choices[0];
-      if (!first || typeof first !== "object" || Array.isArray(first)) {
-        continue;
-      }
-      const delta = (first as Record<string, unknown>).delta;
-      if (!delta || typeof delta !== "object" || Array.isArray(delta)) {
-        continue;
-      }
-      const content = (delta as Record<string, unknown>).content;
-      if (typeof content === "string") {
-        streamedText += content;
-      }
-    }
-
-    expect(streamedText).toContain("High-level summary");
-    expect(sawDone).toBeTrue();
+    expect(response.status).toBe(502);
+    expect(callCount).toBe(1);
+    const body = (await response.json()) as JsonObject;
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
-  test("chat/completions accepts second invalid apply_diff payload after retry", async () => {
+  test("chat/completions rejects invalid apply_diff without a hidden retry", async () => {
     const invalidApplyDiffPayload: JsonObject = {
       id: "chatcmpl-invalid-applydiff-persistent",
       object: "chat.completion",
@@ -3009,14 +2974,10 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
+    expect(response.status).toBe(502);
+    expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
-    const choices = body.choices as JsonObject[];
-    const message = choices[0]?.message as JsonObject;
-    const toolCalls = message.tool_calls as JsonObject[];
-    const functionNode = (toolCalls[0]?.function ?? {}) as JsonObject;
-    expect(tryGetString(functionNode, "name")).toBe("apply_diff");
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 });
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { DurableStateStore } from "./durable-state";
 
 type SessionEntry = {
   sessionId: string;
@@ -32,11 +33,16 @@ export class SubstrateSessionStore {
   private readonly entries = new Map<string, SessionEntry>();
   private readonly activeTurns = new Set<string>();
   private readonly turnQueues = new Map<string, TurnWaiter[]>();
-
   constructor(
     private readonly ttlMinutes: number,
     private readonly maxEntries: number = DefaultMaxEntries,
-  ) {}
+    private readonly durable = new DurableStateStore(),
+  ) {
+    const now = Date.now();
+    for (const [key, entry] of Object.entries(this.durable.state.sessions)) {
+      if (entry.expiresAtUtc > now) this.entries.set(key, entry);
+    }
+  }
 
   getOrCreate(
     conversationId: string,
@@ -51,19 +57,25 @@ export class SubstrateSessionStore {
 
     const existing = this.entries.get(normalizedConversationId);
     if (existing) {
-      this.entries.delete(normalizedConversationId);
-      this.entries.set(normalizedConversationId, {
+      const refreshed = {
         sessionId: existing.sessionId,
         expiresAtUtc: this.computeExpiry(nowUtcMs),
-      });
+      };
+      this.entries.delete(normalizedConversationId);
+      this.entries.set(normalizedConversationId, refreshed);
+      this.durable.state.sessions[normalizedConversationId] = refreshed;
+      this.durable.save();
       return existing.sessionId;
     }
 
     const sessionId = createSessionId();
-    this.entries.set(normalizedConversationId, {
+    const entry = {
       sessionId,
       expiresAtUtc: this.computeExpiry(nowUtcMs),
-    });
+    };
+    this.entries.set(normalizedConversationId, entry);
+    this.durable.state.sessions[normalizedConversationId] = entry;
+    this.durable.save();
     this.trimToLimit();
     return sessionId;
   }
@@ -79,10 +91,13 @@ export class SubstrateSessionStore {
     if (!normalizedConversationId || !normalizedSessionId) {
       return;
     }
-    this.entries.set(normalizedConversationId, {
+    const entry = {
       sessionId: normalizedSessionId,
       expiresAtUtc: this.computeExpiry(nowUtcMs),
-    });
+    };
+    this.entries.set(normalizedConversationId, entry);
+    this.durable.state.sessions[normalizedConversationId] = entry;
+    this.durable.save();
     this.trimToLimit();
   }
 
