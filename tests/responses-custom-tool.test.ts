@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import { buildFunctionCallOutputItem } from "../src/proxy/responses-api";
 import { tryParseResponsesRequest } from "../src/proxy/request-parser";
-import { LogLevels, OpenAiTransformModes, TransportNames, type WrapperOptions } from "../src/proxy/types";
+import {
+  LogLevels,
+  OpenAiTransformModes,
+  ToolChoiceModes,
+  TransportNames,
+  type WrapperOptions,
+} from "../src/proxy/types";
 
 describe("Responses custom tool support", () => {
   test("emits a custom_tool_call with byte-preserved freeform input", () => {
@@ -30,6 +36,36 @@ describe("Responses custom tool support", () => {
     expect(parsed.request.inputItemsForStorage).toEqual([
       { type: "custom_tool_call_output", call_id: "call_patch", output: "done" },
     ]);
+  });
+
+  test("does not force another initial tool call after custom output", () => {
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        input: [
+          {
+            type: "custom_tool_call_output",
+            call_id: "call_patch",
+            output: "done",
+          },
+          { role: "user", content: "Give the final answer." },
+        ],
+        tools: [
+          {
+            type: "function",
+            name: "exec",
+            parameters: { type: "object" },
+          },
+        ],
+        tool_choice: "auto",
+      },
+      options(),
+    );
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.base.tooling.toolChoiceMode).toBe(
+      ToolChoiceModes.Auto,
+    );
   });
 });
 

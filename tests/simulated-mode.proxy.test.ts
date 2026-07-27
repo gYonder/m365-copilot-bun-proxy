@@ -1521,6 +1521,148 @@ describe("simulated transform mode proxy flow", () => {
     expect(tryGetString(body.error as JsonObject, "code")).toBe("invalid_request");
   });
 
+  test("responses continuation with function output bypasses stored tool replay", async () => {
+    let upstreamCalls = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        upstreamCalls += 1;
+        const response =
+          upstreamCalls < 3
+            ? {
+                id: `resp_tool_${upstreamCalls}`,
+                object: "response",
+                output: [
+                  {
+                    type: "function_call",
+                    call_id: "call_1",
+                    name: "exec",
+                    arguments: "{}",
+                  },
+                ],
+              }
+            : {
+                id: "resp_final_1",
+                object: "response",
+                output: [
+                  {
+                    type: "message",
+                    role: "assistant",
+                    content: [
+                      {
+                        type: "output_text",
+                        text: "M365_TOOL_LOOP_OK",
+                      },
+                    ],
+                  },
+                ],
+                output_text: "M365_TOOL_LOOP_OK",
+              };
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson(response),
+        );
+      }),
+    );
+    const headers = {
+      "content-type": "application/json",
+      "x-m365-transport": TransportNames.Graph,
+    };
+    const first = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "m365-copilot",
+          input: "Use exec.",
+          tools: [
+            {
+              type: "function",
+              name: "exec",
+              parameters: { type: "object" },
+            },
+          ],
+          tool_choice: "required",
+        }),
+      }),
+    );
+    expect(first.status).toBe(200);
+    const firstBody = (await first.json()) as JsonObject;
+    const firstId = tryGetString(firstBody, "id");
+    expect(firstId).not.toBeNull();
+    const continuationBody = {
+      model: "m365-copilot",
+      previous_response_id: firstId,
+      input: [
+        {
+          type: "function_call",
+          call_id: "call_1",
+          name: "exec",
+          arguments: "{}",
+        },
+        { type: "function_call_output", call_id: "call_1", output: "ok" },
+        {
+          type: "custom_tool_call_output",
+          call_id: "custom_1",
+          output: "ok",
+        },
+        { role: "user", content: "Give final answer." },
+      ],
+      tools: [
+        {
+          type: "function",
+          name: "exec",
+          parameters: { type: "object" },
+        },
+      ],
+      tool_choice: "auto",
+    };
+    const second = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(continuationBody),
+      }),
+    );
+    expect(second.status).toBe(200);
+    const secondBody = (await second.json()) as JsonObject;
+    const secondOutput = Array.isArray(secondBody.output)
+      ? secondBody.output
+      : [];
+    expect(
+      secondOutput.some(
+        (item) =>
+          isJsonObject(item) &&
+          tryGetString(item, "type") === "function_call",
+      ),
+    ).toBeTrue();
+
+    const third = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers,
+        body: JSON.stringify(continuationBody),
+      }),
+    );
+    expect(third.status).toBe(200);
+    expect(third.headers.get("x-m365-request-hash-replayed")).toBeNull();
+    const thirdBody = (await third.json()) as JsonObject;
+    expect(tryGetString(thirdBody, "output_text")).toBe(
+      "M365_TOOL_LOOP_OK",
+    );
+    const output = Array.isArray(thirdBody.output) ? thirdBody.output : [];
+    expect(
+      output.some(
+        (item) =>
+          isJsonObject(item) &&
+          ["function_call", "custom_tool_call"].includes(
+            tryGetString(item, "type") ?? "",
+          ),
+      ),
+    ).toBeFalse();
+    expect(upstreamCalls).toBe(3);
+  });
+
   test("responses request-hash guard replays the stored response for duplicate identical requests", async () => {
     let chatCallCount = 0;
     const app = createProxyApp(

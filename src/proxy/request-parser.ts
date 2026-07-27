@@ -571,7 +571,7 @@ function buildMappedPromptText(
   return lines.join("\n");
 }
 
-function hasPriorToolResult(requestJson: JsonObject): boolean {
+export function hasPriorToolResult(requestJson: JsonObject): boolean {
   const input = requestJson.input;
   if (Array.isArray(input)) {
     for (const item of input) {
@@ -579,7 +579,10 @@ function hasPriorToolResult(requestJson: JsonObject): boolean {
         continue;
       }
       const type = (tryGetString(item, "type") ?? "").toLowerCase();
-      if (type === "function_call_output") {
+      if (
+        type === "function_call_output" ||
+        type === "custom_tool_call_output"
+      ) {
         return true;
       }
     }

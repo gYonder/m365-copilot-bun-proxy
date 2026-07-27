@@ -46,6 +46,7 @@ import {
 } from "./context-accounting";
 import {
   buildCopilotRequestPayload,
+  hasPriorToolResult,
   isSupportedOpenAiTransformMode,
   isSupportedTransport,
   normalizeOpenAiTransformMode,
@@ -951,7 +952,13 @@ async function handleResponsesCreate(
     selectedTransport,
     request,
   );
-  const storedRequestReplay = responseStore.tryGetRequestReplay(requestHash);
+  // A continuation carrying tool output must execute upstream. Replaying the
+  // prior tool-call response would make Codex re-apply the same exec/patch
+  // event indefinitely. Initial/disconnected retries without tool output keep
+  // the idempotent replay path.
+  const storedRequestReplay = hasPriorToolResult(payload.json)
+    ? null
+    : responseStore.tryGetRequestReplay(requestHash);
   if (storedRequestReplay) {
     responseHeaders.set("x-m365-request-hash-replayed", "true");
     return buildStoredReplayResponsesResult(
