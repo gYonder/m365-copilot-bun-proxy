@@ -25,6 +25,20 @@ const SUPPORTED_BROWSERS = new Set([
 const DEFAULT_TOKEN_TIMEOUT_MS = 120_000;
 const DEFAULT_LOGIN_TIMEOUT_MS = 300_000;
 
+// Microsoft identity/SSO cookie domains. These are small and are what lets a
+// saved session silently re-authenticate, so they are always preserved.
+const IDENTITY_COOKIE_DOMAIN_PATTERN =
+  /(^|\.)(login\.microsoftonline\.com|login\.microsoft\.com|login\.live\.com|microsoftonline\.com|microsoftazuread-sso\.com)$/i;
+// m365.cloud.microsoft returns a "Bad Request" error page (HTTP 400) when the
+// request Cookie header is too large. Playwright's persisted storageState can
+// accumulate the chunked OhpAuth*/OhpToken* application cookies across renewals
+// until the jar (~40 KB) crosses that limit and blocks token renewal entirely.
+// When the non-identity (application) cookies exceed this budget we drop them
+// and rely on the identity cookies to mint a fresh, correctly sized session.
+const OVERSIZED_APP_COOKIE_BYTES = 24_000;
+const HEADER_TOO_LARGE_TITLE_PATTERN =
+  /bad request|request too long|header too (large|long)|cookie too large/i;
+
 if (isMainModule(process.argv[1])) {
   await runCli();
 }
@@ -81,13 +95,13 @@ async function fetchTokenWithPlaywrightNode(
     `[playwright] Launching ${browserName} under Node.js (${mode})...`,
   );
   const browser = await launchBrowser(browserName, options.headless);
-  const storageStateExists = await fileExists(storageStatePath);
+  const initialStorageState = await loadSanitizedStorageState(storageStatePath);
   const context = await browser.newContext(
-    storageStateExists ? { storageState: storageStatePath } : {},
+    initialStorageState ? { storageState: initialStorageState } : {},
   );
   await installSubstrateTemporaryChatShim(context);
   console.log(
-    `[playwright] Browser launched (${storageStateExists ? "using saved storage state" : "fresh context"}).`,
+    `[playwright] Browser launched (${initialStorageState ? "using saved storage state" : "fresh context"}).`,
   );
 
   try {
@@ -99,21 +113,30 @@ async function fetchTokenWithPlaywrightNode(
 
     try {
       console.log(`[playwright] Navigating to ${CHAT_URL}`);
-      await page.goto(CHAT_URL, {
+      let response = await page.goto(CHAT_URL, {
         waitUntil: "domcontentloaded",
         timeout: 60_000,
       });
       console.log(`[playwright] Landed on: ${page.url()}`);
 
+      if (await isHeaderTooLargeError(page, response)) {
+        console.log(
+          "[playwright] M365 returned a 'request header too large' error page; the saved session cookies are oversized. Dropping application cookies and re-authenticating with the sign-in cookies.",
+        );
+        await dropOversizedAppCookies(context);
+        response = await page.goto(CHAT_URL, {
+          waitUntil: "domcontentloaded",
+          timeout: 60_000,
+        });
+        console.log(`[playwright] Reloaded after cookie reset: ${page.url()}`);
+      }
+
       if (LOGIN_HOST_PATTERN.test(page.url())) {
-        if (options.headless) {
-          throw new Error(
-            "Microsoft login is required; headless token capture cannot complete interactive sign-in.",
-          );
-        }
-        console.log("[playwright] Login required - sign in in the browser window.");
-        await page.waitForURL(CHAT_URL_GLOB, { timeout: options.loginTimeoutMs });
-        console.log(`[playwright] Login complete: ${page.url()}`);
+        await completeSignIn(page, options);
+      } else if (await isHeaderTooLargeError(page, response)) {
+        throw new Error(
+          "M365 still returns 'Bad Request - request header too large' after clearing application cookies. Run 'codex-m365-yolo --runtime-auth' and sign in when Edge opens to reset the saved session.",
+        );
       } else {
         console.log("[playwright] Already logged in.");
       }
@@ -610,6 +633,117 @@ async function waitForEditorToClear(page, timeoutMs) {
   } catch {
     return false;
   }
+}
+
+async function completeSignIn(page, options) {
+  if (options.headless) {
+    // A saved SSO session can still complete a silent redirect back to the app
+    // without any interaction. Give it a bounded window before giving up so a
+    // headless refresh keeps working whenever the sign-in cookies are valid.
+    console.log("[playwright] On Microsoft sign-in; waiting for silent SSO...");
+    try {
+      await page.waitForURL(CHAT_URL_GLOB, {
+        timeout: Math.min(options.loginTimeoutMs, 25_000),
+      });
+      console.log(`[playwright] Silent SSO complete: ${page.url()}`);
+      return;
+    } catch {
+      throw new Error(
+        "Microsoft login is required; headless token capture cannot complete interactive sign-in.",
+      );
+    }
+  }
+  console.log("[playwright] Login required - sign in in the browser window.");
+  await page.waitForURL(CHAT_URL_GLOB, { timeout: options.loginTimeoutMs });
+  console.log(`[playwright] Login complete: ${page.url()}`);
+}
+
+async function loadSanitizedStorageState(storageStatePath) {
+  if (!(await fileExists(storageStatePath))) {
+    return null;
+  }
+  let state;
+  try {
+    state = JSON.parse(await fs.readFile(storageStatePath, "utf8"));
+  } catch {
+    console.log(
+      "[playwright] Saved browser state was unreadable; starting from a fresh context.",
+    );
+    return null;
+  }
+  if (!state || typeof state !== "object" || !Array.isArray(state.cookies)) {
+    return null;
+  }
+
+  const nowSeconds = Date.now() / 1000;
+  const liveCookies = state.cookies.filter(
+    (cookie) =>
+      !(
+        typeof cookie?.expires === "number" &&
+        cookie.expires > 0 &&
+        cookie.expires < nowSeconds
+      ),
+  );
+
+  const appCookieBytes = sumCookieBytes(
+    liveCookies.filter((cookie) => !isIdentityCookie(cookie)),
+  );
+  if (appCookieBytes > OVERSIZED_APP_COOKIE_BYTES) {
+    const identityCookies = liveCookies.filter(isIdentityCookie);
+    console.log(
+      `[playwright] Saved application cookies are oversized (${appCookieBytes} bytes); keeping ${identityCookies.length} sign-in cookies so silent SSO can issue a fresh, correctly sized session.`,
+    );
+    return { cookies: identityCookies, origins: [] };
+  }
+
+  return { cookies: liveCookies, origins: state.origins ?? [] };
+}
+
+function isIdentityCookie(cookie) {
+  const domain = String(cookie?.domain ?? "").replace(/^\./, "");
+  return IDENTITY_COOKIE_DOMAIN_PATTERN.test(domain);
+}
+
+function sumCookieBytes(cookies) {
+  return cookies.reduce(
+    (total, cookie) =>
+      total +
+      String(cookie?.name ?? "").length +
+      String(cookie?.value ?? "").length,
+    0,
+  );
+}
+
+async function dropOversizedAppCookies(context) {
+  const cookies = await context.cookies();
+  const identityCookies = cookies.filter(isIdentityCookie);
+  await context.clearCookies();
+  if (identityCookies.length > 0) {
+    await context.addCookies(identityCookies);
+  }
+  console.log(
+    `[playwright] Cleared ${cookies.length - identityCookies.length} application cookies; kept ${identityCookies.length} sign-in cookies.`,
+  );
+}
+
+async function isHeaderTooLargeError(page, response) {
+  // Only the m365.cloud.microsoft app origin produces the oversized-cookie
+  // "Bad Request" page. On the login host we are mid sign-in, not in error.
+  if (LOGIN_HOST_PATTERN.test(page.url())) {
+    return false;
+  }
+  const status =
+    response && typeof response.status === "function" ? response.status() : null;
+  if (status === 400 || status === 431 || status === 494) {
+    return true;
+  }
+  let title = "";
+  try {
+    title = (await page.title()) ?? "";
+  } catch {
+    title = "";
+  }
+  return HEADER_TOO_LARGE_TITLE_PATTERN.test(title);
 }
 
 async function persistBrowserState(context, storageStatePath, reason) {
