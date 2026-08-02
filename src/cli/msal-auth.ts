@@ -2,7 +2,11 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import * as msal from "@azure/msal-node";
 import type { BrowserContextOptions } from "playwright";
-import { getBrowserStatePath, getTokenPath } from "./token-helpers";
+import {
+  getBrowserStatePath,
+  getTokenPath,
+  loadToken,
+} from "./token-helpers";
 import type { PlaywrightBrowserName } from "./playwright-token";
 
 // First-party public-client app id that M365 Copilot ("Sydney") web uses. The
@@ -17,6 +21,9 @@ const SCOPES = [
   "https://substrate.office.com/sydney/M365Chat.Read",
   "https://substrate.office.com/sydney/sydney.readwrite",
 ];
+const TOKEN_EXPIRY_SKEW_MS = 60_000;
+const SUBSTRATE_AUDIENCE = "https://substrate.office.com";
+const SYDNEY_AUDIENCE = "https://substrate.office.com/sydney";
 
 export type MsalTokenResult = {
   token: string;
@@ -26,16 +33,50 @@ export type MsalTokenResult = {
 };
 
 export type MsalAcquireOptions = {
+  cachePath?: string;
+  tokenPath?: string;
   browserStatePath?: string;
   browser?: PlaywrightBrowserName;
   allowInteractive?: boolean;
   headless?: boolean;
   quiet?: boolean;
+  appFactory?: () => MsalPublicClient;
+};
+
+type MsalTokenCache = {
+  deserialize(value: string): void;
+  serialize(): string;
+  getAllAccounts(): Promise<msal.AccountInfo[]>;
+};
+
+type MsalPublicClient = Pick<
+  msal.PublicClientApplication,
+  "acquireTokenSilent" | "acquireTokenByCode" | "getAuthCodeUrl"
+> & {
+  getTokenCache(): MsalTokenCache;
 };
 
 async function getMsalCachePath(): Promise<string> {
   const tokenPath = await getTokenPath();
   return path.join(path.dirname(tokenPath), "msal-cache.json");
+}
+
+async function writeOwnerOnlyAtomic(filePath: string, value: string): Promise<void> {
+  const directory = path.dirname(filePath);
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  try {
+    await fs.writeFile(temporaryPath, value, { encoding: "utf8", mode: 0o600 });
+    await fs.chmod(temporaryPath, 0o600);
+    await fs.rename(temporaryPath, filePath);
+    await fs.chmod(filePath, 0o600);
+  } catch (error) {
+    await fs.unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -63,20 +104,39 @@ function decodeJwtClaims(token: string): Record<string, unknown> | null {
   }
 }
 
-function buildResult(accessToken: string, expiresOn: Date | null): MsalTokenResult {
-  const claims = decodeJwtClaims(accessToken) ?? {};
+function buildResult(accessToken: string, expiresOn: Date | null): MsalTokenResult | null {
+  const claims = decodeJwtClaims(accessToken);
+  if (!claims) return null;
   const oid = typeof claims.oid === "string" ? claims.oid : null;
   const tid = typeof claims.tid === "string" ? claims.tid : null;
   const exp = typeof claims.exp === "number" ? claims.exp * 1000 : null;
-  const expiresAtUtc =
-    expiresOn ?? (exp ? new Date(exp) : new Date(Date.now() + 3_600_000));
+  const expiresAtUtc = exp ? new Date(exp) : expiresOn;
+  if (!expiresAtUtc || expiresAtUtc.getTime() <= Date.now() + TOKEN_EXPIRY_SKEW_MS) {
+    return null;
+  }
   return { token: accessToken, expiresAtUtc, oid, tid };
 }
 
-function isSubstrateToken(result: MsalTokenResult): boolean {
+export function isValidSubstrateToken(
+  result: MsalTokenResult,
+  requiredTenantId?: string | null,
+): boolean {
   const claims = decodeJwtClaims(result.token);
-  const aud = claims && typeof claims.aud === "string" ? claims.aud : "";
-  return aud.includes("substrate.office.com");
+  if (!claims) return false;
+  const aud = typeof claims.aud === "string" ? claims.aud.toLowerCase() : "";
+  const tid = typeof claims.tid === "string" ? claims.tid : "";
+  const exp = typeof claims.exp === "number" ? claims.exp * 1000 : 0;
+  const scopeClaim = typeof claims.scp === "string" ? claims.scp : "";
+  const scopes = new Set(scopeClaim.split(/\s+/).filter(Boolean));
+  return (
+    aud === SUBSTRATE_AUDIENCE ||
+    aud === SYDNEY_AUDIENCE ||
+    aud === "substrate.office.com"
+  ) &&
+    exp > Date.now() + TOKEN_EXPIRY_SKEW_MS &&
+    !!tid &&
+    (!requiredTenantId || tid === requiredTenantId) &&
+    SCOPES.every((scope) => scopes.has(scope.split("/").at(-1) ?? scope));
 }
 
 /**
@@ -90,37 +150,41 @@ function isSubstrateToken(result: MsalTokenResult): boolean {
 export async function acquireSubstrateToken(
   options: MsalAcquireOptions = {},
 ): Promise<MsalTokenResult | null> {
-  const cachePath = await getMsalCachePath();
-  const app = new msal.PublicClientApplication({
+  const cachePath = options.cachePath ?? (await getMsalCachePath());
+  const tokenPath = options.tokenPath ?? (await getTokenPath());
+  const priorToken = await loadToken(tokenPath);
+  const app = options.appFactory?.() ?? new msal.PublicClientApplication({
     auth: { clientId: CLIENT_ID, authority: AUTHORITY },
   });
   if (await fileExists(cachePath)) {
     try {
+      await fs.chmod(cachePath, 0o600);
       app.getTokenCache().deserialize(await fs.readFile(cachePath, "utf8"));
     } catch {
       // Corrupt cache; a fresh interactive flow will reseed it.
     }
   }
 
-  const persistCache = async (): Promise<void> => {
+  const persistCache = async (): Promise<boolean> => {
     try {
-      await fs.writeFile(cachePath, app.getTokenCache().serialize(), "utf8");
+      await writeOwnerOnlyAtomic(cachePath, app.getTokenCache().serialize());
+      return true;
     } catch {
-      // Non-fatal: cache persistence is best-effort.
+      return false;
     }
   };
 
-  const silent = await acquireSilently(app, options.quiet);
+  const silent = await acquireSilently(app, priorToken, options.quiet);
   if (silent) {
-    await persistCache();
-    return isSubstrateToken(silent) ? silent : null;
+    if (!(await persistCache())) return null;
+    return isValidSubstrateToken(silent, priorToken?.tid) ? silent : null;
   }
 
   if (options.allowInteractive !== false) {
     const interactive = await acquireInteractively(app, options);
     if (interactive) {
-      await persistCache();
-      return isSubstrateToken(interactive) ? interactive : null;
+      if (!(await persistCache())) return null;
+      return isValidSubstrateToken(interactive) ? interactive : null;
     }
   }
 
@@ -128,7 +192,8 @@ export async function acquireSubstrateToken(
 }
 
 async function acquireSilently(
-  app: msal.PublicClientApplication,
+  app: MsalPublicClient,
+  priorToken: Awaited<ReturnType<typeof loadToken>>,
   quiet?: boolean,
 ): Promise<MsalTokenResult | null> {
   let accounts: msal.AccountInfo[];
@@ -140,10 +205,20 @@ async function acquireSilently(
   if (accounts.length === 0) {
     return null;
   }
+  let account: msal.AccountInfo | null = null;
+  if (priorToken?.tid || priorToken?.oid) {
+    const matching = accounts.filter((candidate) =>
+      (!priorToken.tid || candidate.tenantId === priorToken.tid) &&
+      (!priorToken.oid || candidate.localAccountId === priorToken.oid),
+    );
+    if (matching.length === 1) account = matching[0] ?? null;
+  }
+  if (!account && accounts.length === 1) account = accounts[0] ?? null;
+  if (!account) return null;
   try {
     const result = await app.acquireTokenSilent({
       scopes: SCOPES,
-      account: accounts[0],
+      account,
     });
     return buildResult(result.accessToken, result.expiresOn ?? null);
   } catch (error) {
@@ -159,7 +234,7 @@ async function acquireSilently(
 }
 
 async function acquireInteractively(
-  app: msal.PublicClientApplication,
+  app: MsalPublicClient,
   options: MsalAcquireOptions,
 ): Promise<MsalTokenResult | null> {
   let chromium: typeof import("playwright").chromium;

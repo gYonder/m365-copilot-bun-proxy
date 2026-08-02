@@ -940,21 +940,31 @@ function captureSubstrateToken(page, timeoutMs = DEFAULT_TOKEN_TIMEOUT_MS) {
 }
 
 async function saveToken(filePath, token, expiresAtUtc, metadata = {}) {
-  await fs.mkdir(path.dirname(filePath), { recursive: true });
-  await fs.writeFile(
-    filePath,
-    JSON.stringify(
-      {
-        token,
-        expiresAtUtc: expiresAtUtc.toISOString(),
-        ...(metadata.oid ? { oid: metadata.oid } : {}),
-        ...(metadata.tid ? { tid: metadata.tid } : {}),
-      },
-      null,
-      2,
-    ),
-    "utf8",
+  const directory = path.dirname(filePath);
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`,
   );
+  const content = JSON.stringify(
+    {
+      token,
+      expiresAtUtc: expiresAtUtc.toISOString(),
+      ...(metadata.oid ? { oid: metadata.oid } : {}),
+      ...(metadata.tid ? { tid: metadata.tid } : {}),
+    },
+    null,
+    2,
+  );
+  try {
+    await fs.writeFile(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
+    await fs.chmod(temporaryPath, 0o600);
+    await fs.rename(temporaryPath, filePath);
+    await fs.chmod(filePath, 0o600);
+  } catch (error) {
+    await fs.unlink(temporaryPath).catch(() => {});
+    throw error;
+  }
 }
 
 async function fileExists(filePath) {

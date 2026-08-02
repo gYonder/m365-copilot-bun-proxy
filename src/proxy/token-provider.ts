@@ -1,5 +1,9 @@
 import { fetchTokenWithPlaywright } from "../cli/playwright-token";
-import { acquireSubstrateToken } from "../cli/msal-auth";
+import {
+  acquireSubstrateToken,
+  isValidSubstrateToken,
+  type MsalTokenResult,
+} from "../cli/msal-auth";
 import {
   getBrowserStatePath,
   getTokenPath,
@@ -12,21 +16,42 @@ import { normalizeBearerToken } from "./utils";
 
 const TOKEN_EXPIRY_SKEW_MS = 60_000;
 
+type TokenProviderDependencies = {
+  getTokenPath: typeof getTokenPath;
+  getBrowserStatePath: typeof getBrowserStatePath;
+  loadToken: typeof loadToken;
+  saveToken: typeof saveToken;
+  acquireSubstrateToken: typeof acquireSubstrateToken;
+  fetchTokenWithPlaywright: typeof fetchTokenWithPlaywright;
+};
+
+const defaultDependencies: TokenProviderDependencies = {
+  getTokenPath,
+  getBrowserStatePath,
+  loadToken,
+  saveToken,
+  acquireSubstrateToken,
+  fetchTokenWithPlaywright,
+};
+
 export class ProxyTokenProvider {
   private readonly tokenPathPromise: Promise<string>;
   private readonly browserStatePathPromise: Promise<string>;
   private readonly ignoreIncomingAuthorizationHeader: boolean;
   private readonly playwrightBrowser: PlaywrightBrowser;
   private readonly msalAuthEnabled: boolean;
+  private readonly dependencies: TokenProviderDependencies;
   private inFlightAcquirePromise: Promise<string | null> | null = null;
 
   constructor(options?: {
     ignoreIncomingAuthorizationHeader?: boolean;
     playwrightBrowser?: PlaywrightBrowser;
     msalAuthEnabled?: boolean;
+    dependencies?: Partial<TokenProviderDependencies>;
   }) {
-    this.tokenPathPromise = getTokenPath();
-    this.browserStatePathPromise = getBrowserStatePath();
+    this.dependencies = { ...defaultDependencies, ...options?.dependencies };
+    this.tokenPathPromise = this.dependencies.getTokenPath();
+    this.browserStatePathPromise = this.dependencies.getBrowserStatePath();
     this.ignoreIncomingAuthorizationHeader =
       options?.ignoreIncomingAuthorizationHeader ?? true;
     this.playwrightBrowser =
@@ -54,8 +79,8 @@ export class ProxyTokenProvider {
 
   private async tryGetCachedAuthorizationHeader(): Promise<string | null> {
     const tokenPath = await this.tokenPathPromise;
-    const tokenState = await loadToken(tokenPath);
-    if (!isTokenStateValid(tokenState)) {
+    const tokenState = await this.dependencies.loadToken(tokenPath);
+    if (!isTokenStateValid(tokenState) || !isValidPersistedSubstrateToken(tokenState)) {
       return null;
     }
     return `Bearer ${tokenState.token}`;
@@ -97,7 +122,7 @@ export class ProxyTokenProvider {
 
     // Fallback: legacy Playwright cookie capture.
     try {
-      await fetchTokenWithPlaywright(tokenPath, browserStatePath, {
+      await this.dependencies.fetchTokenWithPlaywright(tokenPath, browserStatePath, {
         quiet: true,
         browser: this.playwrightBrowser,
       });
@@ -105,8 +130,10 @@ export class ProxyTokenProvider {
       return null;
     }
 
-    const fetched = await loadToken(tokenPath);
-    return isTokenStateValid(fetched) ? `Bearer ${fetched.token}` : null;
+    const fetched = await this.dependencies.loadToken(tokenPath);
+    return isTokenStateValid(fetched) && isValidPersistedSubstrateToken(fetched)
+      ? `Bearer ${fetched.token}`
+      : null;
   }
 
   private async tryAcquireViaMsal(
@@ -114,17 +141,18 @@ export class ProxyTokenProvider {
     browserStatePath: string,
   ): Promise<string | null> {
     try {
-      const result = await acquireSubstrateToken({
+      const result = await this.dependencies.acquireSubstrateToken({
+        tokenPath,
         browserStatePath,
         browser: this.playwrightBrowser,
         allowInteractive: true,
         headless: true,
         quiet: true,
       });
-      if (!result?.token?.trim()) {
+      if (!result?.token?.trim() || !isValidSubstrateToken(result)) {
         return null;
       }
-      await saveToken(tokenPath, result.token, result.expiresAtUtc, {
+      await this.dependencies.saveToken(tokenPath, result.token, result.expiresAtUtc, {
         oid: result.oid,
         tid: result.tid,
       });
@@ -133,6 +161,16 @@ export class ProxyTokenProvider {
       return null;
     }
   }
+}
+
+function isValidPersistedSubstrateToken(tokenState: TokenState): boolean {
+  const result: MsalTokenResult = {
+    token: tokenState.token,
+    expiresAtUtc: new Date(tokenState.expiresAtUtc),
+    oid: tokenState.oid ?? null,
+    tid: tokenState.tid ?? null,
+  };
+  return isValidSubstrateToken(result, tokenState.tid);
 }
 
 function isTokenStateValid(tokenState: TokenState | null): tokenState is TokenState {
