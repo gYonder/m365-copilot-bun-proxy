@@ -703,28 +703,133 @@ function tryBuildToolCall(
   const argumentsJson = offeredTool?.type === "custom"
     ? normalizeCustomToolInput(rawArguments)
     : normalizeArgumentsJson(rawArguments);
-  if (
-    offeredTool !== undefined &&
-    offeredTool.type !== "custom" &&
-    !hasRequiredToolArguments(argumentsJson, offeredTool.parameters)
-  ) {
+  const validation = validateOpenAiToolCall(
+    { id: "", name, type: offeredTool?.type ?? "function", argumentsJson },
+    tooling,
+  );
+  if (!validation.valid) {
     return null;
   }
   const id = pickString(callObject.id) ?? `call_${randomUUID().replaceAll("-", "")}`;
   return { id, name, type: offeredTool?.type ?? "function", argumentsJson };
 }
 
-function hasRequiredToolArguments(
-  argumentsJson: string,
-  parameters: JsonObject,
-): boolean {
-  const required = parameters.required;
-  if (!Array.isArray(required) || required.length === 0) return true;
-  const parsed = tryParseJsonNode(argumentsJson);
-  if (!isJsonObject(parsed)) return false;
-  return required.every(
-    (name) => typeof name === "string" && parsed[name] !== undefined,
-  );
+export type OpenAiToolCallValidation =
+  | { valid: true }
+  | {
+      valid: false;
+      reason:
+        | "unoffered_tool"
+        | "tool_choice_mismatch"
+        | "malformed_arguments"
+        | "schema_violation"
+        | "invalid_custom_input";
+    };
+
+export function validateOpenAiToolCall(
+  call: OpenAiAssistantToolCall,
+  tooling: OpenAiTooling,
+): OpenAiToolCallValidation {
+  if (
+    tooling.toolChoiceMode === ToolChoiceModes.Function &&
+    tooling.toolChoiceFunctionName &&
+    call.name !== tooling.toolChoiceFunctionName
+  ) {
+    return { valid: false, reason: "tool_choice_mismatch" };
+  }
+
+  const offeredTool = tooling.tools.find((tool) => tool.name === call.name);
+  if (!offeredTool) {
+    return { valid: false, reason: "unoffered_tool" };
+  }
+
+  if (offeredTool.type === "custom") {
+    return validateCustomToolInput(call.name, call.argumentsJson)
+      ? { valid: true }
+      : { valid: false, reason: "invalid_custom_input" };
+  }
+
+  const parsed = tryParseJsonNode(call.argumentsJson);
+  if (!isJsonObject(parsed)) {
+    return { valid: false, reason: "malformed_arguments" };
+  }
+  return validateJsonSchemaValue(parsed, offeredTool.parameters)
+    ? { valid: true }
+    : { valid: false, reason: "schema_violation" };
+}
+
+function validateJsonSchemaValue(value: JsonValue, schema: JsonObject): boolean {
+  if (Array.isArray(schema.enum) && !schema.enum.some((item) => jsonValuesEqual(item, value))) {
+    return false;
+  }
+
+  const expectedType = typeof schema.type === "string" ? schema.type : null;
+  if (expectedType && !matchesJsonSchemaType(value, expectedType)) {
+    return false;
+  }
+
+  if (isJsonObject(value)) {
+    const required = Array.isArray(schema.required) ? schema.required : [];
+    if (
+      !required.every(
+        (name) => typeof name === "string" && Object.hasOwn(value, name),
+      )
+    ) {
+      return false;
+    }
+
+    const properties = isJsonObject(schema.properties) ? schema.properties : {};
+    for (const [name, childValue] of Object.entries(value)) {
+      const childSchema = properties[name];
+      if (isJsonObject(childSchema)) {
+        if (!validateJsonSchemaValue(childValue, childSchema)) return false;
+      } else if (schema.additionalProperties === false) {
+        return false;
+      } else if (isJsonObject(schema.additionalProperties)) {
+        if (!validateJsonSchemaValue(childValue, schema.additionalProperties)) return false;
+      }
+    }
+  }
+
+  if (Array.isArray(value) && isJsonObject(schema.items)) {
+    return value.every((item) => validateJsonSchemaValue(item, schema.items as JsonObject));
+  }
+  return true;
+}
+
+function matchesJsonSchemaType(value: JsonValue, expectedType: string): boolean {
+  switch (expectedType) {
+    case "object": return isJsonObject(value);
+    case "array": return Array.isArray(value);
+    case "string": return typeof value === "string";
+    case "number": return typeof value === "number" && Number.isFinite(value);
+    case "integer": return typeof value === "number" && Number.isInteger(value);
+    case "boolean": return typeof value === "boolean";
+    case "null": return value === null;
+    default: return true;
+  }
+}
+
+function jsonValuesEqual(left: JsonValue, right: JsonValue): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function validateCustomToolInput(name: string, input: string): boolean {
+  if (!input.trim()) return false;
+  const normalizedName = name.trim().toLowerCase();
+  if (normalizedName === "apply_diff") {
+    const normalized = input.replace(/\r\n/g, "\n");
+    const blocks = [...normalized.matchAll(/<<<<<<< SEARCH\n([\s\S]*?)\n=======\n[\s\S]*?\n>>>>>>> REPLACE/g)];
+    return blocks.length > 0 && blocks.every((match) => Boolean(match[1]?.trim()));
+  }
+  if (normalizedName === "apply_patch") {
+    return (
+      input.includes("*** Begin Patch") &&
+      input.includes("*** End Patch") &&
+      /\*\*\* (?:Add|Update|Delete) File: .+/.test(input)
+    );
+  }
+  return true;
 }
 
 function normalizeCustomToolInput(input: JsonValue | null): string {

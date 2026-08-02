@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { buildAssistantResponse } from "../src/proxy/openai";
+import {
+  buildAssistantResponse,
+  validateOpenAiToolCall,
+} from "../src/proxy/openai";
 import {
   OpenAiTransformModes,
   ToolChoiceModes,
@@ -100,7 +103,14 @@ describe("buildAssistantResponse strict tool behavior", () => {
       parameters: {},
       format: null,
     }];
-    const patch = "*** Begin Patch\n*** End Patch";
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: example.txt",
+      "@@",
+      "-before",
+      "+after",
+      "*** End Patch",
+    ].join("\n");
     const response = buildAssistantResponse(
       request,
       JSON.stringify({
@@ -150,6 +160,130 @@ describe("buildAssistantResponse strict tool behavior", () => {
 
     expect(response.toolCalls).toEqual([]);
     expect(response.strictToolErrorMessage).toContain("tool_calls");
+  });
+
+  test("validates nested objects, arrays, enums, and additional properties", () => {
+    const request = createRequest(ToolChoiceModes.Required, null);
+    request.tooling.tools[0]!.parameters = {
+      type: "object",
+      properties: {
+        mode: { type: "string", enum: ["fast", "safe"] },
+        target: {
+          type: "object",
+          properties: { path: { type: "string" } },
+          required: ["path"],
+          additionalProperties: false,
+        },
+        values: { type: "array", items: { type: "integer" } },
+      },
+      required: ["mode", "target", "values"],
+      additionalProperties: false,
+    };
+
+    expect(validateOpenAiToolCall({
+      id: "call_valid",
+      name: "get_time",
+      type: "function",
+      argumentsJson: JSON.stringify({
+        mode: "safe",
+        target: { path: "a.txt" },
+        values: [1, 2],
+      }),
+    }, request.tooling)).toEqual({ valid: true });
+
+    for (const argumentsJson of [
+      "not-json",
+      JSON.stringify({ mode: "unknown", target: { path: "a.txt" }, values: [1] }),
+      JSON.stringify({ mode: "safe", target: {}, values: [1] }),
+      JSON.stringify({ mode: "safe", target: { path: "a.txt" }, values: ["1"] }),
+      JSON.stringify({ mode: "safe", target: { path: "a.txt", extra: true }, values: [1] }),
+      JSON.stringify({ mode: "safe", target: { path: "a.txt" }, values: [1], extra: true }),
+    ]) {
+      expect(validateOpenAiToolCall({
+        id: "call_invalid",
+        name: "get_time",
+        type: "function",
+        argumentsJson,
+      }, request.tooling).valid).toBe(false);
+    }
+  });
+
+  test("rejects unoffered calls independently of strict choice", () => {
+    const request = createRequest(ToolChoiceModes.Auto, null);
+    expect(validateOpenAiToolCall({
+      id: "call_unknown",
+      name: "not_offered",
+      type: "function",
+      argumentsJson: "{}",
+    }, request.tooling)).toEqual({ valid: false, reason: "unoffered_tool" });
+  });
+
+  test("validates apply_diff and apply_patch custom input", () => {
+    const request = createRequest(ToolChoiceModes.Required, null);
+    request.tooling.tools = [
+      {
+        name: "apply_diff",
+        type: "custom",
+        description: "Apply an exact diff",
+        parameters: {},
+        format: null,
+      },
+      {
+        name: "apply_patch",
+        type: "custom",
+        description: "Apply a patch",
+        parameters: {},
+        format: null,
+      },
+    ];
+
+    const validDiff = [
+      "<<<<<<< SEARCH",
+      "before",
+      "=======",
+      "after",
+      ">>>>>>> REPLACE",
+    ].join("\n");
+    const emptySearch = [
+      "<<<<<<< SEARCH",
+      "",
+      "=======",
+      "after",
+      ">>>>>>> REPLACE",
+    ].join("\n");
+    const validPatch = [
+      "*** Begin Patch",
+      "*** Update File: example.txt",
+      "@@",
+      "-before",
+      "+after",
+      "*** End Patch",
+    ].join("\n");
+
+    expect(validateOpenAiToolCall({
+      id: "call_diff",
+      name: "apply_diff",
+      type: "custom",
+      argumentsJson: validDiff,
+    }, request.tooling)).toEqual({ valid: true });
+    expect(validateOpenAiToolCall({
+      id: "call_empty",
+      name: "apply_diff",
+      type: "custom",
+      argumentsJson: emptySearch,
+    }, request.tooling)).toEqual({ valid: false, reason: "invalid_custom_input" });
+    expect(validateOpenAiToolCall({
+      id: "call_patch",
+      name: "apply_patch",
+      type: "custom",
+      argumentsJson: validPatch,
+    }, request.tooling)).toEqual({ valid: true });
+    expect(validateOpenAiToolCall({
+      id: "call_bad_patch",
+      name: "apply_patch",
+      type: "custom",
+      argumentsJson: "*** Begin Patch\n*** End Patch",
+    }, request.tooling)).toEqual({ valid: false, reason: "invalid_custom_input" });
   });
 });
 

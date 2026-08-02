@@ -21,6 +21,7 @@ import {
   tryBuildAssistantResponseFromChatCompletionPayload,
   tryExtractIncrementalSimulatedChatContent,
   tryExtractSimulatedResponsePayload,
+  validateOpenAiToolCall,
 } from "./openai";
 import { ResponseStore } from "./response-store";
 import {
@@ -64,6 +65,8 @@ import {
   type JsonObject,
   type ChatResult,
   type OpenAiAssistantResponse,
+  type OpenAiAssistantToolCall,
+  type OpenAiTooling,
   type ParsedOpenAiRequest,
   type ParsedResponsesRequest,
   type ResponsesProtocolIdentity,
@@ -580,6 +583,17 @@ async function handleChat(
       result,
       executeChatTurn,
     );
+    if (
+      parsedRequest.transformMode === OpenAiTransformModes.Simulated &&
+      isInvalidSimulatedChatResult(
+        result,
+        parsedRequest,
+        conversationId!,
+        options.includeConversationIdInResponseBody,
+      )
+    ) {
+      result = await executeChatTurn();
+    }
     return result;
   };
 
@@ -649,7 +663,10 @@ async function handleChat(
         if (
           !normalizedSimulatedPayload ||
           !hasUsableSimulatedChatCompletionPayload(normalizedSimulatedPayload) ||
-          shouldRetrySimulatedInvalidChatToolPayload(normalizedSimulatedPayload) ||
+          shouldRetrySimulatedInvalidChatToolPayload(
+            normalizedSimulatedPayload,
+            parsedRequest.tooling,
+          ) ||
           shouldRetrySimulatedToollessChatPayload(
             options,
             parsedRequest,
@@ -784,7 +801,10 @@ async function handleChat(
     if (
       !normalized ||
       !hasUsableSimulatedChatCompletionPayload(normalized) ||
-      shouldRetrySimulatedInvalidChatToolPayload(normalized) ||
+      shouldRetrySimulatedInvalidChatToolPayload(
+        normalized,
+        parsedRequest.tooling,
+      ) ||
       shouldRetrySimulatedToollessChatPayload(options, parsedRequest, normalized)
     ) {
       traceError(
@@ -1197,6 +1217,17 @@ async function handleResponsesCreateOnce(
       result,
       executeChatTurn,
     );
+    if (
+      baseRequest.transformMode === OpenAiTransformModes.Simulated &&
+      isInvalidSimulatedResponsesResult(
+        result,
+        parsedRequest,
+        conversationId!,
+        options.includeConversationIdInResponseBody,
+      )
+    ) {
+      result = await executeChatTurn();
+    }
     return result;
   };
 
@@ -1249,6 +1280,7 @@ async function handleResponsesCreateOnce(
             !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
             shouldRetrySimulatedInvalidResponsesToolPayload(
               normalized.responseBody,
+              baseRequest.tooling,
             ) ||
             shouldRetrySimulatedToollessResponsesPayload(
               options,
@@ -1400,6 +1432,7 @@ async function handleResponsesCreateOnce(
         !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
         shouldRetrySimulatedInvalidResponsesToolPayload(
           normalized.responseBody,
+          baseRequest.tooling,
         ) ||
         shouldRetrySimulatedToollessResponsesPayload(
           options,
@@ -2257,6 +2290,7 @@ function shouldRetrySimulatedToollessChatPayload(
 
 function shouldRetrySimulatedInvalidChatToolPayload(
   payload: JsonObject | null,
+  tooling: OpenAiTooling,
 ): boolean {
   if (!payload) {
     return false;
@@ -2267,11 +2301,42 @@ function shouldRetrySimulatedInvalidChatToolPayload(
     return false;
   }
   for (const toolCall of assistantResponse.toolCalls) {
-    if (isKnownInvalidSimulatedToolCall(toolCall.name, toolCall.argumentsJson)) {
+    if (
+      !validateOpenAiToolCall(toolCall, tooling).valid ||
+      isKnownInvalidSimulatedToolCall(toolCall.name, toolCall.argumentsJson)
+    ) {
       return true;
     }
   }
   return false;
+}
+
+function isInvalidSimulatedChatResult(
+  result: ChatResult,
+  request: ParsedOpenAiRequest,
+  conversationId: string,
+  includeConversationId: boolean,
+): boolean {
+  if (!result.isSuccess) return false;
+  const assistantText =
+    result.assistantText ??
+    extractCopilotAssistantText(result.responseJson, request.promptText) ??
+    "";
+  const extracted = tryExtractSimulatedResponsePayload(
+    assistantText,
+    "chat.completions",
+  );
+  if (!extracted) return false;
+  const normalized = normalizeSimulatedChatCompletionPayload(
+    extracted,
+    request.model,
+    conversationId,
+    includeConversationId,
+  );
+  return shouldRetrySimulatedInvalidChatToolPayload(
+    normalized,
+    request.tooling,
+  );
 }
 
 function normalizeSimulatedChatChoices(payload: JsonObject): JsonObject[] {
@@ -2758,6 +2823,7 @@ function shouldRetrySimulatedToollessResponsesPayload(
 
 function shouldRetrySimulatedInvalidResponsesToolPayload(
   responseBody: JsonObject | null,
+  tooling: OpenAiTooling,
 ): boolean {
   if (!responseBody) {
     return false;
@@ -2772,19 +2838,62 @@ function shouldRetrySimulatedInvalidResponsesToolPayload(
       continue;
     }
     const type = (tryGetString(item, "type") ?? "").toLowerCase();
-    if (type !== "function_call") {
+    if (type !== "function_call" && type !== "custom_tool_call") {
       continue;
     }
     const name = tryGetString(item, "name") ?? "";
-    const argsNode = item.arguments;
+    const argsNode =
+      type === "custom_tool_call"
+        ? item.input ?? item.arguments
+        : item.arguments;
     const argumentsJson =
       typeof argsNode === "string" ? argsNode : JSON.stringify(argsNode ?? {});
-    if (isKnownInvalidSimulatedToolCall(name, argumentsJson)) {
+    const call: OpenAiAssistantToolCall = {
+      id: tryGetString(item, "call_id") ?? tryGetString(item, "id") ?? "",
+      name,
+      type: type === "custom_tool_call" ? "custom" : "function",
+      argumentsJson,
+    };
+    if (
+      !validateOpenAiToolCall(call, tooling).valid ||
+      isKnownInvalidSimulatedToolCall(call.name, call.argumentsJson)
+    ) {
       return true;
     }
   }
 
   return false;
+}
+
+function isInvalidSimulatedResponsesResult(
+  result: ChatResult,
+  request: ParsedResponsesRequest,
+  conversationId: string,
+  includeConversationId: boolean,
+): boolean {
+  if (!result.isSuccess) return false;
+  const assistantText =
+    result.assistantText ??
+    extractCopilotAssistantText(
+      result.responseJson,
+      request.base.promptText,
+    ) ??
+    "";
+  const extracted = tryExtractSimulatedResponsePayload(
+    assistantText,
+    "responses",
+  );
+  if (!extracted) return false;
+  const normalized = normalizeSimulatedResponsesPayload(
+    extracted,
+    request,
+    conversationId,
+    includeConversationId,
+  );
+  return shouldRetrySimulatedInvalidResponsesToolPayload(
+    normalized.responseBody,
+    request.base.tooling,
+  );
 }
 
 function isKnownInvalidSimulatedToolCall(
@@ -4718,7 +4827,11 @@ async function streamSubstrateAsSimulatedOpenAi(
 
       const finalParsed = tryEmitFromAccumulatedText();
       const shouldRetryInvalidToolPayload =
-        finalParsed && shouldRetrySimulatedInvalidChatToolPayload(finalParsed.payload);
+        finalParsed &&
+        shouldRetrySimulatedInvalidChatToolPayload(
+          finalParsed.payload,
+          parsedRequest.tooling,
+        );
       const shouldRetryToollessPayload =
         finalParsed && shouldRetrySimulatedToollessChatPayload(services.options, parsedRequest, finalParsed.payload);
       if (

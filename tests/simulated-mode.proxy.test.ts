@@ -306,6 +306,21 @@ describe("simulated transform mode proxy flow", () => {
           model: "m365-copilot",
           stream: true,
           messages: [{ role: "user", content: "Call get_time for UTC." }],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "get_time",
+                description: "Get the time in a zone.",
+                parameters: {
+                  type: "object",
+                  properties: { zone: { type: "string" } },
+                  required: ["zone"],
+                  additionalProperties: false,
+                },
+              },
+            },
+          ],
         }),
       }),
     );
@@ -1821,7 +1836,7 @@ describe("simulated transform mode proxy flow", () => {
                 status: "completed",
                 call_id: "call_abc123",
                 name: "apply_patch",
-                input: "*** Begin Patch\n*** End Patch",
+                input: "*** Begin Patch\n*** Add File: hello.txt\n+world\n*** End Patch",
               },
             ],
           }),
@@ -1840,7 +1855,7 @@ describe("simulated transform mode proxy flow", () => {
       ],
       tools: [
         {
-          type: "function",
+          type: "custom",
           name: "apply_patch",
           format: { type: "grammar", syntax: "lark", definition: "patch" },
         },
@@ -1879,7 +1894,9 @@ describe("simulated transform mode proxy flow", () => {
     expect(secondOutput[0]?.type).toBe("custom_tool_call");
     expect(tryGetString(secondOutput[0], "name")).toBe("apply_patch");
     expect(tryGetString(secondOutput[0], "call_id")).toBe("call_abc123");
-    expect(tryGetString(secondOutput[0], "input")).toBe("*** Begin Patch\n*** End Patch");
+    expect(tryGetString(secondOutput[0], "input")).toBe(
+      "*** Begin Patch\n*** Add File: hello.txt\n+world\n*** End Patch",
+    );
   });
 
   test("does not replay identical bodies across explicit conversation headers", async () => {
@@ -1955,7 +1972,7 @@ describe("simulated transform mode proxy flow", () => {
                 status: "completed",
                 call_id: "call_stream_patch",
                 name: "apply_patch",
-                input: "*** Begin Patch\n*** End Patch",
+                input: "*** Begin Patch\n*** Update File: probe.txt\n@@\n-hello\n+world\n*** End Patch",
               },
             ],
           }),
@@ -1987,7 +2004,7 @@ describe("simulated transform mode proxy flow", () => {
           ],
           tools: [
             {
-              type: "function",
+              type: "custom",
               name: "apply_patch",
               format: { type: "grammar", syntax: "lark", definition: "patch" },
             },
@@ -2088,8 +2105,10 @@ describe("simulated transform mode proxy flow", () => {
     expect(itemDoneId).toBe(addedItemId);
 
     // Freeform patch bytes are preserved verbatim through delta and done.
-    expect(deltaText).toBe("*** Begin Patch\n*** End Patch");
-    expect(doneInput).toBe("*** Begin Patch\n*** End Patch");
+    const expectedPatch =
+      "*** Begin Patch\n*** Update File: probe.txt\n@@\n-hello\n+world\n*** End Patch";
+    expect(deltaText).toBe(expectedPatch);
+    expect(doneInput).toBe(expectedPatch);
 
     // The completed response carries the correlated custom tool call.
     expect(isJsonObject(completedResponse)).toBeTrue();
@@ -2537,6 +2556,21 @@ describe("simulated transform mode proxy flow", () => {
           model: "m365-copilot",
           stream: false,
           messages: [{ role: "user", content: "Complete the task." }],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "attempt_completion",
+                description: "Complete the task.",
+                parameters: {
+                  type: "object",
+                  properties: { result: { type: "string" } },
+                  required: ["result"],
+                  additionalProperties: false,
+                },
+              },
+            },
+          ],
         }),
       }),
     );
@@ -2604,6 +2638,24 @@ describe("simulated transform mode proxy flow", () => {
           model: "m365-copilot",
           stream: false,
           messages: [{ role: "user", content: "Write the file." }],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "write_to_file",
+                description: "Write file content.",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    path: { type: "string" },
+                    content: { type: "string" },
+                  },
+                  required: ["path", "content"],
+                  additionalProperties: false,
+                },
+              },
+            },
+          ],
         }),
       }),
     );
@@ -2907,6 +2959,24 @@ describe("simulated transform mode proxy flow", () => {
           model: "m365-copilot",
           stream: false,
           messages: [{ role: "user", content: "Add comments." }],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "apply_diff",
+                description: "Apply an exact textual diff.",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    path: { type: "string" },
+                    diff: { type: "string" },
+                  },
+                  required: ["path", "diff"],
+                  additionalProperties: false,
+                },
+              },
+            },
+          ],
         }),
       }),
     );
@@ -3094,7 +3164,7 @@ describe("simulated transform mode proxy flow", () => {
     expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
-  test("chat/completions rejects invalid apply_diff without resending", async () => {
+  test("chat/completions corrects invalid apply_diff once before delivery", async () => {
     const invalidApplyDiffPayload: JsonObject = {
       id: "chatcmpl-invalid-applydiff",
       object: "chat.completion",
@@ -3210,10 +3280,14 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(502);
-    expect(callCount).toBe(1);
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(2);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
+    const choices = body.choices as JsonObject[];
+    const message = choices[0]?.message as JsonObject;
+    const calls = message.tool_calls as JsonObject[];
+    expect(calls).toHaveLength(1);
+    expect(((calls[0]?.function as JsonObject).name)).toBe("write_to_file");
   });
 
   test("chat/completions stream rejects toolless auto-tool payload without resending", async () => {
@@ -3283,7 +3357,7 @@ describe("simulated transform mode proxy flow", () => {
     expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
-  test("chat/completions rejects invalid apply_diff without a hidden retry", async () => {
+  test("chat/completions exhausts one invalid apply_diff correction", async () => {
     const invalidApplyDiffPayload: JsonObject = {
       id: "chatcmpl-invalid-applydiff-persistent",
       object: "chat.completion",
@@ -3357,7 +3431,7 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(response.status).toBe(502);
-    expect(callCount).toBe(1);
+    expect(callCount).toBe(2);
     const body = (await response.json()) as JsonObject;
     expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
