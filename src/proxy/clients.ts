@@ -794,6 +794,8 @@ export function buildSubstrateHubUri(
   );
 
   const query = new URLSearchParams({
+    chatsessionid: randomUUID().replaceAll("-", ""),
+    XRoutingParameterSessionKey: randomUUID().replaceAll("-", ""),
     ClientRequestId: clientRequestId,
     "X-SessionId": sessionId,
     ConversationId: conversationId,
@@ -817,6 +819,9 @@ export function buildSubstrateHubUri(
   }
   if (options.substrate.licenseType?.trim()) {
     query.set("licenseType", options.substrate.licenseType);
+  }
+  if (typeof options.substrate.isEdu === "boolean") {
+    query.set("isEdu", options.substrate.isEdu ? "true" : "false");
   }
   if (options.substrate.agent?.trim()) {
     query.set("agent", options.substrate.agent);

@@ -190,6 +190,7 @@ export type SubstrateOptions = {
   product: string | null;
   agentHost: string | null;
   licenseType: string | null;
+  isEdu?: boolean;
   agent: string | null;
   variants: string | null;
   clientPlatform: string;
