@@ -618,14 +618,17 @@ function extractToolCallsFromResponsesNode(
       continue;
     }
     const type = (pickString(item.type) ?? "").toLowerCase();
-    if (type !== "function_call") {
+    if (type !== "function_call" && type !== "custom_tool_call") {
       continue;
     }
     const toolCall = tryBuildToolCall(
       {
         id: pickString(item.call_id, item.tool_call_id, item.id) ?? null,
         name: pickString(item.name) ?? null,
-        arguments: item.arguments ?? null,
+        arguments:
+          type === "custom_tool_call"
+            ? item.input ?? item.arguments ?? null
+            : item.arguments ?? null,
       },
       tooling,
     );

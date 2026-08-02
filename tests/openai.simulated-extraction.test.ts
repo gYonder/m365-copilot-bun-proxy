@@ -5,6 +5,102 @@ import {
 } from "../src/proxy/openai";
 
 describe("tryExtractSimulatedResponsePayload", () => {
+  test("extracts a markdown-wrapped Responses function call instead of exposing JSON as assistant text", () => {
+    const responsePayload = {
+      id: "resp_tool_regression",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-sol",
+      output: [
+        {
+          type: "function_call",
+          id: "fc_regression",
+          call_id: "call_regression",
+          name: "exec",
+          arguments: JSON.stringify({
+            cmd: "git status --short",
+            workdir: "/workspace",
+          }),
+        },
+      ],
+    };
+    const assistantText = [
+      "```json",
+      JSON.stringify(responsePayload, null, 2),
+      "```",
+    ].join("\n");
+
+    const extracted = tryExtractSimulatedResponsePayload(
+      assistantText,
+      "responses",
+    );
+
+    expect(extracted).not.toBeNull();
+    expect(extracted?.object).toBe("response");
+    const output = Array.isArray(extracted?.output) ? extracted.output : [];
+    expect(output).toHaveLength(1);
+    expect(output[0]).toMatchObject({
+      type: "function_call",
+      call_id: "call_regression",
+      name: "exec",
+    });
+  });
+
+  test("extracts a markdown-wrapped Responses custom tool call without converting it to prose", () => {
+    const responsePayload = {
+      id: "resp_custom_tool_regression",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-sol",
+      output: [
+        {
+          type: "custom_tool_call",
+          id: "ctc_regression",
+          call_id: "call_patch_regression",
+          name: "apply_patch",
+          input: "*** Begin Patch\n*** End Patch",
+        },
+      ],
+    };
+    const assistantText = [
+      "```json",
+      JSON.stringify(responsePayload, null, 2),
+      "```",
+    ].join("\n");
+
+    const extracted = tryExtractSimulatedResponsePayload(
+      assistantText,
+      "responses",
+    );
+
+    expect(extracted).not.toBeNull();
+    const output = Array.isArray(extracted?.output) ? extracted.output : [];
+    expect(output).toHaveLength(1);
+    expect(output[0]).toMatchObject({
+      type: "custom_tool_call",
+      call_id: "call_patch_regression",
+      name: "apply_patch",
+      input: "*** Begin Patch\n*** End Patch",
+    });
+  });
+
+  test("does not accept a truncated markdown Responses tool call as a completed payload", () => {
+    const truncated = [
+      "```json",
+      "{",
+      "  \"object\": \"response\",",
+      "  \"status\": \"completed\",",
+      "  \"output\": [{",
+      "    \"type\": \"function_call\",",
+      "    \"name\": \"exec\",",
+      "    \"arguments\": \"{\\\"cmd\\\":\\\"git status",
+    ].join("\n");
+
+    expect(
+      tryExtractSimulatedResponsePayload(truncated, "responses"),
+    ).toBeNull();
+  });
+
   test("prefers chat completion response JSON over echoed request JSON", () => {
     const echoedRequest = {
       model: "gpt-5.1-2025-11-13",
