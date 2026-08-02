@@ -39,6 +39,7 @@ const vizTraceStore = new ProxyVizTraceStore(options.conversationTtlMinutes * 60
 const tokenProvider = new ProxyTokenProvider({
   ignoreIncomingAuthorizationHeader: options.ignoreIncomingAuthorizationHeader,
   playwrightBrowser: options.playwrightBrowser,
+  msalAuthEnabled: options.msalAuth,
 });
 
 const app = createProxyApp({

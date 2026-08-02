@@ -1,8 +1,10 @@
 import { fetchTokenWithPlaywright } from "../cli/playwright-token";
+import { acquireSubstrateToken } from "../cli/msal-auth";
 import {
   getBrowserStatePath,
   getTokenPath,
   loadToken,
+  saveToken,
   type TokenState,
 } from "../cli/token-helpers";
 import { PlaywrightBrowsers, type PlaywrightBrowser } from "./types";
@@ -15,11 +17,13 @@ export class ProxyTokenProvider {
   private readonly browserStatePathPromise: Promise<string>;
   private readonly ignoreIncomingAuthorizationHeader: boolean;
   private readonly playwrightBrowser: PlaywrightBrowser;
+  private readonly msalAuthEnabled: boolean;
   private inFlightAcquirePromise: Promise<string | null> | null = null;
 
   constructor(options?: {
     ignoreIncomingAuthorizationHeader?: boolean;
     playwrightBrowser?: PlaywrightBrowser;
+    msalAuthEnabled?: boolean;
   }) {
     this.tokenPathPromise = getTokenPath();
     this.browserStatePathPromise = getBrowserStatePath();
@@ -27,6 +31,7 @@ export class ProxyTokenProvider {
       options?.ignoreIncomingAuthorizationHeader ?? true;
     this.playwrightBrowser =
       options?.playwrightBrowser ?? PlaywrightBrowsers.Edge;
+    this.msalAuthEnabled = options?.msalAuthEnabled ?? true;
   }
 
   async resolveAuthorizationHeader(
@@ -76,6 +81,21 @@ export class ProxyTokenProvider {
       this.tokenPathPromise,
       this.browserStatePathPromise,
     ]);
+
+    // Primary path: MSAL OAuth2 auth-code + PKCE. A silent refresh-token
+    // exchange renews the substrate token without any browser or cookie replay,
+    // which is what previously overflowed request headers on renewal.
+    if (this.msalAuthEnabled) {
+      const msalHeader = await this.tryAcquireViaMsal(
+        tokenPath,
+        browserStatePath,
+      );
+      if (msalHeader) {
+        return msalHeader;
+      }
+    }
+
+    // Fallback: legacy Playwright cookie capture.
     try {
       await fetchTokenWithPlaywright(tokenPath, browserStatePath, {
         quiet: true,
@@ -87,6 +107,31 @@ export class ProxyTokenProvider {
 
     const fetched = await loadToken(tokenPath);
     return isTokenStateValid(fetched) ? `Bearer ${fetched.token}` : null;
+  }
+
+  private async tryAcquireViaMsal(
+    tokenPath: string,
+    browserStatePath: string,
+  ): Promise<string | null> {
+    try {
+      const result = await acquireSubstrateToken({
+        browserStatePath,
+        browser: this.playwrightBrowser,
+        allowInteractive: true,
+        headless: true,
+        quiet: true,
+      });
+      if (!result?.token?.trim()) {
+        return null;
+      }
+      await saveToken(tokenPath, result.token, result.expiresAtUtc, {
+        oid: result.oid,
+        tid: result.tid,
+      });
+      return `Bearer ${result.token}`;
+    } catch {
+      return null;
+    }
   }
 }
 
