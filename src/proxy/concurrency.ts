@@ -31,6 +31,14 @@ export class ConcurrencyLimiter {
     return this.limit > 0;
   }
 
+  get queueDepth(): number {
+    return this.waiters.length;
+  }
+
+  get activeCount(): number {
+    return this.limit > 0 ? this.limit - this.available : 0;
+  }
+
   /**
    * Acquires a slot, returning a release function. When disabled the release is
    * a no-op. Throws {@link TurnQueueWaitError} on cancellation, task deadline,

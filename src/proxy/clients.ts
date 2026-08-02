@@ -1035,15 +1035,26 @@ export function truncateSubstrateSendText(
   const removed = text.length - maxChars;
   const marker = `\n\n…[${removed} characters truncated to fit Substrate limits]…\n\n`;
   if (marker.length >= maxChars) {
-    return text.slice(text.length - maxChars);
+    throw new Error(
+      "Substrate prompt limit is too small to preserve required context safely.",
+    );
+  }
+  const userBoundary = text.lastIndexOf("\n\nUser: " );
+  const requiredTail = userBoundary >= 0 ? text.slice(userBoundary) : text;
+  if (requiredTail.length + marker.length >= maxChars) {
+    throw new Error(
+      "Substrate prompt cannot be reduced without truncating the current user turn.",
+    );
   }
   const budget = maxChars - marker.length;
-  const headChars = Math.floor(budget * 0.35);
-  const tailChars = budget - headChars;
+  const tailChars = Math.max(requiredTail.length, Math.ceil(budget * 0.65));
+  const headChars = budget - tailChars;
   return (
     text.slice(0, headChars) + marker + text.slice(text.length - tailChars)
   );
-}function buildLocationInfo(locationHint: JsonObject): JsonObject | null {
+}
+
+function buildLocationInfo(locationHint: JsonObject): JsonObject | null {
   const timeZone = tryGetString(locationHint, "timeZone");
   if (!timeZone) {
     return null;

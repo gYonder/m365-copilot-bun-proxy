@@ -495,6 +495,8 @@ describe("Substrate client lifecycle hardening", () => {
   });
 
   test("reports a handshake deadline as 504 instead of socket closure", async () => {
+    const options = createOptions();
+    options.substrate.handshakeTimeoutSeconds = 0.001;
     const ws = {
       readyState: 1,
       send: () => {},
@@ -503,7 +505,7 @@ describe("Substrate client lifecycle hardening", () => {
       },
     };
     const client = new CopilotSubstrateClient(
-      createOptions(),
+      options,
       stubLogger,
       undefined,
       async () => ws as unknown as FakeWebSocket,
@@ -523,7 +525,7 @@ describe("Substrate client lifecycle hardening", () => {
       true,
       undefined,
       null,
-      Date.now() + 1,
+      Date.now() + 1_000,
     );
 
     expect(result.statusCode).toBe(504);

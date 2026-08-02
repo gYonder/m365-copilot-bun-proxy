@@ -32,6 +32,37 @@ describe("ConcurrencyLimiter", () => {
     releaseSecond();
   });
 
+  test("reports queue depth and hands slots to waiters in FIFO order", async () => {
+    const limiter = new ConcurrencyLimiter(1);
+    const releaseFirst = await limiter.acquire();
+    const order: string[] = [];
+
+    const second = limiter.acquire().then((release) => {
+      order.push("second");
+      return release;
+    });
+    const third = limiter.acquire().then((release) => {
+      order.push("third");
+      return release;
+    });
+
+    expect(limiter.activeCount).toBe(1);
+    expect(limiter.queueDepth).toBe(2);
+
+    releaseFirst();
+    const releaseSecond = await second;
+    expect(order).toEqual(["second"]);
+    expect(limiter.queueDepth).toBe(1);
+
+    releaseSecond();
+    const releaseThird = await third;
+    expect(order).toEqual(["second", "third"]);
+    expect(limiter.queueDepth).toBe(0);
+
+    releaseThird();
+    expect(limiter.activeCount).toBe(0);
+  });
+
   test("rejects a queued waiter when its signal aborts", async () => {
     const limiter = new ConcurrencyLimiter(1);
     const release = await limiter.acquire();
@@ -63,6 +94,7 @@ describe("ConcurrencyLimiter", () => {
     }
     expect(caught).toBeInstanceOf(TurnQueueWaitError);
     expect((caught as TurnQueueWaitError).reason).toBe("overloaded");
+    expect(limiter.queueDepth).toBe(0);
     release();
   });
 });

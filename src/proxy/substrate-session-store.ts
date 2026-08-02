@@ -44,6 +44,18 @@ export class SubstrateSessionStore {
     }
   }
 
+  get activeTurnCount(): number {
+    return this.activeTurns.size;
+  }
+
+  get queuedTurnCount(): number {
+    let count = 0;
+    for (const queue of this.turnQueues.values()) {
+      count += queue.length;
+    }
+    return count;
+  }
+
   getOrCreate(
     conversationId: string,
     createSessionId: () => string = () => randomUUID(),

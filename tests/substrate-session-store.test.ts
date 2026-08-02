@@ -62,6 +62,8 @@ describe("SubstrateSessionStore", () => {
 
     await Bun.sleep(0);
     expect(events).toEqual(["first:start"]);
+    expect(store.activeTurnCount).toBe(1);
+    expect(store.queuedTurnCount).toBe(1);
     releaseFirst();
     await Promise.all([first, second]);
     expect(events).toEqual([
@@ -70,6 +72,48 @@ describe("SubstrateSessionStore", () => {
       "second:start",
       "second:end",
     ]);
+    expect(store.activeTurnCount).toBe(0);
+    expect(store.queuedTurnCount).toBe(0);
+  });
+
+  test("preserves FIFO handoff for multiple same-conversation waiters", async () => {
+    const store = new SubstrateSessionStore(180);
+    const events: string[] = [];
+    let releaseFirst!: () => void;
+    let releaseSecond!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+
+    const first = store.runExclusive("conversation-fifo", async () => {
+      events.push("first");
+      await firstGate;
+    });
+    const second = store.runExclusive("conversation-fifo", async () => {
+      events.push("second");
+      await secondGate;
+    });
+    const third = store.runExclusive("conversation-fifo", async () => {
+      events.push("third");
+    });
+
+    await Bun.sleep(0);
+    expect(events).toEqual(["first"]);
+    expect(store.queuedTurnCount).toBe(2);
+
+    releaseFirst();
+    await Bun.sleep(0);
+    expect(events).toEqual(["first", "second"]);
+    expect(store.queuedTurnCount).toBe(1);
+
+    releaseSecond();
+    await Promise.all([first, second, third]);
+    expect(events).toEqual(["first", "second", "third"]);
+    expect(store.activeTurnCount).toBe(0);
+    expect(store.queuedTurnCount).toBe(0);
   });
 
   test("bounds inactive session entries", () => {

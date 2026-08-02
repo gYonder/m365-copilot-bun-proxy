@@ -26,9 +26,21 @@ describe("truncateSubstrateSendText", () => {
     expect(result.startsWith("Context:")).toBeTrue();
   });
 
-  test("keeps the tail when the marker cannot fit in a tiny budget", () => {
+  test("fails explicitly when safe structural reduction is impossible", () => {
     const text = "abcdefghijklmnopqrstuvwxyz";
-    const result = truncateSubstrateSendText(text, 5, true);
-    expect(result).toBe("vwxyz");
+    expect(() => truncateSubstrateSendText(text, 5, true)).toThrow(
+      "too small to preserve required context safely",
+    );
+  });
+
+  test("never truncates the current user turn", () => {
+    const text =
+      "System: keep this instruction.\n\nContext:\n" +
+      "x".repeat(2_000) +
+      "\n\nUser: " +
+      "important".repeat(100);
+    expect(() => truncateSubstrateSendText(text, 500, true)).toThrow(
+      "without truncating the current user turn",
+    );
   });
 });
