@@ -31,6 +31,7 @@ import {
   SubstrateSessionStore,
   TurnQueueWaitError,
 } from "./substrate-session-store";
+import { ConcurrencyLimiter } from "./concurrency";
 
 export class CopilotGraphClient {
   constructor(
@@ -189,6 +190,10 @@ export class CopilotSubstrateClient {
     ),
     private readonly connect: SubstrateWebSocketConnector = connectWebSocket,
     private readonly createReceiver: SubstrateReceiverFactory = createWebSocketReceiver,
+    private readonly concurrencyLimiter: ConcurrencyLimiter = new ConcurrencyLimiter(
+      options.substrate.concurrencyLimit ?? 0,
+      options.substrate.acquireTimeoutMs ?? 0,
+    ),
   ) {}
 
   createConversation(): CreateConversationResult {
@@ -253,17 +258,26 @@ export class CopilotSubstrateClient {
     try {
       return await this.sessionStore.runExclusive(
         sessionId,
-        () =>
-          this.chatCoreUnlocked(
-            authorizationHeader,
-            conversationId,
-            sessionId,
-            request,
-            isStartOfSession,
-            onStreamUpdate,
+        async () => {
+          const releaseSlot = await this.concurrencyLimiter.acquire(
             signal,
             taskDeadlineMs,
-          ),
+          );
+          try {
+            return await this.chatCoreUnlocked(
+              authorizationHeader,
+              conversationId,
+              sessionId,
+              request,
+              isStartOfSession,
+              onStreamUpdate,
+              signal,
+              taskDeadlineMs,
+            );
+          } finally {
+            releaseSlot();
+          }
+        },
         signal,
         taskDeadlineMs,
       );
@@ -847,7 +861,11 @@ export function buildInvocationPayload(
 ): JsonObject {
   const message: JsonObject = {
     author: "user",
-    text: buildPromptWithAdditionalContext(request),
+    text: truncateSubstrateSendText(
+      buildPromptWithAdditionalContext(request),
+      options.substrate.maxSendChars ?? 0,
+      options.substrate.truncateBeforeSending ?? false,
+    ),
     inputMethod: "Keyboard",
     messageType: "Chat",
     requestId: clientRequestId,
@@ -977,7 +995,30 @@ function buildPromptWithAdditionalContext(
   return lines.join("\n");
 }
 
-function buildLocationInfo(locationHint: JsonObject): JsonObject | null {
+// Substrate silently drops or disconnects on oversized invocation payloads.
+// When the combined prompt exceeds the configured ceiling we truncate the
+// middle (context/history) and keep both ends, because the trailing text holds
+// the user's actual prompt (`User: ...`) which must never be cut.
+export function truncateSubstrateSendText(
+  text: string,
+  maxChars: number,
+  enabled: boolean,
+): string {
+  if (!enabled || maxChars <= 0 || text.length <= maxChars) {
+    return text;
+  }
+  const removed = text.length - maxChars;
+  const marker = `\n\n…[${removed} characters truncated to fit Substrate limits]…\n\n`;
+  if (marker.length >= maxChars) {
+    return text.slice(text.length - maxChars);
+  }
+  const budget = maxChars - marker.length;
+  const headChars = Math.floor(budget * 0.35);
+  const tailChars = budget - headChars;
+  return (
+    text.slice(0, headChars) + marker + text.slice(text.length - tailChars)
+  );
+}function buildLocationInfo(locationHint: JsonObject): JsonObject | null {
   const timeZone = tryGetString(locationHint, "timeZone");
   if (!timeZone) {
     return null;

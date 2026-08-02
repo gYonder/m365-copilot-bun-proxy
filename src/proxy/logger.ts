@@ -339,23 +339,18 @@ export class DebugMarkdownLogger {
     suffix: string,
     statusCode: number | null = null,
   ): Promise<void> {
-    if (
-      !this.isEnabled ||
-      !this.options.debugPath ||
-      !this.options.debugPath.trim() ||
-      !this.shouldLogByLevel(suffix, statusCode)
-    ) {
+    if (!this.shouldLogByLevel(suffix, statusCode)) {
       return;
     }
 
-    await fs.mkdir(this.options.debugPath, { recursive: true });
-
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const sequence = String(++this.sequence).padStart(4, "0");
-    const filePath = path.resolve(
-      this.options.debugPath,
-      `${timestamp}-${sequence}-${suffix}.md`,
-    );
+    const fileEnabled =
+      this.isEnabled &&
+      Boolean(this.options.debugPath) &&
+      Boolean(this.options.debugPath?.trim());
+    const stdoutEnabled = this.options.logStdout === true;
+    if (!fileEnabled && !stdoutEnabled) {
+      return;
+    }
 
     const lines: string[] = [];
     lines.push(`# ${title}`, "");
@@ -369,7 +364,23 @@ export class DebugMarkdownLogger {
     if (body && body.trim()) {
       lines.push("", "```json", tryPrettyJson(body), "```");
     }
-    await fs.writeFile(filePath, lines.join("\n"), "utf8");
+    const content = lines.join("\n");
+
+    if (stdoutEnabled) {
+      process.stdout.write(`\n${content}\n`);
+    }
+
+    if (fileEnabled) {
+      const debugPath = this.options.debugPath as string;
+      await fs.mkdir(debugPath, { recursive: true });
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const sequence = String(++this.sequence).padStart(4, "0");
+      const filePath = path.resolve(
+        debugPath,
+        `${timestamp}-${sequence}-${suffix}.md`,
+      );
+      await fs.writeFile(filePath, content, "utf8");
+    }
   }
 
   private shouldLogByLevel(suffix: string, statusCode: number | null): boolean {

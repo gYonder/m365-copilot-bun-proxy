@@ -529,13 +529,16 @@ async function handleChat(
     requiresBufferedAssistantResponse(parsedRequest);
   const taskDeadlineMs = resolveTaskDeadlineMs(options);
 
-  const executeChatTurn = async (): Promise<ChatResult> => {
+  const executeChatTurn = async (
+    turnConversationId: string = conversationId!,
+    turnIsStartOfSession: boolean = createdConversation,
+  ): Promise<ChatResult> => {
     if (selectedTransport === TransportNames.Substrate) {
       const result = await substrateClient.chat(
         authorizationHeader,
-        conversationId!,
+        turnConversationId,
         parsedRequest,
-        createdConversation,
+        turnIsStartOfSession,
         async (update) => {
           traceSubstrateStreamUpdate(services, trace, update);
         },
@@ -568,7 +571,15 @@ async function handleChat(
     // A 502 after the upstream send is ambiguous: retrying can duplicate the
     // user turn. Only the substrate client may retry failures proven to occur
     // before send; preserve the first result here.
-    return executeChatTurn();
+    let result = await executeChatTurn();
+    result = await retryConfabGiveUp(
+      services,
+      selectedTransport,
+      parsedRequest,
+      result,
+      executeChatTurn,
+    );
+    return result;
   };
 
   if (parsedRequest.stream) {
@@ -1068,13 +1079,16 @@ async function handleResponsesCreate(
   }
   const shouldBufferAssistant = requiresBufferedAssistantResponse(baseRequest);
 
-  const executeChatTurn = async (): Promise<ChatResult> => {
+  const executeChatTurn = async (
+    turnConversationId: string = conversationId!,
+    turnIsStartOfSession: boolean = createdConversation,
+  ): Promise<ChatResult> => {
     if (selectedTransport === TransportNames.Substrate) {
       const result = await substrateClient.chat(
         authorizationHeader,
-        conversationId!,
+        turnConversationId,
         baseRequest,
-        createdConversation,
+        turnIsStartOfSession,
         async (update) => {
           traceSubstrateStreamUpdate(services, trace, update);
         },
@@ -1104,7 +1118,15 @@ async function handleResponsesCreate(
     return result;
   };
   const executeChatTurnWithRecovery = async (): Promise<ChatResult> => {
-    return executeChatTurn();
+    let result = await executeChatTurn();
+    result = await retryConfabGiveUp(
+      services,
+      selectedTransport,
+      baseRequest,
+      result,
+      executeChatTurn,
+    );
+    return result;
   };
 
   if (baseRequest.stream) {
@@ -2058,6 +2080,70 @@ function looksLikeForeignSandboxLeak(text: string | null | undefined): boolean {
   // from its hosted sandbox instead of the local Codex harness, so the reply is
   // provably ungrounded and should be re-asked.
   return /\/mnt\/(?:file_upload|data)\b/i.test(text);
+}
+
+const ConfabGiveUpPatterns: readonly RegExp[] = [
+  /file[-\s]?editing tools?(?:\s+\w+){0,3}\s+not available/i,
+  /don't have (?:access to )?(?:the )?file[-\s]?editing tools?/i,
+  /please (?:try to )?restart the task/i,
+  /unable to (?:access|use) (?:the )?(?:file[-\s]?editing|code) tools?/i,
+];
+
+// Some Substrate turns come back with a canned "I can't reach the tools, please
+// restart the task" style give-up instead of doing the work. These are
+// transient and almost always succeed on a clean re-ask, so callers on the
+// buffered (non-streaming) path re-issue the turn on a fresh conversation.
+export function looksLikeConfabGiveUp(text: string | null | undefined): boolean {
+  if (!text || !text.trim()) {
+    return false;
+  }
+  return ConfabGiveUpPatterns.some((pattern) => pattern.test(text));
+}
+
+// Re-issue a buffered (non-streaming) Substrate turn when the model returns a
+// canned "I can't reach the tools, restart the task" give-up. Each retry runs
+// on a fresh ephemeral conversation so no partial/confabulated turn pollutes the
+// context. Only the non-streaming paths use this: a true streaming turn has
+// already emitted deltas that cannot be retracted. A hard failure on retry is
+// discarded in favour of the original (soft) answer.
+async function retryConfabGiveUp(
+  services: Services,
+  transport: string,
+  request: ParsedOpenAiRequest,
+  initialResult: ChatResult,
+  executeChatTurn: (
+    conversationId?: string,
+    isStartOfSession?: boolean,
+  ) => Promise<ChatResult>,
+): Promise<ChatResult> {
+  if (transport !== TransportNames.Substrate) {
+    return initialResult;
+  }
+  const maxRetries = Math.max(0, services.options.confabRetries ?? 0);
+  let result = initialResult;
+  for (let attempt = 0; attempt < maxRetries; attempt += 1) {
+    if (!result.isSuccess) {
+      break;
+    }
+    const assistantText =
+      result.assistantText ??
+      extractCopilotAssistantText(result.responseJson, request.promptText) ??
+      "";
+    if (!looksLikeConfabGiveUp(assistantText)) {
+      break;
+    }
+    const retryConversationId =
+      services.substrateClient.createConversation().conversationId;
+    if (!retryConversationId) {
+      break;
+    }
+    const retryResult = await executeChatTurn(retryConversationId, true);
+    if (!retryResult.isSuccess) {
+      break;
+    }
+    result = retryResult;
+  }
+  return result;
 }
 
 function shouldRetrySimulatedToollessChatPayload(

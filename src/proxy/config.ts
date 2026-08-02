@@ -175,6 +175,10 @@ const WrapperOptionsSchema = z.object({
         .default(["People", "File", "Event", "Email", "TeamsMessage"]),
       earlyCompleteOnSimulatedPayload: z.boolean().default(false),
       incrementalSimulatedContentStreaming: z.boolean().default(false),
+      concurrencyLimit: z.number().int().min(0).default(2),
+      acquireTimeoutMs: z.number().int().min(0).default(0),
+      maxSendChars: z.number().int().min(0).default(500_000),
+      truncateBeforeSending: z.boolean().default(true),
     })
     .default({}),
   defaultModel: z.string().default("gpt-5.6-sol"),
@@ -183,6 +187,9 @@ const WrapperOptionsSchema = z.object({
   maxAdditionalContextMessages: z.number().int().default(16),
   includeConversationIdInResponseBody: z.boolean().default(true),
   retrySimulatedToollessResponses: z.boolean().default(true),
+  logStdout: z.boolean().default(false),
+  confabRetries: z.number().int().min(0).default(1),
+  msalAuth: z.boolean().default(true),
 });
 
 export async function loadWrapperOptions(cwd: string): Promise<WrapperOptions> {
@@ -197,6 +204,7 @@ export async function loadWrapperOptions(cwd: string): Promise<WrapperOptions> {
   }
 
   applyConfigEnvOverrides(rootConfig, process.env);
+  applyFriendlyEnvOverrides(rootConfig, process.env);
   return normalizeWrapperOptions(rootConfig);
 }
 
@@ -242,6 +250,42 @@ function applyConfigEnvOverrides(
       continue;
     }
     setDeepValue(wrapper, pathParts, parseEnvValue(value));
+  }
+}
+
+// Convenience aliases for a handful of runtime-robustness knobs so operators can
+// flip them without the verbose CONFIG__ path syntax.
+function applyFriendlyEnvOverrides(
+  wrapper: JsonObject,
+  env: NodeJS.ProcessEnv,
+): void {
+  const isTruthy = (raw: string): boolean =>
+    ["1", "true", "yes", "on"].includes(raw.trim().toLowerCase());
+
+  const stdout = env.M365_LOG_STDOUT;
+  if (stdout?.trim()) {
+    wrapper.logStdout = isTruthy(stdout);
+  }
+
+  if (env.M365_NO_CONFAB_RETRY?.trim() && isTruthy(env.M365_NO_CONFAB_RETRY)) {
+    wrapper.confabRetries = 0;
+  }
+  const confabRetries = env.M365_CONFAB_RETRIES;
+  if (confabRetries?.trim() && /^\d+$/.test(confabRetries.trim())) {
+    wrapper.confabRetries = Number.parseInt(confabRetries.trim(), 10);
+  }
+
+  const substrate = isJsonObject(wrapper.substrate)
+    ? (wrapper.substrate as JsonObject)
+    : (wrapper.substrate = {} as JsonObject);
+
+  const concurrency = env.M365_SUBSTRATE_CONCURRENCY;
+  if (concurrency?.trim() && /^\d+$/.test(concurrency.trim())) {
+    substrate.concurrencyLimit = Number.parseInt(concurrency.trim(), 10);
+  }
+  const maxSendChars = env.M365_MAX_SEND_CHARS;
+  if (maxSendChars?.trim() && /^\d+$/.test(maxSendChars.trim())) {
+    substrate.maxSendChars = Number.parseInt(maxSendChars.trim(), 10);
   }
 }
 

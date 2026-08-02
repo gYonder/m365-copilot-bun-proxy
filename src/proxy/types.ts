@@ -216,6 +216,10 @@ export type SubstrateOptions = {
   entityAnnotationTypes: string[];
   earlyCompleteOnSimulatedPayload: boolean;
   incrementalSimulatedContentStreaming?: boolean;
+  concurrencyLimit?: number;
+  acquireTimeoutMs?: number;
+  maxSendChars?: number;
+  truncateBeforeSending?: boolean;
 };
 
 export type WrapperOptions = {
@@ -239,4 +243,7 @@ export type WrapperOptions = {
   maxAdditionalContextMessages: number;
   includeConversationIdInResponseBody: boolean;
   retrySimulatedToollessResponses: boolean;
+  logStdout: boolean;
+  confabRetries: number;
+  msalAuth: boolean;
 };
