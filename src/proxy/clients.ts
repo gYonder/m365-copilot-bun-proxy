@@ -32,6 +32,8 @@ import {
   TurnQueueWaitError,
 } from "./substrate-session-store";
 import { ConcurrencyLimiter } from "./concurrency";
+import { resolveSubstrateCapabilities } from "./substrate-capabilities";
+export { resolveSubstrateTone } from "./substrate-capabilities";
 
 export class CopilotGraphClient {
   constructor(
@@ -884,6 +886,10 @@ export function buildInvocationPayload(
   isStartOfSession: boolean,
   options: WrapperOptions,
 ): JsonObject {
+  const capabilities = resolveSubstrateCapabilities(
+    request.model,
+    options.substrate,
+  );
   const message: JsonObject = {
     author: "user",
     text: truncateSubstrateSendText(
@@ -892,17 +898,15 @@ export function buildInvocationPayload(
       options.substrate.truncateBeforeSending ?? false,
     ),
     inputMethod: "Keyboard",
-    messageType: "Chat",
+    messageType: capabilities.messageType,
     requestId: clientRequestId,
     messageId: randomUUID(),
-    locale: options.substrate.locale?.trim() || "en-US",
-    experienceType: options.substrate.experienceType?.trim() || "Default",
+    locale: capabilities.locale,
+    experienceType: capabilities.experienceType,
   };
 
-  if (options.substrate.entityAnnotationTypes.length > 0) {
-    message.entityAnnotationTypes = options.substrate.entityAnnotationTypes
-      .map((v) => v.trim())
-      .filter((v) => v.length > 0);
+  if (capabilities.entityAnnotationTypes.length > 0) {
+    message.entityAnnotationTypes = capabilities.entityAnnotationTypes;
   }
 
   const locationInfo = buildLocationInfo(request.locationHint);
@@ -912,14 +916,14 @@ export function buildInvocationPayload(
 
   const argument: JsonObject = {
     source: options.substrate.source?.trim() || "officeweb",
-    tone: resolveSubstrateTone(request.model),
+    tone: capabilities.tone,
     clientCorrelationId: clientRequestId,
     sessionId,
     conversationId,
     traceId: randomUUID().replaceAll("-", ""),
     isStartOfSession,
-    streamingMode: "ConciseWithPadding",
-    spokenTextMode: "None",
+    streamingMode: capabilities.streamingMode,
+    spokenTextMode: capabilities.spokenTextMode,
     options: {},
     extraExtensionParameters: {},
     sliceIds: [],
@@ -947,15 +951,11 @@ export function buildInvocationPayload(
     disconnectBehavior: "continue",
   };
 
-  if (options.substrate.optionsSets.length > 0) {
-    argument.optionsSets = options.substrate.optionsSets
-      .map((v) => v.trim())
-      .filter((v) => v.length > 0);
+  if (capabilities.optionsSets.length > 0) {
+    argument.optionsSets = capabilities.optionsSets;
   }
-  if (options.substrate.allowedMessageTypes.length > 0) {
-    argument.allowedMessageTypes = options.substrate.allowedMessageTypes
-      .map((v) => v.trim())
-      .filter((v) => v.length > 0);
+  if (capabilities.allowedMessageTypes.length > 0) {
+    argument.allowedMessageTypes = capabilities.allowedMessageTypes;
   }
   if (request.contextualResources) {
     argument.contextualResources = request.contextualResources;
@@ -964,11 +964,8 @@ export function buildInvocationPayload(
   return {
     arguments: [argument],
     invocationId: "0",
-    target: options.substrate.invocationTarget?.trim() || "update",
-    type:
-      options.substrate.invocationType > 0
-        ? options.substrate.invocationType
-        : 1,
+    target: capabilities.invocationTarget,
+    type: capabilities.invocationType,
   };
 }
 
@@ -991,16 +988,6 @@ export function resolveSubstrateDeadlines(
   const turnDeadlineMs =
     nowMs + (substrate.turnTimeoutSeconds ?? invocationTimeoutMs / 1000) * 1000;
   return { invocationTimeoutMs, handshakeTimeoutMs, turnDeadlineMs };
-}
-
-export function resolveSubstrateTone(model: string | null | undefined): string {
-  const normalizedModel = model?.trim().toLowerCase() ?? "";
-  switch (normalizedModel) {
-    case "gpt-5.6-sol":
-      return "Gpt_5_6_Reasoning";
-    default:
-      return "magic";
-  }
 }
 
 function buildPromptWithAdditionalContext(
