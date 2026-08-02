@@ -17,6 +17,11 @@ type RequestHashEntry = {
   response: JsonObject;
 };
 
+export type StoredReplayResult = {
+  conversationId: string | null;
+  response: JsonObject;
+};
+
 type TaskDeadlineEntry = {
   deadlineMs: number;
   expiresAtUtc: number;
@@ -31,6 +36,7 @@ export class ResponseStore {
   private readonly conversationLinks = new Map<string, ConversationLinkEntry>();
   private readonly requestHashes = new Map<string, RequestHashEntry>();
   private readonly taskDeadlines = new Map<string, TaskDeadlineEntry>();
+  private readonly inFlightResponses = new Map<string, Promise<Response>>();
 
   constructor(
     private readonly options: WrapperOptions,
@@ -245,6 +251,59 @@ export class ResponseStore {
     };
   }
 
+  tryGetProtocolReplay(identityKey: string): StoredReplayResult | null {
+    const key = identityKey.trim();
+    if (!key) return null;
+    this.purgeExpired();
+    const entry = this.durable.state.replays[key];
+    if (!entry) return null;
+    if (entry.expiresAtUtc <= Date.now()) {
+      delete this.durable.state.replays[key];
+      this.durable.save();
+      return null;
+    }
+    return {
+      conversationId: entry.conversationId,
+      response: cloneJsonValue(entry.response as JsonObject),
+    };
+  }
+
+  rememberCompletedProtocolTurn(
+    identityKey: string,
+    conversationId: string | null,
+    response: JsonObject,
+  ): void {
+    const key = identityKey.trim();
+    if (!key) return;
+    this.durable.state.replays[key] = {
+      conversationId: conversationId?.trim() || null,
+      response: cloneJsonValue(response),
+      expiresAtUtc: this.resolveExpiryMs(),
+    };
+    this.durable.save();
+  }
+
+  tryGetInFlightResponse(identityKey: string): Promise<Response> | null {
+    return this.inFlightResponses.get(identityKey.trim()) ?? null;
+  }
+
+  registerInFlightResponse(
+    identityKey: string,
+    promise: Promise<Response>,
+  ): Promise<Response> {
+    const key = identityKey.trim();
+    if (!key) return promise;
+    const existing = this.inFlightResponses.get(key);
+    if (existing) return existing;
+    this.inFlightResponses.set(key, promise);
+    void promise.finally(() => {
+      if (this.inFlightResponses.get(key) === promise) {
+        this.inFlightResponses.delete(key);
+      }
+    });
+    return promise;
+  }
+
   rememberCompletedRequest(
     requestHash: string,
     conversationId: string | null,
@@ -272,6 +331,9 @@ export class ResponseStore {
   }
 
   private purgeExpired(): void {
+    let durableReplayChanged = false;
+    const now = Date.now();
+
     if (this.entries.size > 0) {
       const now = Date.now();
       for (const [id, entry] of this.entries.entries()) {
@@ -301,7 +363,6 @@ export class ResponseStore {
     }
 
     if (this.taskDeadlines.size > 0) {
-      const now = Date.now();
       for (const [key, entry] of this.taskDeadlines.entries()) {
         if (entry.expiresAtUtc <= now) {
           this.taskDeadlines.delete(key);
@@ -309,6 +370,15 @@ export class ResponseStore {
       }
     }
 
+    for (const [key, entry] of Object.entries(this.durable.state.replays)) {
+      if (entry.expiresAtUtc <= now) {
+        delete this.durable.state.replays[key];
+        durableReplayChanged = true;
+      }
+    }
+    if (durableReplayChanged) {
+      this.durable.save();
+    }
   }
 }
 

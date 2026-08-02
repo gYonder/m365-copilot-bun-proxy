@@ -1521,42 +1521,23 @@ describe("simulated transform mode proxy flow", () => {
     expect(tryGetString(body.error as JsonObject, "code")).toBe("invalid_request");
   });
 
-  test("responses continuation with function output bypasses stored tool replay", async () => {
+  test("responses continuation advances once and replays an identical retry", async () => {
     let upstreamCalls = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
         upstreamCalls += 1;
-        const response =
-          upstreamCalls < 3
-            ? {
-                id: `resp_tool_${upstreamCalls}`,
-                object: "response",
-                output: [
-                  {
-                    type: "function_call",
-                    call_id: "call_1",
-                    name: "exec",
-                    arguments: "{}",
-                  },
-                ],
-              }
-            : {
-                id: "resp_final_1",
-                object: "response",
-                output: [
-                  {
-                    type: "message",
-                    role: "assistant",
-                    content: [
-                      {
-                        type: "output_text",
-                        text: "M365_TOOL_LOOP_OK",
-                      },
-                    ],
-                  },
-                ],
-                output_text: "M365_TOOL_LOOP_OK",
-              };
+        const response = {
+          id: `resp_tool_${upstreamCalls}`,
+          object: "response",
+          output: [
+            {
+              type: "function_call",
+              call_id: "call_1",
+              name: "exec",
+              arguments: "{}",
+            },
+          ],
+        };
         return buildGraphChatResult(
           conversationId,
           payload,
@@ -1646,21 +1627,102 @@ describe("simulated transform mode proxy flow", () => {
     );
     expect(third.status).toBe(200);
     expect(third.headers.get("x-m365-request-hash-replayed")).toBeNull();
+    expect(third.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
     const thirdBody = (await third.json()) as JsonObject;
-    expect(tryGetString(thirdBody, "output_text")).toBe(
-      "M365_TOOL_LOOP_OK",
+    expect(thirdBody).toEqual(secondBody);
+    expect(upstreamCalls).toBe(2);
+  });
+
+  test("concurrent duplicate protocol turns use one upstream invocation and preserve one tool call", async () => {
+    let upstreamCalls = 0;
+    let releaseUpstream: (() => void) | undefined;
+    const upstreamBlocked = new Promise<void>((resolve) => {
+      releaseUpstream = resolve;
+    });
+    const app = createProxyApp(
+      createServices(async (conversationId, payload) => {
+        upstreamCalls += 1;
+        await upstreamBlocked;
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            id: "resp_concurrent_tool",
+            object: "response",
+            status: "completed",
+            output: [
+              {
+                type: "function_call",
+                call_id: "call_concurrent_1",
+                name: "exec",
+                arguments: JSON.stringify({ cmd: "pwd" }),
+              },
+            ],
+          }),
+        );
+      }),
     );
-    const output = Array.isArray(thirdBody.output) ? thirdBody.output : [];
+    const body = JSON.stringify({
+      model: "m365-copilot",
+      stream: false,
+      input: "Run pwd once.",
+      client_metadata: {
+        thread_id: "thread-concurrent",
+        session_id: "session-concurrent",
+        turn_id: "turn-concurrent",
+      },
+      tools: [
+        {
+          type: "function",
+          name: "exec",
+          parameters: {
+            type: "object",
+            properties: { cmd: { type: "string" } },
+            required: ["cmd"],
+          },
+        },
+      ],
+      tool_choice: "required",
+    });
+    const makeRequest = () =>
+      app.fetch(
+        new Request("http://localhost/v1/responses", {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-m365-transport": TransportNames.Graph,
+          },
+          body,
+        }),
+      );
+
+    const firstPromise = makeRequest();
+    const secondPromise = makeRequest();
+    await Promise.resolve();
+    releaseUpstream?.();
+    const [first, second] = await Promise.all([firstPromise, secondPromise]);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(upstreamCalls).toBe(1);
     expect(
-      output.some(
+      [first, second].filter(
+        (response) =>
+          response.headers.get("x-m365-in-flight-replayed") === "true",
+      ),
+    ).toHaveLength(1);
+    const firstBody = (await first.json()) as JsonObject;
+    const secondBody = (await second.json()) as JsonObject;
+    expect(secondBody).toEqual(firstBody);
+    const output = Array.isArray(firstBody.output) ? firstBody.output : [];
+    expect(
+      output.filter(
         (item) =>
           isJsonObject(item) &&
-          ["function_call", "custom_tool_call"].includes(
-            tryGetString(item, "type") ?? "",
-          ),
+          tryGetString(item, "type") === "function_call" &&
+          tryGetString(item, "call_id") === "call_concurrent_1",
       ),
-    ).toBeFalse();
-    expect(upstreamCalls).toBe(3);
+    ).toHaveLength(1);
   });
 
   test("responses request-hash guard replays the stored response for duplicate identical requests", async () => {

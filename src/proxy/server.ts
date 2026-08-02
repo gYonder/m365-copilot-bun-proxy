@@ -66,6 +66,7 @@ import {
   type OpenAiAssistantResponse,
   type ParsedOpenAiRequest,
   type ParsedResponsesRequest,
+  type ResponsesProtocolIdentity,
   type SubstrateStreamUpdate,
   type WrapperOptions,
 } from "./types";
@@ -845,6 +846,66 @@ async function handleResponsesCreate(
   request: Request,
   services: Services,
 ): Promise<Response> {
+  const payload = await tryReadJsonPayload(request.clone());
+  if (payload) {
+    const resolvedOptions = resolveRequestOptionsWithTransformModeOverride(
+      request,
+      services.options,
+    );
+    if (resolvedOptions.ok) {
+      const parsed = tryParseResponsesRequest(
+        payload.json,
+        resolvedOptions.options,
+      );
+      const selectedTransport = resolveTransport(
+        request,
+        payload.json,
+        resolvedOptions.options,
+      );
+      if (
+        parsed.ok &&
+        !parsed.request.base.stream &&
+        isSupportedTransport(selectedTransport)
+      ) {
+        const requestHash = computeResponsesRequestHash(
+          payload.rawText,
+          payload.json,
+          selectedTransport,
+          request,
+        );
+        const identityKey = computeResponsesReplayIdentityKey(
+          parsed.request.protocolIdentity,
+          payload.json,
+          selectedTransport,
+          requestHash,
+        );
+        const existing = services.responseStore.tryGetInFlightResponse(identityKey);
+        if (existing) {
+          const joined = (await existing).clone();
+          joined.headers.set("x-m365-in-flight-replayed", "true");
+          return joined;
+        }
+        const execution = handleResponsesCreateOnce(request, services);
+        const registered = services.responseStore.registerInFlightResponse(
+          identityKey,
+          execution,
+        );
+        if (registered !== execution) {
+          const joined = (await registered).clone();
+          joined.headers.set("x-m365-in-flight-replayed", "true");
+          return joined;
+        }
+        return execution;
+      }
+    }
+  }
+  return handleResponsesCreateOnce(request, services);
+}
+
+async function handleResponsesCreateOnce(
+  request: Request,
+  services: Services,
+): Promise<Response> {
   const {
     options: baseOptions,
     graphClient,
@@ -963,15 +1024,25 @@ async function handleResponsesCreate(
     selectedTransport,
     request,
   );
-  // A continuation carrying tool output must execute upstream. Replaying the
-  // prior tool-call response would make Codex re-apply the same exec/patch
-  // event indefinitely. Initial/disconnected retries without tool output keep
-  // the idempotent replay path.
-  const storedRequestReplay = hasPriorToolResult(payload.json)
-    ? null
-    : responseStore.tryGetRequestReplay(requestHash);
+  const replayIdentityKey = computeResponsesReplayIdentityKey(
+    parsedRequest.protocolIdentity,
+    payload.json,
+    selectedTransport,
+    requestHash,
+  );
+  const isProtocolIdentity = replayIdentityKey.startsWith("protocol:");
+  const storedRequestReplay = isProtocolIdentity
+    ? responseStore.tryGetProtocolReplay(replayIdentityKey)
+    : hasPriorToolResult(payload.json)
+      ? null
+      : responseStore.tryGetRequestReplay(requestHash);
   if (storedRequestReplay) {
-    responseHeaders.set("x-m365-request-hash-replayed", "true");
+    responseHeaders.set(
+      isProtocolIdentity
+        ? "x-m365-protocol-identity-replayed"
+        : "x-m365-request-hash-replayed",
+      "true",
+    );
     return buildStoredReplayResponsesResult(
       services,
       parsedRequest,
@@ -1200,7 +1271,7 @@ async function handleResponsesCreate(
             normalized.responseBody,
             responseHeaders,
             trace,
-            requestHash,
+            replayIdentityKey,
             taskDeadlineMs,
           );
         }
@@ -1237,7 +1308,7 @@ async function handleResponsesCreate(
         assistantResponse,
         responseHeaders,
         trace,
-        requestHash,
+        replayIdentityKey,
         taskDeadlineMs,
       );
     }
@@ -1265,7 +1336,7 @@ async function handleResponsesCreate(
         scopedConversationKey,
         responseHeaders,
         trace,
-        requestHash,
+        replayIdentityKey,
         taskDeadlineMs,
       );
     }
@@ -1279,7 +1350,7 @@ async function handleResponsesCreate(
       scopedConversationKey,
       responseHeaders,
       trace,
-      requestHash,
+      replayIdentityKey,
       taskDeadlineMs,
       request.signal,
     );
@@ -1363,9 +1434,9 @@ async function handleResponsesCreate(
         conversationId,
         taskDeadlineMs,
       );
-      rememberResponsesReplayHashes(
+      rememberResponsesReplayIdentity(
         responseStore,
-        requestHash,
+        replayIdentityKey,
         conversationId,
         normalized.responseBody,
       );
@@ -1427,9 +1498,9 @@ async function handleResponsesCreate(
     conversationId,
   );
   responseStore.set(responseId, responseBody, conversationId, taskDeadlineMs);
-  rememberResponsesReplayHashes(
+  rememberResponsesReplayIdentity(
     responseStore,
-    requestHash,
+    replayIdentityKey,
     conversationId,
     responseBody,
   );
@@ -1859,7 +1930,7 @@ async function buildBufferedResponsesStreamResponse(
   assistantResponse: ReturnType<typeof buildAssistantResponse>,
   headers: Headers,
   trace: TraceContext | null,
-  requestHash: string,
+  replayIdentityKey: string,
   taskDeadlineMs: number,
 ): Promise<Response> {
   const responseId = createOpenAiResponseId();
@@ -1993,9 +2064,9 @@ async function buildBufferedResponsesStreamResponse(
           conversationId,
           taskDeadlineMs,
         );
-        rememberResponsesReplayHashes(
+        rememberResponsesReplayIdentity(
           services.responseStore,
-          requestHash,
+          replayIdentityKey,
           conversationId,
           completed,
         );
@@ -2804,7 +2875,7 @@ async function buildSimulatedResponsesStreamResponse(
   payload: JsonObject,
   headers: Headers,
   trace: TraceContext | null,
-  requestHash: string,
+  replayIdentityKey: string,
   taskDeadlineMs: number,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
@@ -2936,9 +3007,9 @@ async function buildSimulatedResponsesStreamResponse(
         conversationId,
         taskDeadlineMs,
       );
-      rememberResponsesReplayHashes(
+      rememberResponsesReplayIdentity(
         services.responseStore,
-        requestHash,
+        replayIdentityKey,
         conversationId,
         completed,
       );
@@ -3009,13 +3080,79 @@ function computeResponsesRequestHash(
     .digest("hex");
 }
 
-function rememberResponsesReplayHashes(
+function rememberResponsesReplayIdentity(
   responseStore: ResponseStore,
-  requestHash: string,
+  replayIdentityKey: string,
   conversationId: string | null,
   response: JsonObject,
 ): void {
+  if (replayIdentityKey.startsWith("protocol:")) {
+    responseStore.rememberCompletedProtocolTurn(
+      replayIdentityKey,
+      conversationId,
+      response,
+    );
+    return;
+  }
+  const requestHash = replayIdentityKey.startsWith("legacy:")
+    ? replayIdentityKey.slice("legacy:".length)
+    : replayIdentityKey;
   responseStore.rememberCompletedRequest(requestHash, conversationId, response);
+}
+
+export function computeResponsesReplayIdentityKey(
+  identity: ResponsesProtocolIdentity,
+  requestJson: JsonObject,
+  transport: string,
+  requestHash: string,
+): string {
+  const hasProtocolIdentity = Boolean(
+    identity.turnId ||
+      identity.previousResponseId ||
+      identity.conversationId ||
+      identity.callIds.length > 0,
+  );
+  if (!hasProtocolIdentity) {
+    return "legacy:" + requestHash;
+  }
+
+  const toolResults: JsonObject[] = [];
+  if (Array.isArray(requestJson.input)) {
+    for (const item of requestJson.input) {
+      if (!isJsonObject(item)) continue;
+      const type = (tryGetString(item, "type") ?? "").toLowerCase();
+      if (
+        type !== "function_call_output" &&
+        type !== "custom_tool_call_output"
+      ) {
+        continue;
+      }
+      const outputHash = createHash("sha256")
+        .update(JSON.stringify(cloneJsonValue(item.output ?? null)))
+        .digest("hex");
+      toolResults.push({
+        type,
+        call_id: tryGetString(item, "call_id") ?? "",
+        output_hash: outputHash,
+      });
+    }
+  }
+  toolResults.sort((left, right) =>
+    JSON.stringify(left).localeCompare(JSON.stringify(right)),
+  );
+  const canonical = JSON.stringify({
+    transport,
+    thread_id: identity.threadId,
+    session_id: identity.sessionId,
+    turn_id: identity.turnId,
+    conversation_id: identity.conversationId,
+    previous_response_id: identity.previousResponseId,
+    call_ids: identity.callIds,
+    tool_results: toolResults,
+  });
+  return (
+    "protocol:" + createHash("sha256").update(canonical).digest("hex")
+  );
 }
 
 function resolveTaskDeadlineMs(options: WrapperOptions): number {
@@ -3376,7 +3513,7 @@ async function transformGraphStreamToResponses(
   scopedConversationKey: string | null,
   headers: Headers,
   trace: TraceContext | null,
-  requestHash: string,
+  replayIdentityKey: string,
   taskDeadlineMs: number,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
@@ -3524,9 +3661,9 @@ async function transformGraphStreamToResponses(
           conversationId,
           taskDeadlineMs,
         );
-        rememberResponsesReplayHashes(
+        rememberResponsesReplayIdentity(
           services.responseStore,
-          requestHash,
+          replayIdentityKey,
           conversationId,
           completed,
         );
@@ -3584,7 +3721,7 @@ async function streamSubstrateAsResponses(
   scopedConversationKey: string | null,
   headers: Headers,
   trace: TraceContext | null,
-  requestHash: string,
+  replayIdentityKey: string,
   taskDeadlineMs: number,
   signal?: AbortSignal,
 ): Promise<Response> {
@@ -3754,9 +3891,9 @@ async function streamSubstrateAsResponses(
         conversationId,
         taskDeadlineMs,
       );
-      rememberResponsesReplayHashes(
+      rememberResponsesReplayIdentity(
         services.responseStore,
-        requestHash,
+        replayIdentityKey,
         conversationId,
         completed,
       );

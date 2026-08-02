@@ -49,4 +49,50 @@ describe("durable continuation metadata", () => {
     expect(statSync(file).mode & 0o777).toBe(0o600);
     rmSync(dir, { recursive: true, force: true });
   });
+
+  test("persists explicit completed protocol replays across reconstruction", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "m365-replay-"));
+    const file = path.join(dir, "continuation.json");
+    const options = { conversationTtlMinutes: 180 } as WrapperOptions;
+    const first = new ResponseStore(options, new DurableStateStore(file));
+    const completed = {
+      id: "resp_protocol_1",
+      object: "response",
+      status: "completed",
+      output: [],
+      output_text: "completed protocol result",
+    };
+
+    first.rememberCompletedProtocolTurn(
+      "protocol:durable-turn",
+      "conv_protocol_1",
+      completed,
+    );
+
+    const resumed = new ResponseStore(options, new DurableStateStore(file));
+    expect(resumed.tryGetProtocolReplay("protocol:durable-turn")).toEqual({
+      conversationId: "conv_protocol_1",
+      response: completed,
+    });
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("removes expired durable protocol replays", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "m365-replay-expired-"));
+    const file = path.join(dir, "continuation.json");
+    const options = { conversationTtlMinutes: 180 } as WrapperOptions;
+    const durable = new DurableStateStore(file);
+    durable.state.replays["protocol:expired-turn"] = {
+      conversationId: "conv_expired",
+      response: { id: "resp_expired" },
+      expiresAtUtc: Date.now() - 1,
+    };
+    durable.save();
+
+    const resumed = new ResponseStore(options, new DurableStateStore(file));
+    expect(resumed.tryGetProtocolReplay("protocol:expired-turn")).toBeNull();
+    expect(readFileSync(file, "utf8")).not.toContain("protocol:expired-turn");
+    rmSync(dir, { recursive: true, force: true });
+  });
 });

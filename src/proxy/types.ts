@@ -112,12 +112,22 @@ export type ParsedOpenAiRequest = {
 export type ParsedResponsesRequest = {
   base: ParsedOpenAiRequest;
   previousResponseId: string | null;
+  protocolIdentity: ResponsesProtocolIdentity;
   inputItemsForStorage: JsonValue[];
   instructions: string | null;
   store: boolean;
   rawRequest: JsonObject;
   contextWindowId: string | null;
   contextInputTokens: number | null;
+};
+
+export type ResponsesProtocolIdentity = {
+  threadId: string | null;
+  sessionId: string | null;
+  turnId: string | null;
+  conversationId: string | null;
+  previousResponseId: string | null;
+  callIds: string[];
 };
 
 export type JsonPayload = {

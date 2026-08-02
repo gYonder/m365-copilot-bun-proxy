@@ -25,11 +25,18 @@ type DurableSessionEntry = {
   expiresAtUtc: number;
 };
 
+export type DurableReplayEntry = {
+  conversationId: string | null;
+  response: Record<string, unknown>;
+  expiresAtUtc: number;
+};
+
 export type DurableState = {
   version: 1;
   responses: Record<string, DurableResponseEntry>;
   conversations: Record<string, DurableConversationEntry>;
   sessions: Record<string, DurableSessionEntry>;
+  replays: Record<string, DurableReplayEntry>;
 };
 
 const emptyState = (): DurableState => ({
@@ -37,6 +44,7 @@ const emptyState = (): DurableState => ({
   responses: {},
   conversations: {},
   sessions: {},
+  replays: {},
 });
 
 export function durableStatePath(): string | null {
@@ -64,7 +72,12 @@ export class DurableStateStore {
   save(): void {
     if (!this.path) return;
     const now = Date.now();
-    for (const collection of [this.state.responses, this.state.conversations, this.state.sessions]) {
+    for (const collection of [
+      this.state.responses,
+      this.state.conversations,
+      this.state.sessions,
+      this.state.replays,
+    ]) {
       for (const [key, value] of Object.entries(collection)) {
         if (value.expiresAtUtc <= now) delete collection[key];
       }
@@ -90,7 +103,25 @@ function parseState(value: unknown): DurableState {
     responses: parseResponseEntries(value.responses),
     conversations: parseConversationEntries(value.conversations),
     sessions: parseSessionEntries(value.sessions),
+    replays: parseReplayEntries(value.replays),
   };
+}
+
+function parseReplayEntries(value: unknown): Record<string, DurableReplayEntry> {
+  const output: Record<string, DurableReplayEntry> = {};
+  if (!isRecord(value)) return output;
+  for (const [key, entry] of Object.entries(value)) {
+    if (!isRecord(entry) || !isRecord(entry.response)) continue;
+    const expiresAtUtc = readPositiveNumber(entry.expiresAtUtc);
+    if (expiresAtUtc === null) continue;
+    output[key] = {
+      conversationId:
+        entry.conversationId === null ? null : readString(entry.conversationId) ?? null,
+      response: entry.response,
+      expiresAtUtc,
+    };
+  }
+  return output;
 }
 
 function parseResponseEntries(value: unknown): Record<string, DurableResponseEntry> {

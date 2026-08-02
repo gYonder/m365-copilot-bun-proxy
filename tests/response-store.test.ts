@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { ResponseStore } from "../src/proxy/response-store";
-import type { JsonObject, WrapperOptions } from "../src/proxy/types";
+import { computeResponsesReplayIdentityKey } from "../src/proxy/server";
+import type {
+  JsonObject,
+  ResponsesProtocolIdentity,
+  WrapperOptions,
+} from "../src/proxy/types";
 
 describe("ResponseStore replay identity", () => {
   test("binds each request hash to its exact completed response", () => {
@@ -18,6 +23,89 @@ describe("ResponseStore replay identity", () => {
   test("does not claim a request before a completed response is stored", () => {
     const store = new ResponseStore(createOptions());
     expect(store.tryGetRequestReplay("in-flight-hash")).toBeNull();
+  });
+
+  test("shares one in-flight response promise by protocol identity", async () => {
+    const store = new ResponseStore(createOptions());
+    const responsePromise = Promise.resolve(new Response("ok"));
+
+    expect(
+      store.registerInFlightResponse("protocol:turn-1", responsePromise),
+    ).toBe(responsePromise);
+    expect(store.tryGetInFlightResponse("protocol:turn-1")).toBe(
+      responsePromise,
+    );
+    expect(
+      store.registerInFlightResponse(
+        "protocol:turn-1",
+        Promise.resolve(new Response("duplicate")),
+      ),
+    ).toBe(responsePromise);
+
+    await responsePromise;
+    await Promise.resolve();
+    expect(store.tryGetInFlightResponse("protocol:turn-1")).toBeNull();
+  });
+
+  test("keeps identical prompts in distinct protocol turns independent", () => {
+    const first = computeResponsesReplayIdentityKey(
+      identity({ turnId: "turn-1" }),
+      { input: "same prompt" },
+      "graph",
+      "same-request-hash",
+    );
+    const second = computeResponsesReplayIdentityKey(
+      identity({ turnId: "turn-2" }),
+      { input: "same prompt" },
+      "graph",
+      "same-request-hash",
+    );
+
+    expect(first).not.toBe(second);
+    expect(first.startsWith("protocol:")).toBeTrue();
+    expect(second.startsWith("protocol:")).toBeTrue();
+  });
+
+  test("canonicalizes multiple tool results regardless of input ordering", () => {
+    const protocolIdentity = identity({
+      previousResponseId: "resp_previous",
+      callIds: ["call_a", "call_b"],
+    });
+    const first = computeResponsesReplayIdentityKey(
+      protocolIdentity,
+      {
+        input: [
+          { type: "function_call_output", call_id: "call_a", output: "one" },
+          { type: "custom_tool_call_output", call_id: "call_b", output: "two" },
+        ],
+      },
+      "graph",
+      "unused",
+    );
+    const second = computeResponsesReplayIdentityKey(
+      protocolIdentity,
+      {
+        input: [
+          { type: "custom_tool_call_output", call_id: "call_b", output: "two" },
+          { type: "function_call_output", call_id: "call_a", output: "one" },
+        ],
+      },
+      "graph",
+      "unused",
+    );
+
+    expect(first).toBe(second);
+  });
+
+  test("uses the bounded legacy request hash when protocol identity is absent", () => {
+    expect(
+      computeResponsesReplayIdentityKey(
+        identity(),
+        { input: "legacy prompt" },
+        "graph",
+        "legacy-request-hash",
+      ),
+    ).toBe("legacy:legacy-request-hash");
   });
 
   test("evicts the oldest stored responses after the cap", () => {
@@ -73,6 +161,20 @@ function response(id: string, text: string): JsonObject {
       },
     ],
     output_text: text,
+  };
+}
+
+function identity(
+  overrides: Partial<ResponsesProtocolIdentity> = {},
+): ResponsesProtocolIdentity {
+  return {
+    threadId: null,
+    sessionId: null,
+    turnId: null,
+    conversationId: null,
+    previousResponseId: null,
+    callIds: [],
+    ...overrides,
   };
 }
 

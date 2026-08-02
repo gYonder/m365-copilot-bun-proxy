@@ -11,6 +11,7 @@ import {
   type OpenAiTooling,
   type ParsedOpenAiRequest,
   type ParsedResponsesRequest,
+  type ResponsesProtocolIdentity,
   type WrapperOptions,
 } from "./types";
 import {
@@ -302,6 +303,10 @@ export function tryParseResponsesRequest(
   | { ok: true; request: ParsedResponsesRequest }
   | { ok: false; error: string } {
   const previousResponseId = tryGetString(requestJson, "previous_response_id");
+  const protocolIdentity = extractResponsesProtocolIdentity(
+    requestJson,
+    previousResponseId,
+  );
   const contextWindowId = extractContextWindowId(requestJson);
   const store = tryGetBoolean(requestJson, "store") !== false;
   const specConversationId = extractSpecConversationId(requestJson);
@@ -321,6 +326,7 @@ export function tryParseResponsesRequest(
       request: {
         base: buildSimulatedOpenAiRequest(requestJson, options, "responses"),
         previousResponseId,
+        protocolIdentity,
         inputItemsForStorage: normalizedInput.inputItemsForStorage,
         instructions: tryGetString(requestJson, "instructions"),
         store,
@@ -372,6 +378,7 @@ export function tryParseResponsesRequest(
     request: {
       base: parsedBase.request,
       previousResponseId,
+      protocolIdentity,
       inputItemsForStorage: normalizedInput.inputItemsForStorage,
       instructions,
       store,
@@ -379,6 +386,41 @@ export function tryParseResponsesRequest(
       contextWindowId,
       contextInputTokens: null,
     },
+  };
+}
+
+function extractResponsesProtocolIdentity(
+  requestJson: JsonObject,
+  previousResponseId: string | null,
+): ResponsesProtocolIdentity {
+  const metadata = isJsonObject(requestJson.client_metadata)
+    ? requestJson.client_metadata
+    : null;
+  const encoded = tryGetString(metadata, "x-codex-turn-metadata");
+  const encodedMetadata = encoded ? tryParseJsonObject(encoded) : null;
+  const readMetadata = (key: string): string | null =>
+    tryGetString(metadata, key) ?? tryGetString(encodedMetadata, key);
+  const callIds = new Set<string>();
+  const input = requestJson.input;
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!isJsonObject(item)) continue;
+      const type = (tryGetString(item, "type") ?? "").toLowerCase();
+      if (
+        type !== "function_call_output" &&
+        type !== "custom_tool_call_output"
+      ) continue;
+      const callId = tryGetString(item, "call_id");
+      if (callId) callIds.add(callId);
+    }
+  }
+  return {
+    threadId: readMetadata("thread_id"),
+    sessionId: readMetadata("session_id"),
+    turnId: readMetadata("turn_id"),
+    conversationId: extractSpecConversationId(requestJson),
+    previousResponseId,
+    callIds: [...callIds].sort(),
   };
 }
 
