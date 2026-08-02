@@ -490,7 +490,9 @@ export class CopilotSubstrateClient {
       let responseError: string | null = null;
       let responseErrorCode: string | null = null;
       let completed = false;
+      let receivedSuccessfulTerminal = false;
       let activeBotMessageId: string | null = null;
+      const foldedFrames = new Set<string>();
       const logDeltaSource = async (
         source: "writeAtCursor" | "snapshotText",
         deltaText: string,
@@ -554,6 +556,12 @@ export class CopilotSubstrateClient {
             await sendFrame(ws, requestUri, this.logger, { type: 6 });
             continue;
           }
+
+          const frameIdentity = buildSubstrateFrameIdentity(json, frame.trim());
+          if (foldedFrames.has(frameIdentity)) {
+            continue;
+          }
+          foldedFrames.add(frameIdentity);
 
           const frameRequestId = extractSubstrateRequestId(json);
           if (frameRequestId && frameRequestId !== clientRequestId) {
@@ -659,10 +667,17 @@ export class CopilotSubstrateClient {
               `Substrate returned result '${resultValue}'.`;
           }
 
-          if (
-            frameType !== null &&
-            (frameType === 3 || frameType === 7)
-          ) {
+          if (frameType === 7) {
+            responseError ??= "Substrate websocket closed with an error frame.";
+            responseErrorCode ??= "substrate_terminal_error";
+            completed = true;
+            break;
+          }
+
+          if (frameType === 3) {
+            if (!responseError) {
+              receivedSuccessfulTerminal = true;
+            }
             completed = true;
             break;
           }
@@ -694,6 +709,16 @@ export class CopilotSubstrateClient {
           invocationPayload,
           buildSubstrateTranscriptPayload(transcript),
           responseErrorCode,
+        );
+      }
+
+      if (!receivedSuccessfulTerminal) {
+        return buildFailure(
+          502,
+          "Substrate chat ended without a successful terminal frame.",
+          invocationPayload,
+          buildSubstrateTranscriptPayload(transcript),
+          "substrate_incomplete_terminal",
         );
       }
 
@@ -1568,6 +1593,19 @@ function extractSubstrateRequestId(envelope: JsonObject): string | null {
   }
 
   return null;
+}
+
+function buildSubstrateFrameIdentity(
+  envelope: JsonObject,
+  fallback: string,
+): string {
+  const requestId = extractSubstrateRequestId(envelope) ?? "";
+  const messageId = extractSubstrateBotMessageId(envelope) ?? "";
+  const frameType = tryGetInt(envelope, "type") ?? -1;
+  if (requestId || messageId) {
+    return [frameType, requestId, messageId, fallback].join(":");
+  }
+  return fallback;
 }
 
 function extractSubstrateBotMessageId(envelope: JsonObject): string | null {

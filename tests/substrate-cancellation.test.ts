@@ -268,6 +268,115 @@ describe("Substrate client lifecycle hardening", () => {
     expect(result.rawBody).toContain("Request declined.");
   });
 
+  test("folds repeated update frames without repeating output", async () => {
+    const update = JSON.stringify({
+      type: 1,
+      target: "update",
+      arguments: [{
+        writeAtCursor: "once",
+        messages: [{
+          author: "bot",
+          messageType: "Chat",
+          messageId: "message-repeat",
+          text: "once",
+        }],
+      }],
+    }) + "\u001e";
+    const { connect, createReceiver } = makeFrameTransport([
+      "{}",
+      update,
+      update,
+      JSON.stringify({ type: 3, invocationId: "0" }) + "\u001e",
+    ]);
+    const deltas: string[] = [];
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-repeat",
+      makeRequest(),
+      true,
+      async (updateEvent) => {
+        if (updateEvent.deltaText) deltas.push(updateEvent.deltaText);
+      },
+    );
+
+    expect(result.isSuccess).toBeTrue();
+    expect(result.assistantText).toBe("once");
+    expect(deltas.join("")).toBe("once");
+  });
+
+  test("rejects partial output followed by a type-7 terminal error", async () => {
+    const { connect, createReceiver } = makeFrameTransport([
+      "{}",
+      JSON.stringify({
+        type: 1,
+        target: "update",
+        arguments: [{ writeAtCursor: "partial" }],
+      }) + "\u001e",
+      JSON.stringify({ type: 7, error: "terminal failure" }) + "\u001e",
+    ]);
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-terminal-error",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.statusCode).toBe(502);
+    expect(result.errorCode).toBe("substrate_terminal_error");
+  });
+
+  test("rejects socket closure without a successful terminal frame", async () => {
+    const { connect, createReceiver } = makeFrameTransport([
+      "{}",
+      JSON.stringify({
+        type: 1,
+        target: "update",
+        arguments: [{
+          messages: [{
+            author: "bot",
+            messageType: "Chat",
+            messageId: "message-incomplete",
+            text: "not terminal",
+          }],
+        }],
+      }) + "\u001e",
+    ]);
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-incomplete-terminal",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.errorCode).toBe("substrate_incomplete_terminal");
+  });
+
   test("honors an already-expired task-level deadline", async () => {
     let connectCalls = 0;
     const connect: SubstrateWebSocketConnector = async () => {
