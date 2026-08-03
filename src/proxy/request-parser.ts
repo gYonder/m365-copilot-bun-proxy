@@ -26,6 +26,8 @@ import {
   tryParseJsonObject,
 } from "./utils";
 
+const MAX_SIMULATED_TOOL_RESULT_CHARS = 40_000;
+
 export function normalizeTransport(
   transport: string | null | undefined,
 ): string {
@@ -453,7 +455,14 @@ function buildSimulatedOpenAiRequest(
     model,
     stream: tryGetBoolean(requestJson, "stream") === true,
     transformMode: OpenAiTransformModes.Simulated,
-    promptText: buildSimulatedPrompt(endpointFormat, requestJson, tooling),
+    promptText: buildSimulatedPrompt(
+      endpointFormat,
+      requestJson,
+      tooling,
+      options.substrate.truncateBeforeSending
+        ? options.substrate.maxSendChars
+        : 0,
+    ),
     userKey: tryGetString(requestJson, "user"),
     locationHint: buildLocationHint(requestJson, options.defaultTimeZone),
     contextualResources: buildContextualResources(requestJson),
@@ -469,10 +478,10 @@ function buildSimulatedPrompt(
   endpointFormat: "chat.completions" | "responses",
   requestJson: JsonObject,
   tooling: OpenAiTooling,
+  maxChars = 0,
 ): string {
   const endpointPath =
     endpointFormat === "responses" ? "/v1/responses" : "/v1/chat/completions";
-  const serializedRequest = JSON.stringify(requestJson, null, 2);
   const lines: string[] = [
     `The JSON payload below is an entire request for the OpenAI ${endpointFormat} format.`,
     `The JSON payload below is an entire request for POST ${endpointPath}.`,
@@ -527,8 +536,119 @@ function buildSimulatedPrompt(
     }
   }
 
-  lines.push("```json", serializedRequest, "```");
-  return lines.join("\n");
+  const render = (payload: JsonObject, compact: boolean): string =>
+    [
+      ...lines,
+      "```json",
+      JSON.stringify(payload, null, compact ? undefined : 2),
+      "```",
+    ].join("\n");
+  if (maxChars <= 0) {
+    return render(requestJson, false);
+  }
+  const compactPrompt = render(requestJson, true);
+  const originalCandidates = collectReducibleToolResults(requestJson);
+  if (
+    compactPrompt.length <= maxChars &&
+    originalCandidates.every(
+      (candidate) => candidate.value.length <= MAX_SIMULATED_TOOL_RESULT_CHARS,
+    )
+  ) {
+    return compactPrompt;
+  }
+
+  // Codex continuations can contain a very large shell/diff result. Keep the
+  // request valid JSON and retain the call/result item, but shorten only the
+  // result body. The real user message, instructions, tool declarations, call
+  // IDs, and the useful head/tail of the result remain intact.
+  const reducedRequest = cloneJsonValue(requestJson);
+  if (!isJsonObject(reducedRequest)) {
+    return compactPrompt;
+  }
+  const candidates = collectReducibleToolResults(reducedRequest).sort(
+    (left, right) => right.value.length - left.value.length,
+  );
+  for (const candidate of candidates) {
+    if (candidate.value.length <= MAX_SIMULATED_TOOL_RESULT_CHARS) continue;
+    candidate.owner[candidate.key] = truncateToolResult(
+      candidate.value,
+      MAX_SIMULATED_TOOL_RESULT_CHARS,
+    );
+    candidate.value = candidate.owner[candidate.key] as string;
+  }
+  let reducedPrompt = render(reducedRequest, true);
+  for (const candidate of candidates) {
+    if (reducedPrompt.length <= maxChars) {
+      break;
+    }
+    const excess = reducedPrompt.length - maxChars;
+    const targetChars = Math.max(2_048, candidate.value.length - excess - 128);
+    if (targetChars >= candidate.value.length) {
+      continue;
+    }
+    candidate.owner[candidate.key] = truncateToolResult(
+      candidate.value,
+      targetChars,
+    );
+    reducedPrompt = render(reducedRequest, true);
+  }
+  return reducedPrompt;
+}
+
+type ReducibleToolResult = {
+  owner: JsonObject;
+  key: "content" | "output";
+  value: string;
+};
+
+function collectReducibleToolResults(
+  requestJson: JsonObject,
+): ReducibleToolResult[] {
+  const results: ReducibleToolResult[] = [];
+  const input = requestJson.input;
+  if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!isJsonObject(item)) continue;
+      const type = (tryGetString(item, "type") ?? "").toLowerCase();
+      if (
+        (type === "function_call_output" ||
+          type === "custom_tool_call_output") &&
+        typeof item.output === "string"
+      ) {
+        results.push({ owner: item, key: "output", value: item.output });
+      }
+    }
+  }
+  const messages = requestJson.messages;
+  if (Array.isArray(messages)) {
+    for (const message of messages) {
+      if (
+        isJsonObject(message) &&
+        (tryGetString(message, "role") ?? "").toLowerCase() === "tool" &&
+        typeof message.content === "string"
+      ) {
+        results.push({
+          owner: message,
+          key: "content",
+          value: message.content,
+        });
+      }
+    }
+  }
+  return results;
+}
+
+function truncateToolResult(value: string, maxChars: number): string {
+  const removed = value.length - maxChars;
+  const marker = `\n\n[... ${removed} characters omitted from oversized tool result ...]\n\n`;
+  const retained = Math.max(0, maxChars - marker.length);
+  const headChars = Math.ceil(retained / 2);
+  const tailChars = retained - headChars;
+  return (
+    value.slice(0, headChars) +
+    marker +
+    value.slice(value.length - tailChars)
+  );
 }
 
 function shouldRequireInitialLocalToolCall(

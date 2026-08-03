@@ -152,6 +152,77 @@ describe("simulated transform mode proxy flow", () => {
     ]);
   });
 
+  test(
+    "responses compacts oversized tool output without losing turn structure",
+    () => {
+      const options = createOptions();
+      options.substrate.truncateBeforeSending = true;
+      options.substrate.maxSendChars = 6_000;
+      const toolOutput = `RESULT-HEAD\n${"x".repeat(20_000)}\nRESULT-TAIL`;
+      const parsed = tryParseResponsesRequest(
+        {
+          model: "gpt-5.6-sol",
+          previous_response_id: "resp_previous",
+          input: [
+            {
+              type: "function_call_output",
+              call_id: "call_oversized",
+              output: toolOutput,
+            },
+            {
+              type: "message",
+              role: "user",
+              content: "Continue using the command evidence.",
+            },
+          ],
+        },
+        options,
+      );
+
+      expect(parsed.ok).toBeTrue();
+      if (!parsed.ok) return;
+      const prompt = parsed.request.base.promptText;
+      expect(prompt.length).toBeLessThanOrEqual(6_000);
+      expect(prompt).toContain('"call_id":"call_oversized"');
+      expect(prompt).toContain("RESULT-HEAD");
+      expect(prompt).toContain("RESULT-TAIL");
+      expect(prompt).toContain(
+        "characters omitted from oversized tool result",
+      );
+      expect(prompt).toContain("Continue using the command evidence.");
+      expect(prompt).toContain('"previous_response_id":"resp_previous"');
+    },
+  );
+
+  test("responses caps one huge tool result below the whole-prompt ceiling", () => {
+    const options = createOptions();
+    options.substrate.truncateBeforeSending = true;
+    options.substrate.maxSendChars = 500_000;
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        input: [
+          {
+            type: "function_call_output",
+            call_id: "call_huge",
+            output: `HEAD-${"x".repeat(520_000)}-TAIL`,
+          },
+          { type: "message", role: "user", content: "Continue." },
+        ],
+      },
+      options,
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.base.promptText.length).toBeLessThan(50_000);
+    expect(parsed.request.base.promptText).toContain("HEAD-");
+    expect(parsed.request.base.promptText).toContain("-TAIL");
+    expect(parsed.request.base.promptText).toContain(
+      "characters omitted from oversized tool result",
+    );
+  });
+
   test("GET /v1/models returns all supported models", async () => {
     const app = createProxyApp(
       createServices((conversationId, payload) =>

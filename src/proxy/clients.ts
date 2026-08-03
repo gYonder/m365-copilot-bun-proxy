@@ -1064,14 +1064,24 @@ export function truncateSubstrateSendText(
       "Substrate prompt limit is too small to preserve required context safely.",
     );
   }
-  const userBoundary = text.lastIndexOf("\n\nUser: " );
+  const userBoundary = text.lastIndexOf("\n\nUser: ");
   const requiredTail = userBoundary >= 0 ? text.slice(userBoundary) : text;
+  const budget = maxChars - marker.length;
   if (requiredTail.length + marker.length >= maxChars) {
-    throw new Error(
-      "Substrate prompt cannot be reduced without truncating the current user turn.",
+    if (userBoundary >= 0) {
+      throw new Error(
+        "Substrate prompt cannot be reduced without truncating the current user turn.",
+      );
+    }
+    // Unstructured callers have no reliable user boundary. Preserve both the
+    // request instructions and its tail instead of silently discarding either.
+    const headChars = Math.floor(budget * 0.35);
+    return (
+      text.slice(0, headChars) +
+      marker +
+      text.slice(text.length - (budget - headChars))
     );
   }
-  const budget = maxChars - marker.length;
   const tailChars = Math.max(requiredTail.length, Math.ceil(budget * 0.65));
   const headChars = budget - tailChars;
   return (

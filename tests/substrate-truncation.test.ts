@@ -33,7 +33,7 @@ describe("truncateSubstrateSendText", () => {
     );
   });
 
-  test("never truncates the current user turn", () => {
+  test("never truncates a structurally identified current user turn", () => {
     const text =
       "System: keep this instruction.\n\nContext:\n" +
       "x".repeat(2_000) +
@@ -42,5 +42,13 @@ describe("truncateSubstrateSendText", () => {
     expect(() => truncateSubstrateSendText(text, 500, true)).toThrow(
       "without truncating the current user turn",
     );
+  });
+
+  test("preserves both ends for an unstructured oversized prompt", () => {
+    const text = `INSTRUCTIONS:${"x".repeat(2_000)}:REQUEST-TAIL`;
+    const result = truncateSubstrateSendText(text, 500, true);
+    expect(result.length).toBeLessThanOrEqual(500);
+    expect(result.startsWith("INSTRUCTIONS:")).toBeTrue();
+    expect(result.endsWith(":REQUEST-TAIL")).toBeTrue();
   });
 });
