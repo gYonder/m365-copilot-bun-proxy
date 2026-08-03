@@ -1069,7 +1069,7 @@ function resolveTimeZoneOffsetMinutes(timeZoneId: string): number {
   }
 }
 
-function splitFrames(payload: string): string[] {
+export function splitFrames(payload: string): string[] {
   return payload
     .split("\u001e")
     .map((frame) => frame.trim())
@@ -1139,7 +1139,7 @@ async function connectWithAbort(
   });
 }
 
-async function connectWebSocket(
+export async function connectWebSocket(
   url: URL,
   origin: string | undefined,
   timeoutMs: number,
@@ -1191,7 +1191,7 @@ async function connectWebSocket(
   });
 }
 
-async function sendFrame(
+export async function sendFrame(
   ws: WebSocket,
   requestUri: URL,
   logger: DebugMarkdownLogger,
@@ -1219,7 +1219,7 @@ async function sendFrame(
   });
 }
 
-function createWebSocketReceiver(ws: WebSocket): {
+export function createWebSocketReceiver(ws: WebSocket): {
   next: (timeoutMs: number) => Promise<string | null>;
   dispose: () => void;
 } {

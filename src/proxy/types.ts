@@ -256,4 +256,15 @@ export type WrapperOptions = {
   logStdout: boolean;
   confabRetries: number;
   msalAuth: boolean;
+  imageGeneration: ImageGenerationOptions;
+};
+
+export type ImageGenerationOptions = {
+  enabled: boolean;
+  maxPromptChars: number;
+  maxImages: number;
+  maxArtifactBytes: number;
+  timeoutMs: number;
+  concurrencyLimit: number;
+  allowedMimeTypes: string[];
 };

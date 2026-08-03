@@ -1,6 +1,8 @@
 import { fetchTokenWithPlaywright } from "../cli/playwright-token";
 import {
+  acquireDesignerToken,
   acquireSubstrateToken,
+  isValidDesignerToken,
   isValidSubstrateToken,
   type MsalTokenResult,
 } from "../cli/msal-auth";
@@ -22,6 +24,7 @@ type TokenProviderDependencies = {
   loadToken: typeof loadToken;
   saveToken: typeof saveToken;
   acquireSubstrateToken: typeof acquireSubstrateToken;
+  acquireDesignerToken: typeof acquireDesignerToken;
   fetchTokenWithPlaywright: typeof fetchTokenWithPlaywright;
 };
 
@@ -31,6 +34,7 @@ const defaultDependencies: TokenProviderDependencies = {
   loadToken,
   saveToken,
   acquireSubstrateToken,
+  acquireDesignerToken,
   fetchTokenWithPlaywright,
 };
 
@@ -42,6 +46,9 @@ export class ProxyTokenProvider {
   private readonly msalAuthEnabled: boolean;
   private readonly dependencies: TokenProviderDependencies;
   private inFlightAcquirePromise: Promise<string | null> | null = null;
+  private inFlightDesignerAcquirePromise: Promise<string | null> | null = null;
+  private designerAuthorizationHeader: string | null = null;
+  private designerExpiresAtMs = 0;
 
   constructor(options?: {
     ignoreIncomingAuthorizationHeader?: boolean;
@@ -75,6 +82,47 @@ export class ProxyTokenProvider {
     }
 
     return this.acquireAuthorizationHeader();
+  }
+
+  async resolveDesignerAuthorizationHeader(): Promise<string | null> {
+    if (
+      this.designerAuthorizationHeader &&
+      this.designerExpiresAtMs > Date.now() + TOKEN_EXPIRY_SKEW_MS
+    ) {
+      return this.designerAuthorizationHeader;
+    }
+    const pending =
+      this.inFlightDesignerAcquirePromise ??
+      this.acquireDesignerAuthorizationHeader();
+    if (!this.inFlightDesignerAcquirePromise) {
+      this.inFlightDesignerAcquirePromise = pending;
+    }
+    try {
+      return await pending;
+    } finally {
+      if (this.inFlightDesignerAcquirePromise === pending) {
+        this.inFlightDesignerAcquirePromise = null;
+      }
+    }
+  }
+
+  private async acquireDesignerAuthorizationHeader(): Promise<string | null> {
+    if (!this.msalAuthEnabled) return null;
+    try {
+      const result = await this.dependencies.acquireDesignerToken({
+        browserStatePath: await this.browserStatePathPromise,
+        browser: this.playwrightBrowser,
+        allowInteractive: false,
+        headless: true,
+        quiet: true,
+      });
+      if (!result || !isValidDesignerToken(result)) return null;
+      this.designerAuthorizationHeader = "Bearer " + result.token;
+      this.designerExpiresAtMs = result.expiresAtUtc.getTime();
+      return this.designerAuthorizationHeader;
+    } catch {
+      return null;
+    }
   }
 
   private async tryGetCachedAuthorizationHeader(): Promise<string | null> {

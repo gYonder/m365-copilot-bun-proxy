@@ -13,6 +13,10 @@ import { ProxyVizTraceStore } from "./viz-trace-store";
 import type { WrapperOptions } from "./types";
 import { parseListenUrl } from "./utils";
 import { SubstrateSessionStore } from "./substrate-session-store";
+import {
+  DesignerSubstrateImageTransport,
+  ImageGenerationService,
+} from "./image-generation";
 
 const loadedOptions = await loadWrapperOptions(process.cwd());
 const debugEnabled = parseDebugFlag();
@@ -41,6 +45,11 @@ const tokenProvider = new ProxyTokenProvider({
   playwrightBrowser: options.playwrightBrowser,
   msalAuthEnabled: options.msalAuth,
 });
+const imageGenerationService = new ImageGenerationService(
+  options.imageGeneration,
+  tokenProvider,
+  new DesignerSubstrateImageTransport(options, debugLogger),
+);
 
 const app = createProxyApp({
   options,
@@ -51,6 +60,7 @@ const app = createProxyApp({
   responseStore,
   tokenProvider,
   vizTraceStore,
+  imageGenerationService,
 });
 
 const listen = parseListenUrl(options.listenUrl);

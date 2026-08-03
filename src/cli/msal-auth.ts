@@ -21,6 +21,11 @@ const SCOPES = [
   "https://substrate.office.com/sydney/M365Chat.Read",
   "https://substrate.office.com/sydney/sydney.readwrite",
 ];
+const DESIGNER_SCOPES = ["https://designer.microsoft.com/.default"];
+const DESIGNER_AUDIENCES = new Set([
+  "https://designer.microsoft.com",
+  "designer.microsoft.com",
+]);
 const TOKEN_EXPIRY_SKEW_MS = 60_000;
 const SUBSTRATE_AUDIENCE = "https://substrate.office.com";
 const SYDNEY_AUDIENCE = "https://substrate.office.com/sydney";
@@ -42,6 +47,8 @@ export type MsalAcquireOptions = {
   quiet?: boolean;
   appFactory?: () => MsalPublicClient;
 };
+
+export type DesignerAcquireOptions = Omit<MsalAcquireOptions, "tokenPath">;
 
 type MsalTokenCache = {
   deserialize(value: string): void;
@@ -137,6 +144,64 @@ export function isValidSubstrateToken(
     !!tid &&
     (!requiredTenantId || tid === requiredTenantId) &&
     SCOPES.every((scope) => scopes.has(scope.split("/").at(-1) ?? scope));
+}
+
+export function isValidDesignerToken(result: MsalTokenResult): boolean {
+  const claims = decodeJwtClaims(result.token);
+  if (!claims) return false;
+  const audience =
+    typeof claims.aud === "string"
+      ? claims.aud.toLowerCase().replace(/\/$/, "")
+      : "";
+  const expiry = typeof claims.exp === "number" ? claims.exp * 1000 : 0;
+  return (
+    DESIGNER_AUDIENCES.has(audience) &&
+    expiry > Date.now() + TOKEN_EXPIRY_SKEW_MS
+  );
+}
+
+export async function acquireDesignerToken(
+  options: DesignerAcquireOptions = {},
+): Promise<MsalTokenResult | null> {
+  const substrateCachePath = await getMsalCachePath();
+  const cachePath =
+    options.cachePath ??
+    path.join(path.dirname(substrateCachePath), "msal-designer-cache.json");
+  const app =
+    options.appFactory?.() ??
+    new msal.PublicClientApplication({
+      auth: { clientId: CLIENT_ID, authority: AUTHORITY },
+    });
+
+  if (await fileExists(cachePath)) {
+    try {
+      await fs.chmod(cachePath, 0o600);
+      app.getTokenCache().deserialize(await fs.readFile(cachePath, "utf8"));
+    } catch {
+      // The Designer cache is isolated from the Sydney cache and can be reseeded.
+    }
+  }
+
+  let accounts: msal.AccountInfo[];
+  try {
+    accounts = await app.getTokenCache().getAllAccounts();
+  } catch {
+    return null;
+  }
+  if (accounts.length !== 1) return null;
+
+  try {
+    const acquired = await app.acquireTokenSilent({
+      scopes: DESIGNER_SCOPES,
+      account: accounts[0],
+    });
+    const result = buildResult(acquired.accessToken, acquired.expiresOn ?? null);
+    if (!result || !isValidDesignerToken(result)) return null;
+    await writeOwnerOnlyAtomic(cachePath, app.getTokenCache().serialize());
+    return result;
+  } catch {
+    return null;
+  }
 }
 
 /**

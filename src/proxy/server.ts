@@ -75,6 +75,7 @@ import {
 } from "./types";
 import { ProxyTokenProvider } from "./token-provider";
 import { ProxyVizTraceStore } from "./viz-trace-store";
+import { ImageGenerationService } from "./image-generation";
 import {
   cloneJsonValue,
   extractGraphErrorMessage,
@@ -95,6 +96,7 @@ type Services = {
   responseStore: ResponseStore;
   tokenProvider: ProxyTokenProvider;
   vizTraceStore?: ProxyVizTraceStore;
+  imageGenerationService?: ImageGenerationService;
 };
 
 type TraceContext = {
@@ -124,6 +126,36 @@ export function createProxyApp(services: Services): Hono {
   app.post("/v1/responses", (c) => handleResponsesCreate(c.req.raw, services));
   app.post("/openai/v1/responses", (c) =>
     handleResponsesCreate(c.req.raw, services),
+  );
+  app.post("/v1/images/generations", (c) =>
+    services.imageGenerationService
+      ? services.imageGenerationService.create(c.req.raw)
+      : Response.json(
+          {
+            error: {
+              message: "Image generation is disabled.",
+              type: "invalid_request_error",
+              param: null,
+              code: "image_generation_disabled",
+            },
+          },
+          { status: 404 },
+        ),
+  );
+  app.post("/openai/v1/images/generations", (c) =>
+    services.imageGenerationService
+      ? services.imageGenerationService.create(c.req.raw)
+      : Response.json(
+          {
+            error: {
+              message: "Image generation is disabled.",
+              type: "invalid_request_error",
+              param: null,
+              code: "image_generation_disabled",
+            },
+          },
+          { status: 404 },
+        ),
   );
   app.get("/v1/responses", (c) => handleResponsesList(c.req.raw, services));
   app.get("/openai/v1/responses", (c) =>

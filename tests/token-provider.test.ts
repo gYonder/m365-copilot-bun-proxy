@@ -19,7 +19,55 @@ const state = (value: string) => ({
   oid: "object-a",
 });
 
+const designerToken = (overrides: Record<string, unknown> = {}) =>
+  token({
+    aud: "https://designer.microsoft.com",
+    scp: "Designer.ReadWrite",
+    ...overrides,
+  });
+
 describe("ProxyTokenProvider", () => {
+  test("acquires and caches a separate Designer-audience token", async () => {
+    const value = designerToken();
+    let acquisitions = 0;
+    const provider = new ProxyTokenProvider({ dependencies: {
+      getTokenPath: async () => "/token.json",
+      getBrowserStatePath: async () => "/browser.json",
+      loadToken: async () => null,
+      acquireDesignerToken: async () => {
+        acquisitions += 1;
+        return {
+          token: value,
+          expiresAtUtc: new Date(Date.now() + 3_600_000),
+          oid: "object-a",
+          tid: "tenant-a",
+        };
+      },
+    }});
+    expect(await provider.resolveDesignerAuthorizationHeader()).toBe(
+      "Bearer " + value,
+    );
+    expect(await provider.resolveDesignerAuthorizationHeader()).toBe(
+      "Bearer " + value,
+    );
+    expect(acquisitions).toBe(1);
+  });
+
+  test("rejects a Sydney token returned for the Designer audience", async () => {
+    const provider = new ProxyTokenProvider({ dependencies: {
+      getTokenPath: async () => "/token.json",
+      getBrowserStatePath: async () => "/browser.json",
+      loadToken: async () => null,
+      acquireDesignerToken: async () => ({
+        token: token(),
+        expiresAtUtc: new Date(Date.now() + 3_600_000),
+        oid: "object-a",
+        tid: "tenant-a",
+      }),
+    }});
+    expect(await provider.resolveDesignerAuthorizationHeader()).toBeNull();
+  });
+
   test("uses a validated cached Sydney token", async () => {
     const value = token();
     const provider = new ProxyTokenProvider({ dependencies: {

@@ -13,6 +13,15 @@
   "logStdout": false,
   "confabRetries": 1,
   "msalAuth": true,
+  "imageGeneration": {
+    "enabled": false,
+    "maxPromptChars": 4000,
+    "maxImages": 1,
+    "maxArtifactBytes": 20000000,
+    "timeoutMs": 120000,
+    "concurrencyLimit": 1,
+    "allowedMimeTypes": ["image/png", "image/jpeg", "image/webp"]
+  },
   "graphBaseUrl": "https://graph.microsoft.com",
   "createConversationPath": "/beta/copilot/conversations",
   "chatPathTemplate": "/beta/copilot/conversations/{conversationId}/chat",

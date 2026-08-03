@@ -190,6 +190,20 @@ const WrapperOptionsSchema = z.object({
   logStdout: z.boolean().default(false),
   confabRetries: z.number().int().min(0).default(1),
   msalAuth: z.boolean().default(true),
+  imageGeneration: z
+    .object({
+      enabled: z.boolean().default(false),
+      maxPromptChars: z.number().int().positive().default(4_000),
+      maxImages: z.number().int().min(1).max(4).default(1),
+      maxArtifactBytes: z.number().int().positive().default(20_000_000),
+      timeoutMs: z.number().int().positive().default(120_000),
+      concurrencyLimit: z.number().int().min(1).default(1),
+      allowedMimeTypes: z
+        .array(z.string())
+        .min(1)
+        .default(["image/png", "image/jpeg", "image/webp"]),
+    })
+    .default({}),
 });
 
 export async function loadWrapperOptions(cwd: string): Promise<WrapperOptions> {
