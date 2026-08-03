@@ -1,6 +1,7 @@
 import type { WrapperOptions } from "./types";
 import { createHash } from "node:crypto";
 import { DurableStateStore } from "./durable-state";
+import type { BridgeObservability } from "./observability";
 
 const MaxConversationEntries = 1_024;
 
@@ -12,6 +13,7 @@ export class ConversationStore {
   constructor(
     private readonly options: WrapperOptions,
     private readonly durable = new DurableStateStore(),
+    private readonly observability: BridgeObservability | null = null,
   ) {
     const now = Date.now();
     for (const [key, entry] of Object.entries(this.durable.state.conversations)) {
@@ -54,6 +56,10 @@ export class ConversationStore {
         break;
       }
       this.entries.delete(oldest.value);
+      this.observability?.record("store_eviction", {
+        store: "conversation",
+        reason: "lru",
+      });
     }
     this.durable.state.conversations[durableKey(key)] = {
       conversationId,
@@ -70,6 +76,10 @@ export class ConversationStore {
     for (const [key, value] of this.entries.entries()) {
       if (value.expiresAtUtc <= now) {
         this.entries.delete(key);
+        this.observability?.record("store_eviction", {
+          store: "conversation",
+          reason: "ttl",
+        });
       }
     }
   }

@@ -33,6 +33,7 @@ import {
 } from "./substrate-session-store";
 import { ConcurrencyLimiter } from "./concurrency";
 import { resolveSubstrateCapabilities } from "./substrate-capabilities";
+import type { BridgeObservability } from "./observability";
 export { resolveSubstrateTone } from "./substrate-capabilities";
 
 export class CopilotGraphClient {
@@ -196,6 +197,7 @@ export class CopilotSubstrateClient {
       options.substrate.concurrencyLimit ?? 0,
       options.substrate.acquireTimeoutMs ?? 0,
     ),
+    private readonly observability: BridgeObservability | null = null,
   ) {}
 
   createConversation(): CreateConversationResult {
@@ -257,8 +259,11 @@ export class CopilotSubstrateClient {
     taskDeadlineMs: number | null = null,
   ): Promise<ChatResult> {
     const sessionId = this.sessionStore.getOrCreate(conversationId);
+    const startedAtMs = Date.now();
+    const queueDepth =
+      this.sessionStore.queuedTurnCount + this.concurrencyLimiter.queueDepth;
     try {
-      return await this.sessionStore.runExclusive(
+      const result = await this.sessionStore.runExclusive(
         sessionId,
         async () => {
           const releaseSlot = await this.concurrencyLimiter.acquire(
@@ -283,8 +288,30 @@ export class CopilotSubstrateClient {
         signal,
         taskDeadlineMs,
       );
+      this.observability?.record("queue_wait", {
+        depth: queueDepth,
+        durationMs: Math.max(0, Date.now() - startedAtMs),
+        outcome: "acquired",
+      });
+      this.observability?.record("substrate_terminal", {
+        success: result.isSuccess,
+        statusCode: result.statusCode,
+        latencyMs: Math.max(0, Date.now() - startedAtMs),
+      });
+      if (result.statusCode === 499) {
+        this.observability?.record("cancellation", { phase: "substrate" });
+      }
+      return result;
     } catch (error) {
       if (error instanceof TurnQueueWaitError) {
+        this.observability?.record("queue_wait", {
+          depth: queueDepth,
+          durationMs: Math.max(0, Date.now() - startedAtMs),
+          outcome: error.reason,
+        });
+        if (error.reason === "cancelled") {
+          this.observability?.record("cancellation", { phase: "queue" });
+        }
         return buildFailure(
           error.reason === "cancelled"
             ? 499
@@ -471,6 +498,7 @@ export class CopilotSubstrateClient {
         clientRequestId,
         isStartOfSession,
         this.options,
+        this.observability,
       );
       if (onStreamUpdate) {
         await onStreamUpdate({
@@ -885,18 +913,28 @@ export function buildInvocationPayload(
   clientRequestId: string,
   isStartOfSession: boolean,
   options: WrapperOptions,
+  observability: BridgeObservability | null = null,
 ): JsonObject {
   const capabilities = resolveSubstrateCapabilities(
     request.model,
     options.substrate,
   );
+  const sendText = buildPromptWithAdditionalContext(request);
+  const truncatedSendText = truncateSubstrateSendText(
+    sendText,
+    options.substrate.maxSendChars ?? 0,
+    options.substrate.truncateBeforeSending ?? false,
+  );
+  if (truncatedSendText.length < sendText.length) {
+    observability?.record("truncation", {
+      originalChars: sendText.length,
+      retainedChars: truncatedSendText.length,
+      removedChars: sendText.length - truncatedSendText.length,
+    });
+  }
   const message: JsonObject = {
     author: "user",
-    text: truncateSubstrateSendText(
-      buildPromptWithAdditionalContext(request),
-      options.substrate.maxSendChars ?? 0,
-      options.substrate.truncateBeforeSending ?? false,
-    ),
+    text: truncatedSendText,
     inputMethod: "Keyboard",
     messageType: capabilities.messageType,
     requestId: clientRequestId,

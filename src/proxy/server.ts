@@ -76,6 +76,7 @@ import {
 import { ProxyTokenProvider } from "./token-provider";
 import { ProxyVizTraceStore } from "./viz-trace-store";
 import { ImageGenerationService } from "./image-generation";
+import { BridgeObservability } from "./observability";
 import {
   cloneJsonValue,
   extractGraphErrorMessage,
@@ -97,6 +98,7 @@ type Services = {
   tokenProvider: ProxyTokenProvider;
   vizTraceStore?: ProxyVizTraceStore;
   imageGenerationService?: ImageGenerationService;
+  observability?: BridgeObservability;
 };
 
 type TraceContext = {
@@ -113,6 +115,16 @@ export function createProxyApp(services: Services): Hono {
   const app = new Hono();
 
   app.get("/healthz", (c) => c.json(buildHealthResponse(services.options)));
+  app.get("/readyz", (c) =>
+    c.json(
+      services.observability?.readiness() ?? {
+        status: "ready",
+        eventSequence: 0,
+        events: {},
+        recentEvents: [],
+      },
+    ),
+  );
   app.get("/v1/models", (c) => c.json(buildModelsResponse()));
   app.get("/openai/v1/models", (c) => c.json(buildModelsResponse()));
   app.get("/__viz/traces/:traceId", (c) =>
@@ -933,6 +945,7 @@ async function handleResponsesCreate(
         );
         const existing = services.responseStore.tryGetInFlightResponse(identityKey);
         if (existing) {
+          services.observability?.record("dedup_hit", { kind: "in_flight" });
           const joined = (await existing).clone();
           joined.headers.set("x-m365-in-flight-replayed", "true");
           return joined;
@@ -943,6 +956,7 @@ async function handleResponsesCreate(
           execution,
         );
         if (registered !== execution) {
+          services.observability?.record("dedup_hit", { kind: "in_flight_race" });
           const joined = (await registered).clone();
           joined.headers.set("x-m365-in-flight-replayed", "true");
           return joined;
@@ -1089,6 +1103,9 @@ async function handleResponsesCreateOnce(
       ? null
       : responseStore.tryGetRequestReplay(requestHash);
   if (storedRequestReplay) {
+    services.observability?.record("dedup_hit", {
+      kind: isProtocolIdentity ? "protocol_replay" : "legacy_replay",
+    });
     responseHeaders.set(
       isProtocolIdentity
         ? "x-m365-protocol-identity-replayed"
@@ -2257,6 +2274,11 @@ async function retryConfabGiveUp(
   }
   const maxRetries = Math.max(0, services.options.confabRetries ?? 0);
   let result = initialResult;
+  services.observability?.record("attempt_outcome", {
+    attempt: 1,
+    success: initialResult.isSuccess,
+    statusCode: initialResult.statusCode,
+  });
   for (let attempt = 0; attempt < maxRetries; attempt += 1) {
     if (!result.isSuccess) {
       break;
@@ -2268,12 +2290,21 @@ async function retryConfabGiveUp(
     if (!looksLikeConfabGiveUp(assistantText)) {
       break;
     }
+    services.observability?.record("retry", {
+      reason: "confab_give_up",
+      retryCount: attempt + 1,
+    });
     const retryConversationId =
       services.substrateClient.createConversation().conversationId;
     if (!retryConversationId) {
       break;
     }
     const retryResult = await executeChatTurn(retryConversationId, true);
+    services.observability?.record("attempt_outcome", {
+      attempt: attempt + 2,
+      success: retryResult.isSuccess,
+      statusCode: retryResult.statusCode,
+    });
     if (!retryResult.isSuccess) {
       break;
     }

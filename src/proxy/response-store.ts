@@ -5,6 +5,7 @@ import type {
 } from "./types";
 import { cloneJsonValue, nowUnix } from "./utils";
 import { DurableStateStore } from "./durable-state";
+import type { BridgeObservability } from "./observability";
 
 type ConversationLinkEntry = {
   conversationId: string;
@@ -41,6 +42,7 @@ export class ResponseStore {
   constructor(
     private readonly options: WrapperOptions,
     private readonly durable = new DurableStateStore(),
+    private readonly observability: BridgeObservability | null = null,
   ) {
     const now = Date.now();
     for (const [id, entry] of Object.entries(this.durable.state.responses)) {
@@ -72,14 +74,14 @@ export class ResponseStore {
       contextWindowId: contextWindowId ?? inferredContext.windowId,
     };
     this.entries.set(responseId, record);
-    trimOldest(this.entries, MaxStoredResponses);
+    this.trimOldest(this.entries, MaxStoredResponses, "response");
 
     if (conversationId?.trim()) {
       this.conversationLinks.set(responseId, {
         conversationId: conversationId.trim(),
         expiresAtUtc: record.expiresAtUtc,
       });
-      trimOldest(this.conversationLinks, MaxStoredResponses);
+      this.trimOldest(this.conversationLinks, MaxStoredResponses, "response_link");
       this.durable.state.responses[responseId] = {
         conversationId: conversationId.trim(),
         expiresAtUtc: record.expiresAtUtc,
@@ -160,7 +162,7 @@ export class ResponseStore {
       deadlineMs,
       expiresAtUtc: Math.max(deadlineMs, Date.now()) + RequestHashGuardTtlMs,
     });
-    trimOldest(this.taskDeadlines, MaxStoredResponses);
+    this.trimOldest(this.taskDeadlines, MaxStoredResponses, "task_deadline");
     return deadlineMs;
   }
 
@@ -319,7 +321,7 @@ export class ResponseStore {
       conversationId: conversationId?.trim() ? conversationId.trim() : null,
       response: cloneJsonValue(response),
     });
-    trimOldest(this.requestHashes, MaxRequestHashes);
+    this.trimOldest(this.requestHashes, MaxRequestHashes, "legacy_replay");
   }
 
   private resolveExpiryMs(): number {
@@ -340,6 +342,7 @@ export class ResponseStore {
         if (entry.expiresAtUtc <= now) {
           this.entries.delete(id);
           this.conversationLinks.delete(id);
+          this.recordEviction("response", "ttl");
         }
       }
     }
@@ -349,6 +352,7 @@ export class ResponseStore {
       for (const [id, entry] of this.conversationLinks.entries()) {
         if (entry.expiresAtUtc <= now) {
           this.conversationLinks.delete(id);
+          this.recordEviction("response_link", "ttl");
         }
       }
     }
@@ -358,6 +362,7 @@ export class ResponseStore {
       for (const [hash, entry] of this.requestHashes.entries()) {
         if (entry.expiresAtUtc <= now) {
           this.requestHashes.delete(hash);
+          this.recordEviction("legacy_replay", "ttl");
         }
       }
     }
@@ -366,6 +371,7 @@ export class ResponseStore {
       for (const [key, entry] of this.taskDeadlines.entries()) {
         if (entry.expiresAtUtc <= now) {
           this.taskDeadlines.delete(key);
+          this.recordEviction("task_deadline", "ttl");
         }
       }
     }
@@ -374,11 +380,29 @@ export class ResponseStore {
       if (entry.expiresAtUtc <= now) {
         delete this.durable.state.replays[key];
         durableReplayChanged = true;
+        this.recordEviction("protocol_replay", "ttl");
       }
     }
     if (durableReplayChanged) {
       this.durable.save();
     }
+  }
+
+  private trimOldest<K, V>(
+    entries: Map<K, V>,
+    maxEntries: number,
+    store: string,
+  ): void {
+    while (entries.size > maxEntries) {
+      const oldest = entries.keys().next();
+      if (oldest.done) return;
+      entries.delete(oldest.value);
+      this.recordEviction(store, "lru");
+    }
+  }
+
+  private recordEviction(store: string, reason: "ttl" | "lru"): void {
+    this.observability?.record("store_eviction", { store, reason });
   }
 }
 
@@ -400,16 +424,6 @@ function readContextUsage(response: JsonObject): {
     windowId:
       typeof windowId === "string" && windowId.trim() ? windowId.trim() : null,
   };
-}
-
-function trimOldest<K, V>(entries: Map<K, V>, maxEntries: number): void {
-  while (entries.size > maxEntries) {
-    const oldest = entries.keys().next();
-    if (oldest.done) {
-      return;
-    }
-    entries.delete(oldest.value);
-  }
 }
 
 function normalizeLimit(rawLimit: number): number {

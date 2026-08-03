@@ -17,6 +17,7 @@ import {
   DesignerSubstrateImageTransport,
   ImageGenerationService,
 } from "./image-generation";
+import { BridgeObservability } from "./observability";
 
 const loadedOptions = await loadWrapperOptions(process.cwd());
 const debugEnabled = parseDebugFlag();
@@ -25,6 +26,7 @@ if (debugEnabled && options.debugPath?.trim()) {
   await fs.mkdir(options.debugPath, { recursive: true });
 }
 const debugLogger = new DebugMarkdownLogger(options, debugEnabled);
+const observability = new BridgeObservability();
 const graphClient = new CopilotGraphClient(options, debugLogger);
 const durableState = new DurableStateStore();
 const substrateSessionStore = new SubstrateSessionStore(
@@ -36,19 +38,26 @@ const substrateClient = new CopilotSubstrateClient(
   options,
   debugLogger,
   substrateSessionStore,
+  undefined,
+  undefined,
+  undefined,
+  observability,
 );
-const conversationStore = new ConversationStore(options, durableState);
-const responseStore = new ResponseStore(options, durableState);
+const conversationStore = new ConversationStore(options, durableState, observability);
+const responseStore = new ResponseStore(options, durableState, observability);
 const vizTraceStore = new ProxyVizTraceStore(options.conversationTtlMinutes * 60);
 const tokenProvider = new ProxyTokenProvider({
   ignoreIncomingAuthorizationHeader: options.ignoreIncomingAuthorizationHeader,
   playwrightBrowser: options.playwrightBrowser,
   msalAuthEnabled: options.msalAuth,
+  observability,
 });
 const imageGenerationService = new ImageGenerationService(
   options.imageGeneration,
   tokenProvider,
   new DesignerSubstrateImageTransport(options, debugLogger),
+  undefined,
+  observability,
 );
 
 const app = createProxyApp({
@@ -61,6 +70,7 @@ const app = createProxyApp({
   tokenProvider,
   vizTraceStore,
   imageGenerationService,
+  observability,
 });
 
 const listen = parseListenUrl(options.listenUrl);

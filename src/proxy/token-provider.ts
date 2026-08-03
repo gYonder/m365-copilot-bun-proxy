@@ -15,6 +15,7 @@ import {
 } from "../cli/token-helpers";
 import { PlaywrightBrowsers, type PlaywrightBrowser } from "./types";
 import { normalizeBearerToken } from "./utils";
+import type { BridgeObservability } from "./observability";
 
 const TOKEN_EXPIRY_SKEW_MS = 60_000;
 
@@ -45,6 +46,7 @@ export class ProxyTokenProvider {
   private readonly playwrightBrowser: PlaywrightBrowser;
   private readonly msalAuthEnabled: boolean;
   private readonly dependencies: TokenProviderDependencies;
+  private readonly observability: BridgeObservability | null;
   private inFlightAcquirePromise: Promise<string | null> | null = null;
   private inFlightDesignerAcquirePromise: Promise<string | null> | null = null;
   private designerAuthorizationHeader: string | null = null;
@@ -55,6 +57,7 @@ export class ProxyTokenProvider {
     playwrightBrowser?: PlaywrightBrowser;
     msalAuthEnabled?: boolean;
     dependencies?: Partial<TokenProviderDependencies>;
+    observability?: BridgeObservability;
   }) {
     this.dependencies = { ...defaultDependencies, ...options?.dependencies };
     this.tokenPathPromise = this.dependencies.getTokenPath();
@@ -64,6 +67,7 @@ export class ProxyTokenProvider {
     this.playwrightBrowser =
       options?.playwrightBrowser ?? PlaywrightBrowsers.Edge;
     this.msalAuthEnabled = options?.msalAuthEnabled ?? true;
+    this.observability = options?.observability ?? null;
   }
 
   async resolveAuthorizationHeader(
@@ -72,12 +76,14 @@ export class ProxyTokenProvider {
     if (!this.ignoreIncomingAuthorizationHeader) {
       const providedHeader = normalizeBearerToken(rawAuthorizationHeader);
       if (providedHeader) {
+        this.recordAuthPath("incoming", true);
         return providedHeader;
       }
     }
 
     const cachedHeader = await this.tryGetCachedAuthorizationHeader();
     if (cachedHeader) {
+      this.recordAuthPath("persisted_cache", true);
       return cachedHeader;
     }
 
@@ -89,6 +95,7 @@ export class ProxyTokenProvider {
       this.designerAuthorizationHeader &&
       this.designerExpiresAtMs > Date.now() + TOKEN_EXPIRY_SKEW_MS
     ) {
+      this.recordAuthPath("designer_memory_cache", true, "designer");
       return this.designerAuthorizationHeader;
     }
     const pending =
@@ -107,7 +114,10 @@ export class ProxyTokenProvider {
   }
 
   private async acquireDesignerAuthorizationHeader(): Promise<string | null> {
-    if (!this.msalAuthEnabled) return null;
+    if (!this.msalAuthEnabled) {
+      this.recordAuthPath("designer_msal_disabled", false, "designer");
+      return null;
+    }
     try {
       const result = await this.dependencies.acquireDesignerToken({
         browserStatePath: await this.browserStatePathPromise,
@@ -116,11 +126,16 @@ export class ProxyTokenProvider {
         headless: true,
         quiet: true,
       });
-      if (!result || !isValidDesignerToken(result)) return null;
+      if (!result || !isValidDesignerToken(result)) {
+        this.recordAuthPath("designer_msal", false, "designer");
+        return null;
+      }
       this.designerAuthorizationHeader = "Bearer " + result.token;
       this.designerExpiresAtMs = result.expiresAtUtc.getTime();
+      this.recordAuthPath("designer_msal", true, "designer");
       return this.designerAuthorizationHeader;
     } catch {
+      this.recordAuthPath("designer_msal", false, "designer");
       return null;
     }
   }
@@ -164,8 +179,10 @@ export class ProxyTokenProvider {
         browserStatePath,
       );
       if (msalHeader) {
+        this.recordAuthPath("msal", true);
         return msalHeader;
       }
+      this.recordAuthPath("msal", false);
     }
 
     // Fallback: legacy Playwright cookie capture.
@@ -175,13 +192,17 @@ export class ProxyTokenProvider {
         browser: this.playwrightBrowser,
       });
     } catch {
+      this.recordAuthPath("playwright", false);
       return null;
     }
 
     const fetched = await this.dependencies.loadToken(tokenPath);
-    return isTokenStateValid(fetched) && isValidPersistedSubstrateToken(fetched)
-      ? `Bearer ${fetched.token}`
-      : null;
+    const playwrightHeader =
+      isTokenStateValid(fetched) && isValidPersistedSubstrateToken(fetched)
+        ? "Bearer " + fetched.token
+        : null;
+    this.recordAuthPath("playwright", playwrightHeader !== null);
+    return playwrightHeader;
   }
 
   private async tryAcquireViaMsal(
@@ -208,6 +229,14 @@ export class ProxyTokenProvider {
     } catch {
       return null;
     }
+  }
+
+  private recordAuthPath(
+    path: string,
+    success: boolean,
+    audience: "sydney" | "designer" = "sydney",
+  ): void {
+    this.observability?.record("auth_path", { path, success, audience });
   }
 }
 

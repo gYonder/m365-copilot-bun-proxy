@@ -21,6 +21,7 @@ import type {
   JsonValue,
   WrapperOptions,
 } from "./types";
+import type { BridgeObservability } from "./observability";
 
 export type ImageArtifact = {
   url: string;
@@ -234,6 +235,7 @@ export class ImageGenerationService {
     private readonly tokenProvider: ImageTokenProvider,
     private readonly transport: ImageGenerationTransport,
     private readonly fetchArtifact: ImageFetch = fetch,
+    private readonly observability: BridgeObservability | null = null,
   ) {
     this.limiter = new ConcurrencyLimiter(options.concurrencyLimit, options.timeoutMs);
   }
@@ -293,6 +295,11 @@ export class ImageGenerationService {
       if (artifacts.length !== count) {
         throw new ImageGenerationError(502, "incomplete_image_result", "M365 returned an incomplete image result.");
       }
+      this.observability?.record("image_quota", {
+        outcome: "success",
+        requestedCount: count,
+        returnedCount: artifacts.length,
+      });
 
       const data = [];
       for (const artifact of artifacts) {
@@ -311,16 +318,32 @@ export class ImageGenerationService {
       return Response.json({ created: Math.floor(Date.now() / 1000), data });
     } catch (error) {
       if (error instanceof ImageGenerationError) {
+        this.observability?.record("image_quota", {
+          outcome: "failure",
+          statusCode: error.statusCode,
+          code: error.code,
+        });
         return errorResponse(error.statusCode, error.code, error.message);
       }
       if (controller.signal.aborted) {
         const cancelled = request.signal.aborted;
+        this.observability?.record(
+          cancelled ? "cancellation" : "image_quota",
+          cancelled
+            ? { phase: "image_generation" }
+            : { outcome: "timeout", statusCode: 504 },
+        );
         return errorResponse(
           cancelled ? 499 : 504,
           cancelled ? "image_generation_cancelled" : "image_generation_timeout",
           cancelled ? "Image generation was cancelled." : "Image generation timed out.",
         );
       }
+      this.observability?.record("image_quota", {
+        outcome: "failure",
+        statusCode: 502,
+        code: "image_generation_failed",
+      });
       return errorResponse(502, "image_generation_failed", "M365 image generation failed.");
     } finally {
       release?.();
