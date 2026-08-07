@@ -1269,6 +1269,7 @@ async function handleResponsesCreateOnce(
     if (
       baseRequest.transformMode === OpenAiTransformModes.Simulated &&
       isInvalidSimulatedResponsesResult(
+        options,
         result,
         parsedRequest,
         conversationId!,
@@ -2865,6 +2866,15 @@ function shouldRetrySimulatedToollessResponsesPayload(
   if (hasSandboxLeak) {
     return true;
   }
+  // buildSimulatedPrompt marks initial local actions as mandatory even with
+  // tool_choice=auto. Treat a message-only payload as a recoverable protocol
+  // failure in that case, otherwise raw response JSON can reach Codex as prose
+  // and terminate the tool loop.
+  const requiresInitialLocalToolCall =
+    request.tooling.requiredByLocalAction === true;
+  if (requiresInitialLocalToolCall && (hasMessageText || Boolean(tryGetString(responseBody, "output_text")?.trim()))) {
+    return true;
+  }
   // Auto tool choice may legitimately finish with assistant text. Only
   // required/function choices must reject a tool-less final answer.
   if (
@@ -2929,6 +2939,7 @@ function shouldRetrySimulatedInvalidResponsesToolPayload(
 }
 
 function isInvalidSimulatedResponsesResult(
+  options: WrapperOptions,
   result: ChatResult,
   request: ParsedResponsesRequest,
   conversationId: string,
@@ -2953,9 +2964,18 @@ function isInvalidSimulatedResponsesResult(
     conversationId,
     includeConversationId,
   );
-  return shouldRetrySimulatedInvalidResponsesToolPayload(
-    normalized.responseBody,
-    request.base.tooling,
+  return (
+    !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
+    shouldRetrySimulatedInvalidResponsesToolPayload(
+      normalized.responseBody,
+      request.base.tooling,
+    ) ||
+    (request.base.tooling.requiredByLocalAction === true &&
+      shouldRetrySimulatedToollessResponsesPayload(
+        options,
+        request.base,
+        normalized.responseBody,
+      ))
   );
 }
 

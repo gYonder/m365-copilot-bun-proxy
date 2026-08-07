@@ -671,10 +671,10 @@ function shouldRequireInitialLocalToolCall(
   if (!latestUserText.trim()) {
     return false;
   }
-  const hasLocalAction = /\b(local shell\/file tools|local shell|file tools|read|inspect|write|create|edit|modify|delete|verify|cat|list|run|execute|pwd|commit|stage|git)\b/.test(
+  const hasLocalAction = /\b(local shell\/file tools|local shell|file tools|read|inspect|write|create|edit|modify|delete|verify|copy|place|put|clipboard|pbcopy|cat|list|run|execute|pwd|commit|stage|git)\b/.test(
     latestUserText,
   );
-  const hasLocalTarget = /\b(file|files|workspace|shell|repo|repository|directory|working directory|cwd|pwd|git|commit|docs?|releases?|markdown|md|txt)\b|\.[a-z0-9]{1,8}\b/.test(
+  const hasLocalTarget = /\b(file|files|workspace|shell|repo|repository|directory|working directory|cwd|pwd|git|commit|clipboard|previous output|previous response|previous assistant response|docs?|releases?|markdown|md|txt)\b|\.[a-z0-9]{1,8}\b/.test(
     latestUserText,
   );
   return hasLocalAction && hasLocalTarget;
@@ -691,6 +691,7 @@ function requireLocalToolingIfNeeded(
     ...tooling,
     toolChoiceMode: ToolChoiceModes.Required,
     toolChoiceFunctionName: null,
+    requiredByLocalAction: true,
   };
 }
 
@@ -1277,6 +1278,7 @@ function parseTooling(requestJson: JsonObject): OpenAiTooling {
     toolChoiceFunctionName,
     parallelToolCalls:
       tryGetBoolean(requestJson, "parallel_tool_calls") !== false,
+    requiredByLocalAction: false,
   };
 }
 

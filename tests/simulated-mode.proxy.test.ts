@@ -2909,6 +2909,91 @@ describe("simulated transform mode proxy flow", () => {
     );
   });
 
+  test("responses simulated prompt treats copying previous output to the clipboard as a local tool action", async () => {
+    const capturedPrompts: string[] = [];
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        capturedPrompts.push(readPrompt(payload));
+        callCount += 1;
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson(
+            callCount === 1
+              ? {
+                  id: "resp_clipboard_text_only",
+                  object: "response",
+                  status: "completed",
+                  output: [
+                    {
+                      type: "message",
+                      role: "assistant",
+                      content: [{ type: "output_text", text: "Copied it." }],
+                    },
+                  ],
+                  output_text: "Copied it.",
+                }
+              : {
+                  id: "resp_clipboard_tool",
+                  object: "response",
+                  status: "completed",
+                  output: [
+                    {
+                      type: "function_call",
+                      call_id: "call_clipboard",
+                      name: "exec_command",
+                      arguments: "{\"cmd\":\"pbcopy < output.txt\"}",
+                    },
+                  ],
+                },
+          ),
+        );
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Place the entire previous output in my clipboard.",
+          tools: [
+            {
+              type: "function",
+              name: "exec_command",
+              description: "Run a command",
+              parameters: {
+                type: "object",
+                properties: { cmd: { type: "string" } },
+                required: ["cmd"],
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(2);
+    expect(capturedPrompts[0]).toContain(
+      "This request requires at least one tool call.",
+    );
+    const body = (await response.json()) as JsonObject;
+    const output = Array.isArray(body.output) ? body.output : [];
+    expect(output[0]).toMatchObject({
+      type: "function_call",
+      call_id: "call_clipboard",
+      name: "exec_command",
+    });
+  });
+
   test("responses simulated prompt preserves mcp-like tool names", async () => {
     let capturedPrompt = "";
     const app = createProxyApp(

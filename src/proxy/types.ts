@@ -72,6 +72,7 @@ export type OpenAiTooling = {
   toolChoiceMode: string;
   toolChoiceFunctionName: string | null;
   parallelToolCalls: boolean;
+  requiredByLocalAction?: boolean;
 };
 
 export type OpenAiResponseFormat = {
