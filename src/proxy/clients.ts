@@ -1407,7 +1407,9 @@ export function buildInvocationPayload(
       deviceType: options.substrate.deviceType?.trim() || "Desktop",
     },
     message,
-    plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }],
+    plugins: request.hostedWebSearch
+      ? [{ Id: "BingWebSearch", Source: "BuiltIn" }]
+      : [],
     isSbsSupported: true,
     renderReferencesBehindEOS: true,
     // Verified against the live substrate: `disconnectBehavior: "stop"` is

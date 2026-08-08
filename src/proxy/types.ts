@@ -99,6 +99,7 @@ export type ParsedOpenAiRequest = {
   model: string;
   stream: boolean;
   transformMode: string;
+  hostedWebSearch?: boolean;
   promptText: string;
   userKey: string | null;
   locationHint: JsonObject;

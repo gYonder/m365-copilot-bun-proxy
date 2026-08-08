@@ -11,6 +11,7 @@ import {
   ContextEstimatorVersion,
   estimateResponsesContext,
 } from "./context-accounting";
+import { stripPrivateCitationMarkers } from "./responses-provenance";
 
 export function createOpenAiResponseId(): string {
   return `resp_${randomUUID().replaceAll("-", "")}`;
@@ -30,6 +31,7 @@ export function buildOpenAiResponseFromAssistant(
   includeConversationId: boolean,
   conversationId: string,
   contextInputTokens?: number,
+  annotations: JsonObject[] = [],
 ): JsonObject {
   const output =
     assistantResponse.toolCalls.length > 0
@@ -39,6 +41,7 @@ export function buildOpenAiResponseFromAssistant(
             createOpenAiOutputItemId("msg"),
             assistantResponse.content ?? "",
             "completed",
+            annotations,
           ),
         ];
 
@@ -101,13 +104,20 @@ export function buildMessageOutputItem(
   itemId: string,
   text: string,
   status: string,
+  annotations: JsonObject[] = [],
 ): JsonObject {
   return {
     id: itemId,
     type: "message",
     status,
     role: "assistant",
-    content: [{ type: "output_text", text, annotations: [] }],
+    content: [
+      {
+        type: "output_text",
+        text: stripPrivateCitationMarkers(text),
+        annotations: cloneJsonValue(annotations),
+      },
+    ],
   };
 }
 
@@ -175,7 +185,7 @@ export function buildResponseContentPartAddedEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    part: cloneJsonValue(part),
+    part: sanitizeOutputTextPart(part),
   };
 }
 
@@ -192,7 +202,7 @@ export function buildResponseOutputTextDeltaEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    delta,
+    delta: stripPrivateCitationMarkers(delta),
   };
 }
 
@@ -209,7 +219,7 @@ export function buildResponseOutputTextDoneEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    text,
+    text: stripPrivateCitationMarkers(text),
   };
 }
 
@@ -226,7 +236,7 @@ export function buildResponseContentPartDoneEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    part: cloneJsonValue(part),
+    part: sanitizeOutputTextPart(part),
   };
 }
 
@@ -396,6 +406,19 @@ function buildResponseWebSearchCallEvent(
     output_index: outputIndex,
     ...(itemId ? { item_id: itemId } : {}),
     ...(item ? { item: cloneJsonValue(item) } : {}),
+  };
+}
+
+function sanitizeOutputTextPart(part: JsonObject): JsonObject {
+  if (
+    part.type !== "output_text" ||
+    typeof part.text !== "string"
+  ) {
+    return cloneJsonValue(part);
+  }
+  return {
+    ...cloneJsonValue(part),
+    text: stripPrivateCitationMarkers(part.text),
   };
 }
 

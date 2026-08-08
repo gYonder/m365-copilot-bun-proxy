@@ -96,6 +96,11 @@ import {
   tryParseJsonObject,
   tryReadJsonPayload,
 } from "./utils";
+import {
+  decodeSubstrateUrlCitations,
+  IncrementalPrivateCitationMarkerSanitizer,
+  stripPrivateCitationMarkers,
+} from "./responses-provenance";
 
 type Services = {
   options: WrapperOptions;
@@ -527,6 +532,9 @@ async function handleChat(
     options,
     transport: selectedTransport,
   });
+  // Bind the already-derived profile bit so every substrate entry point uses
+  // the same request decision without re-detecting hosted search.
+  parsedRequest.hostedWebSearch = requestProfile.hostedWebSearch;
   const responseHeaders = new Headers({
     "x-m365-transport": selectedTransport,
   });
@@ -1121,6 +1129,7 @@ async function handleResponsesCreateOnce(
     options,
     transport: selectedTransport,
   });
+  baseRequest.hostedWebSearch = requestProfile.hostedWebSearch;
   const responseHeaders = new Headers({
     "x-m365-transport": selectedTransport,
   });
@@ -1491,6 +1500,10 @@ async function handleResponsesCreateOnce(
         parsedRequest,
         conversationId,
         assistantResponse,
+        decodeSubstrateUrlCitations(
+          buffered.upstreamResponsePayload,
+          stripPrivateCitationMarkers(assistantText),
+        ),
         responseId,
         responseHeaders,
         trace,
@@ -1707,6 +1720,11 @@ async function handleResponsesCreateOnce(
     assistantResponse,
     options.includeConversationIdInResponseBody,
     conversationId,
+    undefined,
+    decodeSubstrateUrlCitations(
+      chatResponse.upstreamResponsePayload,
+      stripPrivateCitationMarkers(assistantText),
+    ),
   );
   const toolLedgerFailure = issueResponsesToolCalls(
     responseStore,
@@ -2137,6 +2155,7 @@ async function buildBufferedResponsesStreamResponse(
   parsedRequest: ParsedResponsesRequest,
   conversationId: string,
   assistantResponse: ReturnType<typeof buildAssistantResponse>,
+  annotations: JsonObject[],
   responseId: string,
   headers: Headers,
   trace: TraceContext | null,
@@ -2174,6 +2193,7 @@ async function buildBufferedResponsesStreamResponse(
                   createOpenAiOutputItemId("msg"),
                   assistantResponse.content ?? "",
                   "completed",
+                  annotations,
                 ),
               ];
 
@@ -2216,7 +2236,7 @@ async function buildBufferedResponsesStreamResponse(
               responseId,
               index,
               String(item.id ?? ""),
-              { type: "output_text", text: content },
+              { type: "output_text", text: content, annotations },
             );
           } else if (item.type === "custom_tool_call") {
             const input = tryGetString(item, "input") ?? "";
@@ -4382,6 +4402,8 @@ async function streamSubstrateAsResponses(
     start: async (controller) => {
       const encoder = new TextEncoder();
       const writer = createResponsesEventWriter(controller, encoder);
+      const textSanitizer = new IncrementalPrivateCitationMarkerSanitizer();
+      let emittedUserFacingText = "";
 
       const inProgress = buildOpenAiResponseObject(
         responseId,
@@ -4424,12 +4446,11 @@ async function streamSubstrateAsResponses(
               return;
             }
             emitted += update.deltaText;
-            writer.outputTextDelta(
-              responseId,
-              0,
-              messageItemId,
-              update.deltaText,
-            );
+            const safeDelta = textSanitizer.push(update.deltaText);
+            if (safeDelta) {
+              emittedUserFacingText += safeDelta;
+              writer.outputTextDelta(responseId, 0, messageItemId, safeDelta);
+            }
           },
           signal,
           taskDeadlineMs,
@@ -4470,7 +4491,13 @@ async function streamSubstrateAsResponses(
               createdAt,
               parsedRequest.base.model,
               "in_progress",
-              [buildMessageOutputItem(messageItemId, emitted, "in_progress")],
+              [
+                buildMessageOutputItem(
+                  messageItemId,
+                  emittedUserFacingText,
+                  "in_progress",
+                ),
+              ],
               parsedRequest,
               includeConversationId ? conversationId : null,
             ),
@@ -4493,22 +4520,42 @@ async function streamSubstrateAsResponses(
         const trailing = computeTrailingDelta(emitted, assistantText);
         if (trailing) {
           emitted += trailing;
+          const safeDelta = textSanitizer.push(trailing);
+          if (safeDelta) {
+            emittedUserFacingText += safeDelta;
+            writer.outputTextDelta(responseId, 0, messageItemId, safeDelta);
+          }
+        }
+
+        const flushedText = textSanitizer.finish();
+        if (flushedText) {
+          emittedUserFacingText += flushedText;
           writer.outputTextDelta(
             responseId,
             0,
             messageItemId,
-            trailing,
+            flushedText,
           );
         }
 
-        writer.outputTextDone(responseId, 0, messageItemId, emitted);
+        const userFacingText = emittedUserFacingText;
+        const annotations = decodeSubstrateUrlCitations(
+          substrateResponse.upstreamResponsePayload,
+          userFacingText,
+        );
+        writer.outputTextDone(responseId, 0, messageItemId, userFacingText);
         writer.contentPartDone(
           responseId,
           0,
           messageItemId,
-          { type: "output_text", text: emitted },
+          { type: "output_text", text: userFacingText, annotations },
         );
-        const outputItem = buildMessageOutputItem(messageItemId, emitted, "completed");
+        const outputItem = buildMessageOutputItem(
+          messageItemId,
+          userFacingText,
+          "completed",
+          annotations,
+        );
         writer.outputItemDone(responseId, 0, outputItem);
 
         const completed = buildOpenAiResponseObject(
