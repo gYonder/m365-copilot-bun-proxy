@@ -59,6 +59,12 @@ export type ContextMessage = {
   description: string | null;
 };
 
+export type ParsedImageInput = {
+  dataUrl: string;
+  mimeType: string;
+  byteLength: number;
+};
+
 export type OpenAiToolDefinition = {
   name: string;
   type: "function" | "custom";
@@ -109,6 +115,7 @@ export type ParsedOpenAiRequest = {
   responseFormat: OpenAiResponseFormat | null;
   reasoningEffort: string | null;
   temperature: number | null;
+  images?: ParsedImageInput[];
 };
 
 export type ParsedResponsesRequest = {
@@ -232,6 +239,13 @@ export type SubstrateOptions = {
   acquireTimeoutMs?: number;
   maxSendChars?: number;
   truncateBeforeSending?: boolean;
+  imageUploadEnabled?: boolean;
+  maxImagesPerRequest?: number;
+  maxBytesPerImage?: number;
+  maxTotalImageBytes?: number;
+  allowedImageMimeTypes?: string[];
+  imageUploadUrl?: string;
+  imageUploadTimeoutMs?: number;
 };
 
 export type WrapperOptions = {

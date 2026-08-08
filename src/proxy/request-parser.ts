@@ -10,6 +10,7 @@ import {
   type OpenAiToolDefinition,
   type OpenAiTooling,
   type ParsedOpenAiRequest,
+  type ParsedImageInput,
   type ParsedResponsesRequest,
   type ResponsesProtocolIdentity,
   type WrapperOptions,
@@ -25,6 +26,7 @@ import {
   cloneJsonValue,
   tryParseJsonObject,
 } from "./utils";
+import { parseImageInputs } from "./image-input";
 
 const MAX_SIMULATED_TOOL_RESULT_CHARS = 40_000;
 
@@ -193,12 +195,17 @@ export function tryParseOpenAiRequest(
 ): { ok: true; request: ParsedOpenAiRequest } | { ok: false; error: string } {
   const transformMode = normalizeOpenAiTransformMode(options.openAiTransformMode);
   if (transformMode === OpenAiTransformModes.Simulated) {
+    const imageResult = parseCurrentTurnImages(requestJson, options);
+    if (!imageResult.ok) {
+      return { ok: false, error: imageResult.message };
+    }
     return {
       ok: true,
       request: buildSimulatedOpenAiRequest(
         requestJson,
         options,
         "chat.completions",
+        imageResult.images,
       ),
     };
   }
@@ -219,7 +226,12 @@ export function tryParseOpenAiRequest(
   const reasoningEffort = tryGetString(requestJson, "reasoning_effort");
   const temperature = tryGetDouble(requestJson, "temperature");
 
-  const messages: { role: string; content: string; index: number }[] = [];
+  const messages: {
+    role: string;
+    content: string;
+    index: number;
+    hasImage: boolean;
+  }[] = [];
   for (let index = 0; index < messagesNode.length; index++) {
     const message = messagesNode[index];
     if (!isJsonObject(message)) {
@@ -227,7 +239,8 @@ export function tryParseOpenAiRequest(
     }
 
     const role = (tryGetString(message, "role") ?? "user").toLowerCase();
-    let content = extractMessageContent(message.content, role);
+    let content = extractMessageContent(message.content);
+    const hasImage = hasImageContent(message.content);
 
     if (role === "assistant") {
       const assistantToolCalls = tryExtractAssistantToolCalls(message, content);
@@ -249,10 +262,10 @@ export function tryParseOpenAiRequest(
       }
     }
 
-    if (!content.trim()) {
+    if (!content.trim() && !hasImage) {
       continue;
     }
-    messages.push({ role, content: content.trim(), index });
+    messages.push({ role, content: content.trim(), index, hasImage });
   }
 
   if (messages.length === 0) {
@@ -263,11 +276,19 @@ export function tryParseOpenAiRequest(
   }
 
   const prompt = resolvePrompt(messages);
-  if (!prompt?.content?.trim()) {
+  if (!prompt || (!prompt.content.trim() && !prompt.hasImage)) {
     return {
       ok: false,
       error: "Unable to determine a prompt from the message list.",
     };
+  }
+  const promptMessage = messagesNode[prompt.index];
+  const imageResult = parseImageInputs(
+    isJsonObject(promptMessage) ? promptMessage.content : undefined,
+    imageInputLimits(options),
+  );
+  if (!imageResult.ok) {
+    return { ok: false, error: imageResult.message };
   }
 
   const stream = tryGetBoolean(requestJson, "stream") === true;
@@ -297,6 +318,7 @@ export function tryParseOpenAiRequest(
     responseFormat,
     reasoningEffort,
     temperature,
+    images: imageResult.images,
   };
 
   return { ok: true, request: parsedRequest };
@@ -327,10 +349,19 @@ export function tryParseResponsesRequest(
   const transformMode = normalizeOpenAiTransformMode(options.openAiTransformMode);
   if (transformMode === OpenAiTransformModes.Simulated) {
     const normalizedInput = normalizeResponsesInput(requestJson.input);
+    const imageResult = parseCurrentTurnImages(requestJson, options);
+    if (!imageResult.ok) {
+      return { ok: false, error: imageResult.message };
+    }
     return {
       ok: true,
       request: {
-        base: buildSimulatedOpenAiRequest(requestJson, options, "responses"),
+        base: buildSimulatedOpenAiRequest(
+          requestJson,
+          options,
+          "responses",
+          imageResult.images,
+        ),
         previousResponseId,
         protocolIdentity,
         inputItemsForStorage: normalizedInput.inputItemsForStorage,
@@ -446,6 +477,7 @@ function buildSimulatedOpenAiRequest(
   requestJson: JsonObject,
   options: WrapperOptions,
   endpointFormat: "chat.completions" | "responses",
+  images: ParsedImageInput[] = [],
 ): ParsedOpenAiRequest {
   const tooling = requireLocalToolingIfNeeded(
     requestJson,
@@ -461,7 +493,7 @@ function buildSimulatedOpenAiRequest(
     transformMode: OpenAiTransformModes.Simulated,
     promptText: buildSimulatedPrompt(
       endpointFormat,
-      requestJson,
+      images.length > 0 ? stripImageInputsFromPrompt(requestJson) : requestJson,
       tooling,
       options.substrate.truncateBeforeSending
         ? options.substrate.maxSendChars
@@ -475,7 +507,38 @@ function buildSimulatedOpenAiRequest(
     responseFormat: parseResponseFormat(requestJson),
     reasoningEffort: tryGetString(requestJson, "reasoning_effort"),
     temperature: tryGetDouble(requestJson, "temperature"),
+    images,
   };
+}
+
+function stripImageInputsFromPrompt(requestJson: JsonObject): JsonObject {
+  const sanitized = stripImageValue(requestJson);
+  if (isJsonObject(sanitized)) {
+    return sanitized;
+  }
+  return {};
+}
+
+function stripImageValue(value: JsonValue): JsonValue | null {
+  if (isImageContentPart(value)) {
+    return null;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map(stripImageValue)
+      .filter((item): item is JsonValue => item !== null);
+  }
+  if (!isJsonObject(value)) {
+    return value;
+  }
+  const result: JsonObject = {};
+  for (const [key, child] of Object.entries(value)) {
+    const sanitizedChild = stripImageValue(child);
+    if (sanitizedChild !== null) {
+      result[key] = sanitizedChild;
+    }
+  }
+  return result;
 }
 
 function buildSimulatedPrompt(
@@ -787,7 +850,7 @@ function extractLatestUserText(requestJson: JsonObject): string {
       const type = (tryGetString(item, "type") ?? "message").toLowerCase();
       const role = (tryGetString(item, "role") ?? "user").toLowerCase();
       if (type === "message" && role === "user") {
-        return extractMessageContent(item.content, role);
+        return extractMessageContent(item.content);
       }
     }
   }
@@ -801,7 +864,7 @@ function extractLatestUserText(requestJson: JsonObject): string {
       }
       const role = (tryGetString(message, "role") ?? "user").toLowerCase();
       if (role === "user") {
-        return extractMessageContent(message.content, role);
+        return extractMessageContent(message.content);
       }
     }
   }
@@ -809,8 +872,18 @@ function extractLatestUserText(requestJson: JsonObject): string {
 }
 
 function resolvePrompt(
-  messages: { role: string; content: string; index: number }[],
-): { role: string; content: string; index: number } | null {
+  messages: {
+    role: string;
+    content: string;
+    index: number;
+    hasImage: boolean;
+  }[],
+): {
+  role: string;
+  content: string;
+  index: number;
+  hasImage: boolean;
+} | null {
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
       return messages[i];
@@ -1007,10 +1080,7 @@ function normalizeFunctionArguments(value: JsonValue | undefined): string | null
   return JSON.stringify(value);
 }
 
-function extractMessageContent(
-  contentNode: JsonValue | undefined,
-  role: string,
-): string {
+function extractMessageContent(contentNode: JsonValue | undefined): string {
   if (contentNode === undefined || contentNode === null) {
     return "";
   }
@@ -1025,18 +1095,14 @@ function extractMessageContent(
       const normalized = normalizeJsonLikeString(directText);
       return normalized ?? directText;
     }
-    const imageFromObject = extractImageReference(contentNode);
-    if (imageFromObject) {
-      return `[${role} attached image: ${imageFromObject}]`;
-    }
     return "";
   }
+
   if (!Array.isArray(contentNode)) {
     return "";
   }
 
   const textParts: string[] = [];
-  const imageParts: string[] = [];
   for (const part of contentNode) {
     if (typeof part === "string" && part.trim()) {
       const normalized = normalizeJsonLikeString(part.trim());
@@ -1064,31 +1130,12 @@ function extractMessageContent(
         continue;
       }
     }
-
-    if (
-      type?.toLowerCase() === "input_image" ||
-      type?.toLowerCase() === "image_url" ||
-      type?.toLowerCase() === "image"
-    ) {
-      imageParts.push(extractImageReference(part) ?? "(inline-image)");
-    }
   }
 
-  if (textParts.length === 0 && imageParts.length === 0) {
-    return "";
-  }
-
-  const imageSuffix =
-    imageParts.length === 0
-      ? ""
-      : `\n[${role} attached ${imageParts.length} image input(s): ${imageParts
-          .slice(0, 4)
-          .join(", ")}]`;
-
-  if (textParts.length === 0) {
-    return imageSuffix.trimStart();
-  }
-  return `${textParts.join("\n")}${imageSuffix}`;
+  // Images from historical/context messages are intentionally dropped here:
+  // only the current user turn is uploaded and annotated, so history must not
+  // pretend that an image remains available to the model.
+  return textParts.join("\n");
 }
 
 function tryExtractAssistantToolCalls(
@@ -1676,19 +1723,87 @@ function extractBalancedJsonSegment(
   return null;
 }
 
-function extractImageReference(partObject: JsonObject): string | null {
-  const imageUrl = partObject.image_url;
-  if (typeof imageUrl === "string" && imageUrl.trim()) {
-    return imageUrl.trim();
+function hasImageContent(contentNode: JsonValue | undefined): boolean {
+  if (isImageContentPart(contentNode)) {
+    return true;
   }
-  if (isJsonObject(imageUrl)) {
-    const url = tryGetString(imageUrl, "url");
-    if (url) {
-      return url.trim();
+  return Array.isArray(contentNode) && contentNode.some(isImageContentPart);
+}
+
+function isImageContentPart(value: JsonValue | undefined): value is JsonObject {
+  if (!isJsonObject(value)) {
+    return false;
+  }
+  const type = (tryGetString(value, "type") ?? "").trim().toLowerCase();
+  // Must stay in sync with `isImagePart` in ./image-input. A bare `url` field
+  // is deliberately excluded: this predicate also drives prompt sanitization,
+  // and matching on `url` alone would strip unrelated request nodes such as
+  // tool schemas that happen to declare a `url` property.
+  return (
+    type === "input_image" ||
+    type === "image_url" ||
+    type === "image" ||
+    value.image_url !== undefined
+  );
+}
+
+function parseCurrentTurnImages(
+  requestJson: JsonObject,
+  options: WrapperOptions,
+) {
+  return parseImageInputs(
+    extractCurrentUserContent(requestJson),
+    imageInputLimits(options),
+  );
+}
+
+function imageInputLimits(options: WrapperOptions): {
+  enabled?: boolean;
+  maxImages?: number;
+  maxBytesPerImage?: number;
+  maxTotalBytes?: number;
+  allowedMimeTypes?: string[];
+} {
+  return {
+    enabled: options.substrate.imageUploadEnabled,
+    maxImages: options.substrate.maxImagesPerRequest,
+    maxBytesPerImage: options.substrate.maxBytesPerImage,
+    maxTotalBytes: options.substrate.maxTotalImageBytes,
+    allowedMimeTypes: options.substrate.allowedImageMimeTypes,
+  };
+}
+
+function extractCurrentUserContent(
+  requestJson: JsonObject,
+): JsonValue | undefined {
+  const messages = requestJson.messages;
+  if (Array.isArray(messages)) {
+    for (let index = messages.length - 1; index >= 0; index--) {
+      const message = messages[index];
+      if (
+        isJsonObject(message) &&
+        (tryGetString(message, "role") ?? "user").toLowerCase() === "user"
+      ) {
+        return message.content;
+      }
     }
   }
-  const directUrl = tryGetString(partObject, "url");
-  return directUrl ? directUrl.trim() : null;
+
+  const input = requestJson.input;
+  if (Array.isArray(input)) {
+    for (let index = input.length - 1; index >= 0; index--) {
+      const item = input[index];
+      if (!isJsonObject(item)) {
+        continue;
+      }
+      const type = (tryGetString(item, "type") ?? "message").toLowerCase();
+      const role = (tryGetString(item, "role") ?? "user").toLowerCase();
+      if (type === "message" && role === "user") {
+        return item.content;
+      }
+    }
+  }
+  return undefined;
 }
 
 function convertToolCallsToContextText(toolCalls: JsonValue[]): string {

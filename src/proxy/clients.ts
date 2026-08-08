@@ -33,6 +33,8 @@ import {
 } from "./substrate-session-store";
 import { ConcurrencyLimiter } from "./concurrency";
 import { resolveSubstrateCapabilities } from "./substrate-capabilities";
+import { uploadSubstrateImages } from "./substrate-image-upload";
+import { classifyBridgeFailure } from "./failure-classifier";
 import type { BridgeObservability } from "./observability";
 export { resolveSubstrateTone } from "./substrate-capabilities";
 
@@ -384,6 +386,33 @@ export class CopilotSubstrateClient {
       );
     }
 
+    let resolvedConversationId = conversationId;
+    let imageAnnotations: JsonObject[] = [];
+    if ((request.images ?? []).length > 0) {
+      const uploadResult = await uploadSubstrateImages(request.images ?? [], {
+        rawToken,
+        objectId,
+        tenantId,
+        conversationId: resolvedConversationId,
+        substrate: this.options.substrate,
+        signal,
+      });
+      if (!uploadResult.ok) {
+        return buildFailure(
+          uploadResult.aborted || signal?.aborted ? 499 : 502,
+          uploadResult.aborted || signal?.aborted
+            ? "Substrate image upload was cancelled."
+            : "Substrate image upload failed.",
+          null,
+          null,
+          uploadResult.aborted || signal?.aborted
+            ? null
+            : classifyBridgeFailure("image_upload_failed").code,
+        );
+      }
+      imageAnnotations = uploadResult.annotations;
+    }
+
     const clientRequestId = randomUUID();
     const requestUri = buildSubstrateHubUri(
       this.options,
@@ -392,7 +421,7 @@ export class CopilotSubstrateClient {
       rawToken,
       clientRequestId,
       sessionId,
-      conversationId,
+      resolvedConversationId,
     );
     const {
       invocationTimeoutMs: configuredTimeoutMs,
@@ -463,7 +492,6 @@ export class CopilotSubstrateClient {
     let cancellationStarted = false;
     let socketClosed = false;
     let receiverDisposed = false;
-    let resolvedConversationId = conversationId;
     const receiver = this.createReceiver(ws);
     let providerDriftObserved = false;
     const driftObservationKeys = new Set<string>();
@@ -652,12 +680,13 @@ export class CopilotSubstrateClient {
       await sendFrame(ws, requestUri, this.logger, { type: 6 });
       invocationPayload = buildInvocationPayload(
         request,
-        conversationId,
+        resolvedConversationId,
         sessionId,
         clientRequestId,
         isStartOfSession,
         this.options,
         this.observability,
+        imageAnnotations,
       );
       activeInvocationId = tryGetString(invocationPayload, "invocationId");
       if (onStreamUpdate) {
@@ -1338,6 +1367,7 @@ export function buildInvocationPayload(
   isStartOfSession: boolean,
   options: WrapperOptions,
   observability: BridgeObservability | null = null,
+  messageAnnotations: JsonObject[] = [],
 ): JsonObject {
   const capabilities = resolveSubstrateCapabilities(
     request.model,
@@ -1374,6 +1404,9 @@ export function buildInvocationPayload(
   const locationInfo = buildLocationInfo(request.locationHint);
   if (locationInfo) {
     message.locationInfo = locationInfo;
+  }
+  if (messageAnnotations.length > 0) {
+    message.messageAnnotations = messageAnnotations;
   }
 
   const argument: JsonObject = {

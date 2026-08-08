@@ -23,6 +23,7 @@ const REAL_REASON_MAPPINGS = [
   ["substrate_incomplete_terminal", "ambiguous_completion"],
   ["confab_recovery_exhausted", "ambiguous_completion"],
   ["image_generation_failed", "artifact_rejected"],
+  ["image_upload_failed", "image_upload_failed"],
 ] as const satisfies ReadonlyArray<readonly [InternalReason, BridgeErrorCode]>;
 
 const SHARED_REASON_MAPPINGS = {
@@ -36,6 +37,7 @@ const SHARED_REASON_MAPPINGS = {
   duplicate_suppressed: "duplicate_tool_result_or_replay",
   fallback_exhausted: "tool_round_repetition_bound_exhausted",
   artifact_rejected: "image_generation_failed",
+  image_upload_failed: "image_upload_failed",
   policy_blocked: "upstream_policy_entitlement_or_feature_refusal",
   transport_failed: "substrate_error",
   provider_drift: "provider_drift",
@@ -78,7 +80,7 @@ describe("bridge failure classifier", () => {
       },
     );
 
-    expect(failures).toHaveLength(16);
+    expect(failures).toHaveLength(17);
     expect(
       failures.filter((failure) => failure.terminal === "incomplete"),
     ).toHaveLength(1);

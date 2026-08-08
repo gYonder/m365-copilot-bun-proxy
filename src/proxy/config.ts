@@ -179,6 +179,22 @@ const WrapperOptionsSchema = z.object({
       acquireTimeoutMs: z.number().int().min(0).default(0),
       maxSendChars: z.number().int().min(0).default(500_000),
       truncateBeforeSending: z.boolean().default(true),
+      imageUploadEnabled: z.boolean().default(true),
+      maxImagesPerRequest: z.number().int().min(1).default(8),
+      maxBytesPerImage: z.number().int().positive().default(10_485_760),
+      maxTotalImageBytes: z
+        .number()
+        .int()
+        .positive()
+        .default(20_971_520),
+      allowedImageMimeTypes: z
+        .array(z.string())
+        .min(1)
+        .default(["image/png", "image/jpeg", "image/gif", "image/webp"]),
+      imageUploadUrl: z
+        .string()
+        .default("https://substrate.office.com/m365Copilot/UploadFile"),
+      imageUploadTimeoutMs: z.number().int().positive().default(30_000),
     })
     .default({}),
   defaultModel: z.string().default("gpt-5.6-sol"),
