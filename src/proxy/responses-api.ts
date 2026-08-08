@@ -63,15 +63,18 @@ export function buildOpenAiResponseObject(
   parsedRequest: ParsedResponsesRequest,
   conversationId: string | null,
   contextInputTokens?: number,
+  terminal?: ResponseTerminal,
 ): JsonObject {
   const usage = buildResponseUsage(parsedRequest, output, contextInputTokens);
   const response: JsonObject = {
     id: responseId,
     object: "response",
     created_at: createdAt,
-    status,
-    error: null,
-    incomplete_details: null,
+    status: terminal?.status ?? status,
+    error: terminal ? cloneJsonValue(terminal.error) : null,
+    incomplete_details: terminal
+      ? cloneJsonValue(terminal.incomplete_details)
+      : null,
     service_tier: null,
     usage,
     model,
@@ -242,6 +245,158 @@ export function buildResponseOutputItemDoneEvent(
 
 export function buildResponseCompletedEvent(response: JsonObject): JsonObject {
   return { type: "response.completed", response: cloneJsonValue(response) };
+}
+
+export function buildResponseFailedEvent(response: JsonObject): JsonObject {
+  return { type: "response.failed", response: cloneJsonValue(response) };
+}
+
+export function buildResponseIncompleteEvent(response: JsonObject): JsonObject {
+  return { type: "response.incomplete", response: cloneJsonValue(response) };
+}
+
+export function buildResponseFunctionCallArgumentsDeltaEvent(
+  responseId: string,
+  outputIndex: number,
+  itemId: string,
+  delta: string,
+  callId?: string,
+): JsonObject {
+  return {
+    type: "response.function_call_arguments.delta",
+    response_id: responseId,
+    output_index: outputIndex,
+    item_id: itemId,
+    ...(callId ? { call_id: callId } : {}),
+    delta,
+  };
+}
+
+export function buildResponseFunctionCallArgumentsDoneEvent(
+  responseId: string,
+  outputIndex: number,
+  itemId: string,
+  argumentsText: string,
+  callId?: string,
+): JsonObject {
+  return {
+    type: "response.function_call_arguments.done",
+    response_id: responseId,
+    output_index: outputIndex,
+    item_id: itemId,
+    ...(callId ? { call_id: callId } : {}),
+    arguments: argumentsText,
+  };
+}
+
+export function buildResponseCustomToolInputDeltaEvent(
+  responseId: string,
+  outputIndex: number,
+  itemId: string,
+  delta: string,
+  callId?: string,
+): JsonObject {
+  return {
+    type: "response.custom_tool_call_input.delta",
+    response_id: responseId,
+    output_index: outputIndex,
+    item_id: itemId,
+    ...(callId ? { call_id: callId } : {}),
+    delta,
+  };
+}
+
+export function buildResponseCustomToolInputDoneEvent(
+  responseId: string,
+  outputIndex: number,
+  itemId: string,
+  input: string,
+  callId?: string,
+): JsonObject {
+  return {
+    type: "response.custom_tool_call_input.done",
+    response_id: responseId,
+    output_index: outputIndex,
+    item_id: itemId,
+    ...(callId ? { call_id: callId } : {}),
+    input,
+  };
+}
+
+export function buildResponseWebSearchCallInProgressEvent(
+  responseId: string,
+  outputIndex: number,
+  itemIdOrItem?: string | JsonObject,
+  item?: JsonObject,
+): JsonObject {
+  return buildResponseWebSearchCallEvent(
+    "response.web_search_call.in_progress",
+    responseId,
+    outputIndex,
+    typeof itemIdOrItem === "string" ? itemIdOrItem : undefined,
+    typeof itemIdOrItem === "string" ? item : itemIdOrItem,
+  );
+}
+
+export function buildResponseWebSearchCallSearchingEvent(
+  responseId: string,
+  outputIndex: number,
+  itemIdOrItem?: string | JsonObject,
+  item?: JsonObject,
+): JsonObject {
+  return buildResponseWebSearchCallEvent(
+    "response.web_search_call.searching",
+    responseId,
+    outputIndex,
+    typeof itemIdOrItem === "string" ? itemIdOrItem : undefined,
+    typeof itemIdOrItem === "string" ? item : itemIdOrItem,
+  );
+}
+
+export function buildResponseWebSearchCallCompletedEvent(
+  responseId: string,
+  outputIndex: number,
+  itemIdOrItem?: string | JsonObject,
+  item?: JsonObject,
+): JsonObject {
+  return buildResponseWebSearchCallEvent(
+    "response.web_search_call.completed",
+    responseId,
+    outputIndex,
+    typeof itemIdOrItem === "string" ? itemIdOrItem : undefined,
+    typeof itemIdOrItem === "string" ? item : itemIdOrItem,
+  );
+}
+
+export type ResponseTerminal =
+  | {
+      status: "failed";
+      error: { code: string; message: string };
+      incomplete_details: null;
+    }
+  | {
+      status: "incomplete";
+      error: null;
+      incomplete_details: { reason: string };
+    };
+
+function buildResponseWebSearchCallEvent(
+  type:
+    | "response.web_search_call.in_progress"
+    | "response.web_search_call.searching"
+    | "response.web_search_call.completed",
+  responseId: string,
+  outputIndex: number,
+  itemId?: string,
+  item?: JsonObject,
+): JsonObject {
+  return {
+    type,
+    response_id: responseId,
+    output_index: outputIndex,
+    ...(itemId ? { item_id: itemId } : {}),
+    ...(item ? { item: cloneJsonValue(item) } : {}),
+  };
 }
 
 function extractOutputText(output: JsonObject[]): string {
