@@ -980,9 +980,11 @@ export class CopilotSubstrateClient {
           }
 
           if (frameType === SignalRCompletionType) {
+            const resultMessage = extractSubstrateResultMessage(json);
             if (
               hasSubstrateResultValue(json) &&
-              (!resultValue || !isSubstrateResultSuccess(resultValue))
+              (!resultValue ||
+                (!isSubstrateResultSuccess(resultValue) && !resultMessage))
             ) {
               recordDrift(
                 "unrecognized_terminal_semantics",
@@ -1019,12 +1021,17 @@ export class CopilotSubstrateClient {
       // partially streamed message into a successful Codex turn: that would
       // make a failed write or patch look completed to the client.
       if (responseError) {
+        const rateLimited = isSubstrateRateLimitMessage(responseError);
         return buildFailure(
-          502,
+          rateLimited ? 429 : 502,
           `Substrate chat failed. ${responseError}`,
           invocationPayload,
           buildSubstrateTranscriptPayload(transcript),
-          providerDriftObserved ? "provider_drift" : responseErrorCode,
+          rateLimited
+            ? "upstream_rate_limit"
+            : providerDriftObserved
+              ? "provider_drift"
+              : responseErrorCode,
         );
       }
 
@@ -2280,6 +2287,15 @@ function extractSubstrateResultMessage(envelope: JsonObject): string | null {
     return tryGetString(envelope.result, "message");
   }
   return null;
+}
+
+function isSubstrateRateLimitMessage(message: string): boolean {
+  return (
+    /temporarily unable to respond to this volume of requests/i.test(message) ||
+    /\b(?:rate limit|too many requests|capacity limit|request volume)\b/i.test(
+      message,
+    )
+  );
 }
 
 function extractSubstrateResultValue(envelope: JsonObject): string | null {

@@ -699,6 +699,39 @@ describe("Substrate client lifecycle hardening", () => {
     expect(result.rawBody).toContain("Request declined.");
   });
 
+  test("classifies provider capacity responses as rate limits, not drift", async () => {
+    const { connect, createReceiver } = makeFrameTransport([
+      "{}",
+      JSON.stringify({
+        type: 3,
+        invocationId: "0",
+        result: {
+          value: "Failure",
+          message:
+            "We're temporarily unable to respond to this volume of requests. Please try again later.",
+        },
+      }) + "\u001e",
+    ]);
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-rate-limited",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.statusCode).toBe(429);
+    expect(result.errorCode).toBe("upstream_rate_limit");
+  });
+
   test("folds repeated update frames without repeating output", async () => {
     const update = JSON.stringify({
       type: 1,
