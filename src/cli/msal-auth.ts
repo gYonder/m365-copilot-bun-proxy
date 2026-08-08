@@ -135,6 +135,7 @@ export function isValidSubstrateToken(
   const exp = typeof claims.exp === "number" ? claims.exp * 1000 : 0;
   const scopeClaim = typeof claims.scp === "string" ? claims.scp : "";
   const scopes = new Set(scopeClaim.split(/\s+/).filter(Boolean));
+  const claimOid = typeof claims.oid === "string" ? claims.oid : "";
   return (
     aud === SUBSTRATE_AUDIENCE ||
     aud === SYDNEY_AUDIENCE ||
@@ -143,6 +144,8 @@ export function isValidSubstrateToken(
     exp > Date.now() + TOKEN_EXPIRY_SKEW_MS &&
     !!tid &&
     (!requiredTenantId || tid === requiredTenantId) &&
+    (!result.tid || result.tid === tid) &&
+    (!result.oid || result.oid === claimOid) &&
     SCOPES.every((scope) => scopes.has(scope.split("/").at(-1) ?? scope));
 }
 

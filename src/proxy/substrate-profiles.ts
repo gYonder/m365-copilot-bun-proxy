@@ -1,4 +1,9 @@
-import { canonicalizeJson, hashCanonicalJson } from "./canonical-json";
+import { createHash } from "node:crypto";
+import {
+  hashCanonicalJson,
+  tryHashCanonicalJson,
+  tryCanonicalizeJson,
+} from "./canonical-json";
 import { resolveSubstrateCapabilities } from "./substrate-capabilities";
 import type {
   JsonObject,
@@ -68,13 +73,12 @@ export function deriveRequestProfile({
     hasStructuredKey(requestJson, "image_url");
 
   const localTools = request.tooling.tools.length > 0;
-  const localToolSchemaHash = hashCanonicalJson(
-    request.tooling.tools
-      .map(toCanonicalTool)
-      .sort((left, right) =>
-        canonicalizeJson(left).localeCompare(canonicalizeJson(right)),
-      ),
-  );
+  const canonicalTools = request.tooling.tools
+    .map(toCanonicalTool)
+    .sort((left, right) =>
+      safeCanonicalJson(left).localeCompare(safeCanonicalJson(right)),
+    );
+  const localToolSchemaHash = safeHashCanonicalJson(canonicalTools);
   const localToolProtocol = [...new Set(
     request.tooling.tools.map((tool) => tool.type),
   )]
@@ -155,6 +159,21 @@ function normalizeTaskScope(taskScope: string | null | undefined): string {
   // `coding` is the natural short spelling of the only supported scope, so it
   // must not be read as a different, unsupported one.
   return CODING_TASK_SCOPE_ALIASES.has(normalized) ? "coding_project" : normalized;
+}
+
+function safeCanonicalJson(value: unknown): string {
+  const result = tryCanonicalizeJson(value);
+  return result.ok ? result.value : JSON.stringify(value);
+}
+
+function safeHashCanonicalJson(value: unknown): string {
+  const result = tryHashCanonicalJson(value);
+  if (result.ok) {
+    return result.value;
+  }
+  return createHash("sha256")
+    .update(safeCanonicalJson(value), "utf8")
+    .digest("hex");
 }
 
 function normalizeValue(value: string | null | undefined): string {

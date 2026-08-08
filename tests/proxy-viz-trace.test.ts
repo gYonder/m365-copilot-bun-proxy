@@ -115,6 +115,7 @@ describe("proxy viz trace capture", () => {
 
     const trace = await getTrace(app, traceId);
     expect(trace.status).toBe("completed");
+    expect(trace.traceId).not.toBe(traceId);
     expect(trace.transformMode).toBe("simulated");
     expect(
       String(((trace.pane3 as JsonObject).message as JsonObject).text ?? ""),

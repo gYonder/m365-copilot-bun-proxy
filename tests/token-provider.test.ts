@@ -12,11 +12,11 @@ const token = (overrides: Record<string, unknown> = {}) =>
     ...overrides,
   })}.signature`;
 
-const state = (value: string) => ({
+const state = (value: string, overrides: Partial<{ tid: string; oid: string }> = {}) => ({
   token: value,
   expiresAtUtc: new Date(Date.now() + 3_600_000).toISOString(),
-  tid: "tenant-a",
-  oid: "object-a",
+  tid: overrides.tid ?? "tenant-a",
+  oid: overrides.oid ?? "object-a",
 });
 
 const designerToken = (overrides: Record<string, unknown> = {}) =>
@@ -131,7 +131,8 @@ describe("ProxyTokenProvider", () => {
     const provider = new ProxyTokenProvider({ dependencies: {
       getTokenPath: async () => "/token.json",
       getBrowserStatePath: async () => "/browser.json",
-      loadToken: async () => ++loads === 1 ? null : state(fallback),
+      loadToken: async () =>
+        ++loads === 1 ? null : state(fallback, { oid: "object-b" }),
       acquireSubstrateToken: async () => ({ token: msal, expiresAtUtc: new Date(Date.now() + 3_600_000), oid: "object-a", tid: "tenant-a" }),
       saveToken: async () => { throw new Error("persistence failed"); },
       fetchTokenWithPlaywright: async () => {},

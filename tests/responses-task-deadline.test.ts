@@ -73,6 +73,21 @@ describe("Responses task deadlines", () => {
       ),
     );
   });
+
+  test("ignores assistant commentary when continuing the same task", () => {
+    const initial = request([]);
+    const withCommentary = request([
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "I am checking the workspace." }],
+      },
+    ]);
+
+    expect(computeResponsesTaskKey(withCommentary)).toBe(
+      computeResponsesTaskKey(initial),
+    );
+  });
 });
 
 function request(appendedItems: JsonObject[]): JsonObject {

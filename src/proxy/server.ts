@@ -119,6 +119,7 @@ type Services = {
 
 type TraceContext = {
   traceId: string;
+  requestedTraceId: string;
   requestType: string;
   transformMode: string;
   transport: string;
@@ -160,6 +161,13 @@ export function createProxyApp(services: Services): Hono {
   );
   app.get("/v1/models", (c) => c.json(buildModelsResponse()));
   app.get("/openai/v1/models", (c) => c.json(buildModelsResponse()));
+  app.use("/__viz/*", async (c, next) => {
+    const failure = await rejectUnauthorizedGatewayRequest(c.req.raw, services);
+    if (failure) {
+      return failure;
+    }
+    await next();
+  });
   app.get("/__viz/traces/:traceId", (c) =>
     handleVizTraceRetrieve(services, c.req.param("traceId")),
   );
@@ -333,7 +341,8 @@ function resolveTraceContext(
     return null;
   }
   return {
-    traceId,
+    traceId: randomUUID().replaceAll("-", ""),
+    requestedTraceId: traceId,
     requestType,
     transformMode,
     transport,
@@ -353,6 +362,7 @@ function initializeTrace(
     trace.transformMode,
     trace.transport,
   );
+  services.vizTraceStore?.alias(trace.requestedTraceId, trace.traceId);
 }
 
 function tracePane2(
@@ -547,6 +557,16 @@ async function handleChat(
   // Bind the already-derived profile bit so every substrate entry point uses
   // the same request decision without re-detecting hosted search.
   parsedRequest.hostedWebSearch = requestProfile.hostedWebSearch;
+  if (!isSupportedTaskScope(requestProfile.taskScope)) {
+    const failure = classifyBridgeFailure("task_scope_not_supported");
+    return writeOpenAiError(
+      services,
+      400,
+      failure.message,
+      "invalid_request_error",
+      failure.code,
+    );
+  }
   const responseHeaders = new Headers({
     "x-m365-transport": selectedTransport,
   });
@@ -980,11 +1000,7 @@ async function handleResponsesCreate(
         payload.json,
         resolvedOptions.options,
       );
-      if (
-        parsed.ok &&
-        !parsed.request.base.stream &&
-        isSupportedTransport(selectedTransport)
-      ) {
+      if (parsed.ok && isSupportedTransport(selectedTransport)) {
         const requestHash = computeResponsesRequestHash(
           payload.rawText,
           payload.json,
@@ -3679,7 +3695,11 @@ export function computeResponsesTaskKey(requestJson: JsonObject): string {
           type !== "function_call" &&
           type !== "function_call_output" &&
           type !== "custom_tool_call" &&
-          type !== "custom_tool_call_output"
+          type !== "custom_tool_call_output" &&
+          !(
+            type === "message" &&
+            (tryGetString(item, "role") ?? "").toLowerCase() === "assistant"
+          )
         );
       })
     : requestJson.input;
@@ -4411,7 +4431,7 @@ async function transformGraphStreamToResponses(
           },
           500,
         );
-        if (signal?.aborted) {
+        if (signal?.aborted && isAbortError(error)) {
           if (!writer.terminalState) {
             writer.clientAbort();
           }
@@ -4675,7 +4695,13 @@ async function streamSubstrateAsResponses(
               createdAt,
               parsedRequest.base.model,
               "in_progress",
-              [buildMessageOutputItem(messageItemId, emitted, "in_progress")],
+              [
+                buildMessageOutputItem(
+                  messageItemId,
+                  emittedUserFacingText,
+                  "in_progress",
+                ),
+              ],
               parsedRequest,
               includeConversationId ? conversationId : null,
             ),
@@ -4848,6 +4874,10 @@ function classifyResponsesFailure(rawReason: string): BridgeFailure {
     return classifyBridgeFailure(reason as InternalReason);
   }
   return classifyUnknownReason(rawReason);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function emitResponsesFailureTerminal(

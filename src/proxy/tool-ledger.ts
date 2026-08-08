@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { tryCanonicalizeJson } from "./canonical-json";
 import {
   classifyBridgeFailure,
@@ -5,8 +6,9 @@ import {
   type InternalReason,
 } from "./failure-classifier";
 
-// Keep this at or below response-store.ts:31's 60-second replay guard.
-export const TOOL_LEDGER_PENDING_TTL_MS = 60_000;
+// Pending tool calls must survive ordinary builds and restarts. The shorter
+// response replay guard remains separate in response-store.ts.
+export const TOOL_LEDGER_PENDING_TTL_MS = 180 * 60_000;
 export const MAX_TOOL_CALLS_PER_RESPONSE = 8;
 export const MAX_TOOL_ROUNDS_PER_TASK = 200;
 export const MAX_TOOL_LEDGER_ENTRIES = 128;
@@ -234,7 +236,7 @@ export class ToolLedger {
         return this.reject("invalid_call", "invalid_request");
       }
 
-      const canonical = canonicalArguments(input.arguments);
+      const canonical = canonicalArgumentDigest(input.arguments);
       if (!canonical.ok) return canonical;
       const repetitionKey = repetitionIdentity(input.name, canonical.value);
       if (repetitionKey === batchRepetitionKey) {
@@ -619,7 +621,7 @@ export function decideToolParallelism(
   return { parallel: true, reason: "allowed" };
 }
 
-function canonicalArguments(value: unknown): ToolLedgerResult<string> {
+function canonicalArgumentDigest(value: unknown): ToolLedgerResult<string> {
   let parsed = value;
   if (typeof value === "string") {
     try {
@@ -636,7 +638,10 @@ function canonicalArguments(value: unknown): ToolLedgerResult<string> {
   }
   const result = tryCanonicalizeJson(parsed);
   return result.ok
-    ? result
+    ? {
+        ok: true,
+        value: createHash("sha256").update(result.value, "utf8").digest("hex"),
+      }
     : {
         ok: false,
         error: new ToolLedgerError(
@@ -742,8 +747,8 @@ function validateEntry(value: IssuedCall): void {
   ) {
     throw malformed("invalid issued call");
   }
-  if (!isCanonical(value.canonical_arguments)) {
-    throw malformed("non-canonical arguments");
+  if (!isSha256Digest(value.canonical_arguments)) {
+    throw malformed("invalid argument digest");
   }
 }
 
@@ -793,8 +798,8 @@ function validateTask(
     ) {
       throw malformed("invalid repetition state");
     }
-    if (!isCanonical(repetition.canonical_arguments)) {
-      throw malformed("non-canonical repetition arguments");
+    if (!isSha256Digest(repetition.canonical_arguments)) {
+      throw malformed("invalid repetition argument digest");
     }
   }
   for (const count of value.response_counts) {
@@ -818,13 +823,8 @@ function validateTask(
   }
 }
 
-function isCanonical(value: string): boolean {
-  try {
-    const result = tryCanonicalizeJson(JSON.parse(value));
-    return result.ok && result.value === value;
-  } catch {
-    return false;
-  }
+function isSha256Digest(value: string): boolean {
+  return /^[a-f0-9]{64}$/.test(value);
 }
 
 function malformed(message: string): ToolLedgerCodecError {

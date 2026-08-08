@@ -62,6 +62,7 @@ export class ResponseStore {
       try {
         const recovered = ToolLedger.recover(entry.serialized, now, {
           now: () => Date.now(),
+          pendingTtlMs: this.toolLedgerPendingTtlMs(),
         });
         this.recordToolLedgerRecovery(recovered.outcomes);
         if (recovered.ledger.size > 0) {
@@ -209,7 +210,9 @@ export class ResponseStore {
       }
     }
 
-    const ledger = new ToolLedger();
+    const ledger = new ToolLedger({
+      pendingTtlMs: this.toolLedgerPendingTtlMs(),
+    });
     this.toolLedgers.set(key, {
       ledger,
       expiresAtUtc: this.resolveExpiryMs(),
@@ -401,11 +404,12 @@ export class ResponseStore {
     const existing = this.inFlightResponses.get(key);
     if (existing) return existing;
     this.inFlightResponses.set(key, promise);
-    void promise.finally(() => {
+    const cleanup = () => {
       if (this.inFlightResponses.get(key) === promise) {
         this.inFlightResponses.delete(key);
       }
-    });
+    };
+    void promise.then(cleanup, cleanup);
     return promise;
   }
 
@@ -541,13 +545,17 @@ export class ResponseStore {
     outcomes: Array<{ failure: { code: string; reason: string }; released: true }>,
   ): void {
     for (const outcome of outcomes) {
-      this.observability?.record("provider_drift", {
+      this.observability?.record("tool_ledger_recovery", {
         source: "tool_ledger",
         code: outcome.failure.code,
         reason: outcome.failure.reason,
         released: outcome.released,
       });
     }
+  }
+
+  private toolLedgerPendingTtlMs(): number {
+    return Math.max(1, this.options.conversationTtlMinutes) * 60_000;
   }
 
   private recordEviction(store: string, reason: "ttl" | "lru"): void {

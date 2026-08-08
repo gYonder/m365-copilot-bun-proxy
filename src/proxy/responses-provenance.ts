@@ -14,8 +14,6 @@ const PrivateDelimiterCharacterPattern = new RegExp(
   `[${PrivateDelimiterSource}]`,
   "u",
 );
-const MaxIncrementalCitationHoldback = 64;
-
 const SearchSemanticTypes = new Set([
   "internalsearchquery",
   "semanticserp",
@@ -78,11 +76,7 @@ export class IncrementalPrivateCitationMarkerSanitizer {
     this.pending += chunk;
 
     const holdbackStart = findIncrementalHoldbackStart(this.pending);
-    const forcedReleaseStart = Math.max(
-      0,
-      this.pending.length - MaxIncrementalCitationHoldback,
-    );
-    const releaseEnd = Math.max(holdbackStart, forcedReleaseStart);
+    const releaseEnd = holdbackStart;
     if (releaseEnd <= 0) {
       return "";
     }
@@ -235,10 +229,7 @@ function findIncrementalHoldbackStart(value: string): number {
 }
 
 function findPotentialCitationSuffixLength(value: string): number {
-  const searchStart = Math.max(
-    0,
-    value.length - MaxIncrementalCitationHoldback,
-  );
+  const searchStart = 0;
   for (let start = searchStart; start < value.length; start += 1) {
     if (isPotentialCitationMarkerPrefix(value.slice(start))) {
       return value.length - start;

@@ -45,7 +45,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(body.status).toBe("ok");
     expect(body.openAiTransformMode).toBe(OpenAiTransformModes.Mapped);
     expect(body.defaultModel).toBe("gpt-5.6-sol");
-    expect(body.configured_context_limit).toBe(400_000);
+    expect(body.configured_context_limit).toBe(264_000);
     expect(body.observed_safe_context_limit).toBeNull();
     expect(body.verified_provider_context_limit).toBeNull();
   });
@@ -308,10 +308,10 @@ describe("simulated transform mode proxy flow", () => {
       "xhigh",
       "max",
     ]);
-    expect(codexModels[0]?.context_window).toBe(400_000);
+    expect(codexModels[0]?.context_window).toBe(264_000);
     expect(codexModels[0]?.apply_patch_tool_type).toBe("freeform");
     expect(codexModels[0]?.supports_parallel_tool_calls).toBe(true);
-    expect(codexModels[0]?.context_window).toBe(400_000);
+    expect(codexModels[0]?.input_modalities).toEqual(["text", "image"]);
   });
 
   test("chat/completions non-stream wraps incoming JSON and returns parsed JSON block", async () => {

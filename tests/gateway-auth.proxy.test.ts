@@ -74,6 +74,48 @@ describe("gateway authentication and task scope", () => {
     expect(calls.chat).toBe(1);
   });
 
+  test("requires the configured runtime token on trace retrieval", async () => {
+    const options = createOptions();
+    options.gatewayToken = "seeded-runtime-token";
+    const app = createApp(options, { create: 0, chat: 0 });
+
+    const missing = await app.fetch(
+      new Request("http://localhost/__viz/traces/trace-1"),
+    );
+    const correct = await app.fetch(
+      new Request("http://localhost/__viz/traces/trace-1", {
+        headers: { "x-runtime-token": "seeded-runtime-token" },
+      }),
+    );
+
+    expect(missing.status).toBe(403);
+    expect(correct.status).toBe(404);
+  });
+
+  test("rejects general task scope on chat completions before upstream invocation", async () => {
+    const options = createOptions();
+    options.taskScope = "general";
+    const calls = { create: 0, chat: 0 };
+    const app = createApp(options, calls);
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      }),
+    );
+    const body = (await response.json()) as JsonObject;
+
+    expect(response.status).toBe(400);
+    expect(body.error.code).toBe("capability_unavailable");
+    expect(calls.create).toBe(0);
+    expect(calls.chat).toBe(0);
+  });
+
   test("leaves health and readiness unauthenticated", async () => {
     for (const gatewayToken of [null, "seeded-runtime-token"]) {
       const options = createOptions();

@@ -167,6 +167,17 @@ describe("private citation marker handling", () => {
     expect(first.length).toBeGreaterThan(100);
     expect(first + rest).toBe(`${"a".repeat(200)}c`);
   });
+
+  test("holds a long partial citation marker instead of leaking it", () => {
+    const sanitizer = new IncrementalPrivateCitationMarkerSanitizer();
+    const marker = `cite${"turn1search1".repeat(10)}`;
+    const first = sanitizer.push(`Before ${marker.slice(0, 80)}`);
+    const second = sanitizer.push(marker.slice(80));
+
+    expect(first).toBe("Before");
+    expect(second).toBe("");
+    expect(sanitizer.finish()).toBe("");
+  });
 });
 
 describe("defensive substrate citation decoding", () => {

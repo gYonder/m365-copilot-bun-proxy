@@ -12,6 +12,7 @@ export type BridgeEventName =
   | "truncation"
   | "image_quota"
   | "cancellation"
+  | "tool_ledger_recovery"
   | "provider_drift";
 
 export type BridgeEvent = {

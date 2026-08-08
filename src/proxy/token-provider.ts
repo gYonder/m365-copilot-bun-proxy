@@ -247,7 +247,10 @@ function isValidPersistedSubstrateToken(tokenState: TokenState): boolean {
     oid: tokenState.oid ?? null,
     tid: tokenState.tid ?? null,
   };
-  return isValidSubstrateToken(result, tokenState.tid);
+  return (
+    Boolean(tokenState.tid?.trim()) &&
+    isValidSubstrateToken(result, tokenState.tid)
+  );
 }
 
 function isTokenStateValid(tokenState: TokenState | null): tokenState is TokenState {

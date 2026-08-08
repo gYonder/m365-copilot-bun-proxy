@@ -13,6 +13,7 @@ const MaxTraceEntries = 256;
 
 export class ProxyVizTraceStore {
   private readonly traces = new Map<string, MutableTraceRecord>();
+  private readonly aliases = new Map<string, string>();
 
   constructor(private readonly ttlSeconds: number) {}
 
@@ -45,7 +46,16 @@ export class ProxyVizTraceStore {
       if (oldest.done) {
         break;
       }
+
       this.traces.delete(oldest.value);
+    }
+  }
+
+  alias(requestedTraceId: string, serverTraceId: string): void {
+    const alias = requestedTraceId.trim();
+    const traceId = serverTraceId.trim();
+    if (alias && traceId) {
+      this.aliases.set(alias, traceId);
     }
   }
 
@@ -122,7 +132,8 @@ export class ProxyVizTraceStore {
   get(traceId: string): ProxyVizTraceRecord | null {
     const now = nowUnix();
     this.cleanup(now);
-    const existing = this.traces.get(traceId);
+    const existing = this.traces.get(traceId) ??
+      this.traces.get(this.aliases.get(traceId) ?? "");
     if (!existing) {
       return null;
     }
@@ -147,6 +158,11 @@ export class ProxyVizTraceStore {
     for (const [traceId, record] of this.traces.entries()) {
       if (record.expiresAtUnix < now) {
         this.traces.delete(traceId);
+      }
+    }
+    for (const [alias, traceId] of this.aliases.entries()) {
+      if (!this.traces.has(traceId)) {
+        this.aliases.delete(alias);
       }
     }
   }

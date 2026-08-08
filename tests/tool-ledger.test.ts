@@ -17,7 +17,8 @@ describe("ToolLedger", () => {
       call_id: "call-1",
       name: "read_file",
       type: "function",
-      canonical_arguments: '{"a":1,"b":2}',
+      canonical_arguments:
+        "43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777",
       request_profile_key: "profile-1",
       issued_at: 1_000,
       status: "pending",

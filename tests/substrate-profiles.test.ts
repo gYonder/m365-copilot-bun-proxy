@@ -3,6 +3,7 @@ import { deriveRequestProfile, isSupportedTaskScope } from "../src/proxy/substra
 import {
   OpenAiTransformModes,
   TransportNames,
+  type OpenAiToolDefinition,
   type ParsedOpenAiRequest,
   type WrapperOptions,
 } from "../src/proxy/types";
@@ -126,6 +127,29 @@ describe("substrate request profiles", () => {
     expect(imageEnabled.compatibilityKey).not.toBe(coding.compatibilityKey);
     expect(searchEnabled.hostedWebSearch).toBeTrue();
     expect(imageEnabled.imageInput).toBeTrue();
+  });
+
+  test("does not reject a tool schema beyond canonical JSON bounds", () => {
+    const request = createParsedRequest();
+    const tool: OpenAiToolDefinition = {
+      name: "large_schema",
+      type: "function",
+      description: "x".repeat(70_000),
+      parameters: { type: "object" },
+      format: null,
+    };
+
+    expect(() =>
+      deriveRequestProfile({
+        requestJson: { model: "m365-copilot", input: "inspect" },
+        request: {
+          ...request,
+          tooling: { ...request.tooling, tools: [tool] },
+        },
+        options: createOptions(),
+        transport: TransportNames.Substrate,
+      }),
+    ).not.toThrow();
   });
 });
 
