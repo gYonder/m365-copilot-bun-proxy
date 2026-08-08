@@ -49,6 +49,8 @@ export class ProxyTokenProvider {
   private readonly observability: BridgeObservability | null;
   private inFlightAcquirePromise: Promise<string | null> | null = null;
   private inFlightDesignerAcquirePromise: Promise<string | null> | null = null;
+  private authorizationHeader: string | null = null;
+  private authorizationExpiresAtMs = 0;
   private designerAuthorizationHeader: string | null = null;
   private designerExpiresAtMs = 0;
 
@@ -79,6 +81,14 @@ export class ProxyTokenProvider {
         this.recordAuthPath("incoming", true);
         return providedHeader;
       }
+    }
+
+    if (
+      this.authorizationHeader &&
+      this.authorizationExpiresAtMs > Date.now() + TOKEN_EXPIRY_SKEW_MS
+    ) {
+      this.recordAuthPath("memory_cache", true);
+      return this.authorizationHeader;
     }
 
     const cachedHeader = await this.tryGetCachedAuthorizationHeader();
@@ -146,7 +156,7 @@ export class ProxyTokenProvider {
     if (!isTokenStateValid(tokenState) || !isValidPersistedSubstrateToken(tokenState)) {
       return null;
     }
-    return `Bearer ${tokenState.token}`;
+    return this.rememberAuthorizationHeader(tokenState);
   }
 
   private async acquireAuthorizationHeader(): Promise<string | null> {
@@ -199,7 +209,7 @@ export class ProxyTokenProvider {
     const fetched = await this.dependencies.loadToken(tokenPath);
     const playwrightHeader =
       isTokenStateValid(fetched) && isValidPersistedSubstrateToken(fetched)
-        ? "Bearer " + fetched.token
+        ? this.rememberAuthorizationHeader(fetched)
         : null;
     this.recordAuthPath("playwright", playwrightHeader !== null);
     return playwrightHeader;
@@ -225,10 +235,21 @@ export class ProxyTokenProvider {
         oid: result.oid,
         tid: result.tid,
       });
-      return `Bearer ${result.token}`;
+      return this.rememberAuthorizationHeader({
+        token: result.token,
+        expiresAtUtc: result.expiresAtUtc.toISOString(),
+        oid: result.oid ?? undefined,
+        tid: result.tid ?? undefined,
+      });
     } catch {
       return null;
     }
+  }
+
+  private rememberAuthorizationHeader(tokenState: TokenState): string {
+    this.authorizationHeader = `Bearer ${tokenState.token}`;
+    this.authorizationExpiresAtMs = new Date(tokenState.expiresAtUtc).getTime();
+    return this.authorizationHeader;
   }
 
   private recordAuthPath(

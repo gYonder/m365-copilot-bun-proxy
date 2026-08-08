@@ -70,12 +70,18 @@ describe("ProxyTokenProvider", () => {
 
   test("uses a validated cached Sydney token", async () => {
     const value = token();
+    let loads = 0;
     const provider = new ProxyTokenProvider({ dependencies: {
       getTokenPath: async () => "/token.json",
       getBrowserStatePath: async () => "/browser.json",
-      loadToken: async () => state(value),
+      loadToken: async () => {
+        loads += 1;
+        return state(value);
+      },
     }});
     expect(await provider.resolveAuthorizationHeader(null)).toBe(`Bearer ${value}`);
+    expect(await provider.resolveAuthorizationHeader(null)).toBe(`Bearer ${value}`);
+    expect(loads).toBe(1);
   });
 
   test("accepts a cached token with the observed Sydney resource audience", async () => {
