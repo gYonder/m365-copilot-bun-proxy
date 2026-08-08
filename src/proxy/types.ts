@@ -226,6 +226,7 @@ export type SubstrateOptions = {
   turnTimeoutSeconds?: number;
   taskTimeoutSeconds?: number;
   keepAliveSeconds: number;
+  webSearch: "auto" | "off";
   optionsSets: string[];
   allowedMessageTypes: string[];
   invocationTarget: string;

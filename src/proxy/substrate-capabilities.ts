@@ -30,6 +30,7 @@ export type ResolvedSubstrateCapabilities = {
   optionsSets: string[];
   allowedMessageTypes: string[];
   entityAnnotationTypes: string[];
+  webSearch: boolean;
 };
 
 export function resolveSubstrateTone(
@@ -72,6 +73,12 @@ export function resolveSubstrateCapabilities(
     optionsSets: normalizeList(substrate.optionsSets),
     allowedMessageTypes: normalizeList(substrate.allowedMessageTypes),
     entityAnnotationTypes: normalizeList(substrate.entityAnnotationTypes),
+    // Web search is a capability the client advertises, not a per-turn request.
+    // Codex cannot signal it: verified on 0.146 that `web_search_mode` changes
+    // nothing in what a custom provider receives, so gating on a request field
+    // left search permanently unreachable. Advertise it and let the substrate
+    // decide per turn, which is what the reference clients do.
+    webSearch: substrate.webSearch !== "off",
   };
 }
 

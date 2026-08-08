@@ -110,6 +110,7 @@ const WrapperOptionsSchema = z.object({
       turnTimeoutSeconds: z.number().int().positive().optional(),
       taskTimeoutSeconds: z.number().int().positive().default(900),
       keepAliveSeconds: z.number().int().default(15),
+      webSearch: z.enum(["auto", "off"]).default("auto"),
       optionsSets: z
         .array(z.string())
         .default([
