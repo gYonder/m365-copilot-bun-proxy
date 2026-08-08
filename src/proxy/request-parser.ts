@@ -144,12 +144,16 @@ function extractSpecConversationId(requestJson: JsonObject): string | null {
 export function scopeConversationKey(
   conversationKey: string | null,
   transportName: string,
+  compatibilityKey: string | null = null,
 ): string | null {
   const normalizedKey = normalizeNullableString(conversationKey);
   if (!normalizedKey) {
     return null;
   }
-  return `${normalizeTransport(transportName)}:${normalizedKey}`;
+  const normalizedCompatibilityKey = normalizeNullableString(compatibilityKey);
+  return normalizedCompatibilityKey
+    ? `${normalizeTransport(transportName)}:${normalizedKey}:profile:${normalizedCompatibilityKey}`
+    : `${normalizeTransport(transportName)}:${normalizedKey}`;
 }
 
 export function buildCopilotRequestPayload(

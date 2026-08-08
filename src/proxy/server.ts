@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import {
   CopilotGraphClient,
@@ -41,6 +41,10 @@ import {
 } from "./failure-classifier";
 import { hashCanonicalJson } from "./canonical-json";
 import { ResponsesEventWriter } from "./responses-event-writer";
+import {
+  deriveRequestProfile,
+  isSupportedTaskScope,
+} from "./substrate-profiles";
 import {
   estimateResponsesContext,
   resolveContextInputTokens,
@@ -118,6 +122,21 @@ const TransformModeHeaderName = "x-m365-openai-transform-mode";
 
 export function createProxyApp(services: Services): Hono {
   const app = new Hono();
+
+  app.use("/v1/*", async (c, next) => {
+    const failure = await rejectUnauthorizedGatewayRequest(c.req.raw, services);
+    if (failure) {
+      return failure;
+    }
+    await next();
+  });
+  app.use("/openai/v1/*", async (c, next) => {
+    const failure = await rejectUnauthorizedGatewayRequest(c.req.raw, services);
+    if (failure) {
+      return failure;
+    }
+    await next();
+  });
 
   app.get("/healthz", (c) => c.json(buildHealthResponse(services.options)));
   app.get("/readyz", (c) =>
@@ -499,6 +518,12 @@ async function handleChat(
     );
   }
 
+  const requestProfile = deriveRequestProfile({
+    requestJson: payload.json,
+    request: parsedRequest,
+    options,
+    transport: selectedTransport,
+  });
   const responseHeaders = new Headers({
     "x-m365-transport": selectedTransport,
   });
@@ -510,6 +535,7 @@ async function handleChat(
   const scopedConversationKey = scopeConversationKey(
     conversationSelection.conversationKey,
     selectedTransport,
+    requestProfile.compatibilityKey,
   );
 
   let conversationId = conversationSelection.conversationId;
@@ -1086,9 +1112,32 @@ async function handleResponsesCreateOnce(
     );
   }
 
+  const requestProfile = deriveRequestProfile({
+    requestJson: payload.json,
+    request: baseRequest,
+    options,
+    transport: selectedTransport,
+  });
   const responseHeaders = new Headers({
     "x-m365-transport": selectedTransport,
   });
+  const taskDeadlineMs = resolveResponsesTaskDeadlineMs(
+    payload.json,
+    responseStore,
+    options,
+  );
+  if (!isSupportedTaskScope(requestProfile.taskScope)) {
+    return buildResponsesFailureResult(
+      services,
+      parsedRequest,
+      responseHeaders,
+      null,
+      taskDeadlineMs,
+      "task_scope_not_supported",
+      request.signal,
+    );
+  }
+
   const requestHash = computeResponsesRequestHash(
     payload.rawText,
     payload.json,
@@ -1109,6 +1158,7 @@ async function handleResponsesCreateOnce(
   const scopedConversationKey = scopeConversationKey(
     conversationSelection.conversationKey,
     selectedTransport,
+    requestProfile.compatibilityKey,
   );
 
   let conversationId = conversationSelection.conversationId;
@@ -1137,11 +1187,6 @@ async function handleResponsesCreateOnce(
     }
   }
 
-  const taskDeadlineMs = resolveResponsesTaskDeadlineMs(
-    payload.json,
-    responseStore,
-    options,
-  );
   const isProtocolIdentity = replayIdentityKey.startsWith("protocol:");
   const storedRequestReplay = isProtocolIdentity
     ? responseStore.tryGetProtocolReplay(replayIdentityKey)
@@ -1174,10 +1219,7 @@ async function handleResponsesCreateOnce(
       parsedRequest.protocolIdentity.conversationId ??
       scopedConversationKey,
   );
-  const toolProfileKey = computeResponsesToolProfileKey(
-    baseRequest,
-    selectedTransport,
-  );
+  const toolProfileKey = requestProfile.compatibilityKey;
   const toolLedger = responseStore.getOrCreateToolLedger(toolLedgerScope);
   const toolResultFailure = validateResponsesToolResults(
     payload.json,
@@ -1388,7 +1430,7 @@ async function handleResponsesCreateOnce(
             parsedRequest,
             conversationId,
             normalized.responseBody,
-            selectedTransport,
+            requestProfile.compatibilityKey,
             responseHeaders,
             trace,
             replayIdentityKey,
@@ -1426,7 +1468,7 @@ async function handleResponsesCreateOnce(
       const toolLedgerFailure = issueResponsesToolCalls(
         services.responseStore,
         computeResponsesToolLedgerScope(parsedRequest.rawRequest, conversationId),
-        computeResponsesToolProfileKey(baseRequest, selectedTransport),
+        requestProfile.compatibilityKey,
         responseId,
         assistantToolCallsForLedger(assistantResponse.toolCalls),
       );
@@ -1575,7 +1617,7 @@ async function handleResponsesCreateOnce(
       const toolLedgerFailure = issueResponsesToolCalls(
         responseStore,
         computeResponsesToolLedgerScope(payload.json, conversationId),
-        computeResponsesToolProfileKey(baseRequest, selectedTransport),
+        requestProfile.compatibilityKey,
         normalized.responseId,
         outputItemsForLedger(
           Array.isArray(normalized.responseBody.output)
@@ -1666,7 +1708,7 @@ async function handleResponsesCreateOnce(
   const toolLedgerFailure = issueResponsesToolCalls(
     responseStore,
     computeResponsesToolLedgerScope(payload.json, conversationId),
-    computeResponsesToolProfileKey(baseRequest, selectedTransport),
+    requestProfile.compatibilityKey,
     responseId,
     assistantToolCallsForLedger(assistantResponse.toolCalls),
   );
@@ -3160,7 +3202,7 @@ async function buildSimulatedResponsesStreamResponse(
   parsedRequest: ParsedResponsesRequest,
   conversationId: string,
   payload: JsonObject,
-  selectedTransport: string,
+  requestProfileKey: string,
   headers: Headers,
   trace: TraceContext | null,
   replayIdentityKey: string,
@@ -3207,7 +3249,7 @@ async function buildSimulatedResponsesStreamResponse(
   const toolLedgerFailure = issueResponsesToolCalls(
     services.responseStore,
     computeResponsesToolLedgerScope(parsedRequest.rawRequest, conversationId),
-    computeResponsesToolProfileKey(parsedRequest.base, selectedTransport),
+    requestProfileKey,
     responseId,
     outputItemsForLedger(finalizedOutputItems),
   );
@@ -3550,18 +3592,6 @@ function computeResponsesToolLedgerScope(
   });
 }
 
-function computeResponsesToolProfileKey(
-  request: ParsedOpenAiRequest,
-  transport: string,
-): string {
-  return hashCanonicalJson({
-    model: request.model,
-    transform_mode: request.transformMode,
-    transport,
-    user_key: request.userKey,
-  });
-}
-
 function validateResponsesToolResults(
   requestJson: JsonObject,
   ledger: ToolLedger,
@@ -3675,6 +3705,26 @@ function buildResponsesLedgerFailureResult(
   failure: ToolLedgerError,
   signal?: AbortSignal,
 ): Response {
+  return buildResponsesFailureResult(
+    services,
+    parsedRequest,
+    headers,
+    conversationId,
+    taskDeadlineMs,
+    failure.reason,
+    signal,
+  );
+}
+
+function buildResponsesFailureResult(
+  services: Services,
+  parsedRequest: ParsedResponsesRequest,
+  headers: Headers,
+  conversationId: string | null,
+  taskDeadlineMs: number | null,
+  rawReason: string,
+  signal?: AbortSignal,
+): Response {
   const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
   const responseConversationId =
@@ -3693,7 +3743,7 @@ function buildResponsesLedgerFailureResult(
 
   if (!parsedRequest.base.stream) {
     const writer = new ResponsesEventWriter(() => {});
-    emitResponsesFailureTerminal(writer, inProgress, failure.reason);
+    emitResponsesFailureTerminal(writer, inProgress, rawReason);
     const terminalResponse =
       writer.terminalState && writer.terminalState.kind !== "cancelled"
         ? writer.terminalState.response
@@ -3725,7 +3775,7 @@ function buildResponsesLedgerFailureResult(
       } else {
         writer.created(inProgress);
         writer.inProgress(inProgress);
-        emitResponsesFailureTerminal(writer, inProgress, failure.reason);
+        emitResponsesFailureTerminal(writer, inProgress, rawReason);
         if (
           writer.terminalState &&
           writer.terminalState.kind !== "cancelled"
@@ -4521,6 +4571,38 @@ async function resolveAuthorizationHeader(
   return services.tokenProvider.resolveAuthorizationHeader(
     request.headers.get("authorization"),
   );
+}
+
+async function rejectUnauthorizedGatewayRequest(
+  request: Request,
+  services: Services,
+): Promise<Response | null> {
+  const configuredToken = services.options.gatewayToken?.trim() || null;
+  if (!configuredToken) {
+    return null;
+  }
+
+  const suppliedToken = request.headers.get("x-runtime-token");
+  if (suppliedToken && tokensMatchConstantTime(suppliedToken, configuredToken)) {
+    return null;
+  }
+
+  const failure = classifyBridgeFailure(
+    "gateway_caller_credential_rejected",
+  );
+  return writeOpenAiError(
+    services,
+    403,
+    failure.message,
+    "permission_denied",
+    failure.code,
+  );
+}
+
+function tokensMatchConstantTime(left: string, right: string): boolean {
+  const leftDigest = createHash("sha256").update(left, "utf8").digest();
+  const rightDigest = createHash("sha256").update(right, "utf8").digest();
+  return timingSafeEqual(leftDigest, rightDigest);
 }
 
 async function tryWriteStrictToolOutputError(

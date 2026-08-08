@@ -321,10 +321,24 @@ export function parseListenUrl(listenUrl: string): {
   port: number;
 } {
   const url = new URL(listenUrl);
+  const hostname = url.hostname || "127.0.0.1";
+  if (!isLoopbackHostname(hostname)) {
+    throw new Error("The proxy must bind to a loopback hostname.");
+  }
   return {
-    hostname: url.hostname || "0.0.0.0",
+    hostname,
     port: url.port ? Number.parseInt(url.port, 10) : 4000,
   };
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.trim().toLowerCase();
+  return (
+    normalized === "localhost" ||
+    normalized === "127.0.0.1" ||
+    normalized === "[::1]" ||
+    normalized === "::1"
+  );
 }
 
 export function tryPrettyJson(rawPayload: string): string {

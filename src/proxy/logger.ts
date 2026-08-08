@@ -726,6 +726,9 @@ function collectMessages(json: JsonObject): JsonObject[] {
 
 function redactHeaderValue(header: string, value: string): string {
   const normalizedHeader = header.trim().toLowerCase();
+  if (normalizedHeader === "x-runtime-token") {
+    return "[redacted]";
+  }
   if (
     normalizedHeader !== "authorization" &&
     normalizedHeader !== "proxy-authorization"

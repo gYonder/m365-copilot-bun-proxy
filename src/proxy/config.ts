@@ -183,6 +183,13 @@ const WrapperOptionsSchema = z.object({
     .default({}),
   defaultModel: z.string().default("gpt-5.6-sol"),
   defaultTimeZone: z.string().default("America/New_York"),
+  gatewayToken: z
+    .preprocess(
+      (value) => (value === null || value === undefined ? value : String(value)),
+      z.string().nullable(),
+    )
+    .default(null),
+  taskScope: z.string().nullable().default(null),
   conversationTtlMinutes: z.number().int().default(180),
   maxAdditionalContextMessages: z.number().int().default(16),
   includeConversationIdInResponseBody: z.boolean().default(true),

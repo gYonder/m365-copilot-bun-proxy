@@ -85,13 +85,13 @@ const server = Bun.serve({
   fetch: app.fetch,
 });
 
-console.log(
-  `m365-copilot-bun-proxy listening on http://${server.hostname}:${server.port} (from ${options.listenUrl})`,
+process.stdout.write(
+  `m365-copilot-bun-proxy listening on http://${server.hostname}:${server.port} (from ${options.listenUrl})\n`,
 );
-console.log(
+process.stdout.write(
   debugEnabled
-    ? `Debugging: enabled (level: ${options.logLevel}, logs at ${debugLogPath})`
-    : `Debugging: disabled (configured level: ${options.logLevel})`,
+    ? `Debugging: enabled (level: ${options.logLevel}, logs at ${debugLogPath})\n`
+    : `Debugging: disabled (configured level: ${options.logLevel})\n`,
 );
 
 setInterval(() => undefined, 86_400_000);

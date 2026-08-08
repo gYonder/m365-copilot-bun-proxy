@@ -122,6 +122,116 @@ describe("conversation reuse", () => {
     expect(createConversationCount).toBe(1);
   });
 
+  test("does not reuse a conversation across incompatible tool profiles", async () => {
+    const options = createOptions();
+    const conversationStore = new ConversationStore(options);
+    const responseStore = new ResponseStore(options);
+    let createConversationCount = 0;
+
+    const graphClient = {
+      createConversation: async (): Promise<CreateConversationResult> => ({
+        isSuccess: true,
+        statusCode: 200,
+        conversationId: `profile-conv-${++createConversationCount}`,
+        rawBody: "{}",
+      }),
+      chat: async (
+        _authorizationHeader: string,
+        conversationId: string,
+        _payload: JsonObject,
+      ): Promise<ChatResult> => ({
+        isSuccess: true,
+        statusCode: 200,
+        responseJson: null,
+        rawBody: "{}",
+        assistantText: "assistant",
+        conversationId,
+      }),
+      chatOverStream: async (): Promise<Response> => {
+        throw new Error("not used");
+      },
+    } as unknown as CopilotGraphClient;
+
+    const substrateClient = {
+      createConversation: (): CreateConversationResult => ({
+        isSuccess: true,
+        statusCode: 200,
+        conversationId: "conv-substrate",
+        rawBody: "{}",
+      }),
+      chat: async (): Promise<ChatResult> => {
+        throw new Error("not used");
+      },
+      chatStream: async (): Promise<ChatResult> => {
+        throw new Error("not used");
+      },
+    } as unknown as CopilotSubstrateClient;
+
+    const debugLogger = {
+      logIncomingRequest: async () => {},
+      logOutgoingResponse: async () => {},
+      logUpstreamRequest: async () => {},
+      logUpstreamResponse: async () => {},
+      logSubstrateFrame: async () => {},
+    } as unknown as DebugMarkdownLogger;
+    const tokenProvider = {
+      resolveAuthorizationHeader: async () => "******",
+    } as unknown as ProxyTokenProvider;
+    const app = createProxyApp({
+      options,
+      debugLogger,
+      graphClient,
+      substrateClient,
+      conversationStore,
+      responseStore,
+      tokenProvider,
+    });
+
+    const headers = {
+      "content-type": "application/json",
+      "x-m365-transport": TransportNames.Graph,
+    };
+    const first = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "m365-copilot",
+          user: "profile-thread-1",
+          messages: [{ role: "user", content: "hello" }],
+        }),
+      }),
+    );
+    const second = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          model: "m365-copilot",
+          user: "profile-thread-1",
+          messages: [{ role: "user", content: "say hello" }],
+          tools: [
+            {
+              type: "function",
+              name: "read_file",
+              parameters: { type: "object" },
+            },
+          ],
+        }),
+      }),
+    );
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(first.headers.get("x-m365-conversation-id")).toBe(
+      "profile-conv-1",
+    );
+    expect(second.headers.get("x-m365-conversation-id")).toBe(
+      "profile-conv-2",
+    );
+    expect(createConversationCount).toBe(2);
+  });
+
   test("allows an identical retry after an aborted Responses stream before upstream completion", async () => {
     const options = createOptions();
     const conversationStore = new ConversationStore(options);

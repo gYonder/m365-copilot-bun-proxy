@@ -250,6 +250,8 @@ export type WrapperOptions = {
   substrate: SubstrateOptions;
   defaultModel: string;
   defaultTimeZone: string;
+  gatewayToken?: string | null;
+  taskScope?: string | null;
   conversationTtlMinutes: number;
   maxAdditionalContextMessages: number;
   includeConversationIdInResponseBody: boolean;
