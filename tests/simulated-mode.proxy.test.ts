@@ -3049,6 +3049,66 @@ describe("simulated transform mode proxy flow", () => {
     );
   });
 
+  test("responses bounds buffered simulated recovery to one correction turn", async () => {
+    let callCount = 0;
+    const services = createSubstrateStreamingServices(
+      async () => {
+        throw new Error("buffered simulated responses should not use chatStream");
+      },
+      (_request) => {
+        callCount += 1;
+        return buildGraphChatResult(
+          "conv_latency_bound_" + callCount,
+          {},
+          toMarkdownJson({
+            id: "resp_latency_bound_" + callCount,
+            object: "response",
+            status: "completed",
+            output: [
+              {
+                type: "message",
+                role: "assistant",
+                content: [{ type: "output_text", text: "I cannot access the tool." }],
+              },
+            ],
+            output_text: "I cannot access the tool.",
+          }),
+        );
+      },
+    );
+    services.options.confabRetries = 1;
+    services.options.substrate.earlyCompleteOnSimulatedPayload = true;
+    const app = createProxyApp(services);
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: true,
+          input: "Use the shell to run pwd.",
+          tools: [
+            {
+              type: "function",
+              name: "exec_command",
+              description: "Run a command",
+              parameters: {
+                type: "object",
+                properties: { cmd: { type: "string" } },
+                required: ["cmd"],
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(502);
+    expect(callCount).toBe(2);
+  });
+
   test("responses simulated prompt treats copying previous output to the clipboard as a local tool action", async () => {
     const capturedPrompts: string[] = [];
     let callCount = 0;

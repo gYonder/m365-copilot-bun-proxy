@@ -1408,36 +1408,42 @@ async function handleResponsesCreateOnce(
   };
   const executeChatTurnWithRecovery = async (): Promise<ChatResult> => {
     let result = await executeChatTurn();
-    result = await retryConfabGiveUp(
-      services,
-      selectedTransport,
-      baseRequest,
-      result,
-      executeChatTurn,
-    );
-    for (let retry = 0; retry < 2; retry += 1) {
-      if (
-        baseRequest.transformMode !== OpenAiTransformModes.Simulated ||
-        !isInvalidSimulatedResponsesResult(
-          options,
-          result,
-          parsedRequest,
-          conversationId!,
-          options.includeConversationIdInResponseBody,
-        )
-      ) {
-        break;
-      }
+    // Simulated Responses requests are fully buffered, so every recovery turn
+    // adds its complete upstream latency before the caller sees any output.
+    // Do not chain the general confab retry with protocol correction. A bad
+    // simulated payload gets one focused correction turn; all other requests
+    // retain the independently configured confab recovery behavior.
+    if (baseRequest.transformMode !== OpenAiTransformModes.Simulated) {
+      return retryConfabGiveUp(
+        services,
+        selectedTransport,
+        baseRequest,
+        result,
+        executeChatTurn,
+      );
+    }
+    if (
+      isInvalidSimulatedResponsesResult(
+        options,
+        result,
+        parsedRequest,
+        conversationId!,
+        options.includeConversationIdInResponseBody,
+      )
+    ) {
+      services.observability?.record("retry", {
+        reason: "simulated_protocol_correction",
+        retryCount: 1,
+      });
       const retryConversationId =
         services.substrateClient.createConversation().conversationId;
-      if (!retryConversationId) {
-        break;
+      if (retryConversationId) {
+        result = await executeChatTurn(
+          retryConversationId,
+          true,
+          buildSimulatedProtocolRetryRequest(baseRequest, 1),
+        );
       }
-      result = await executeChatTurn(
-        retryConversationId,
-        true,
-        buildSimulatedProtocolRetryRequest(baseRequest, retry + 1),
-      );
     }
     return result;
   };
