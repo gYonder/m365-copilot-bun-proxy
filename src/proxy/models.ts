@@ -3,6 +3,7 @@ import type { JsonObject } from "./types";
 // Codex M365 has one supported route. Keep the advertised catalog narrow so
 // clients cannot select unverified M365 selectors.
 export const AvailableModelIds = ["gpt-5.6-sol"] as const;
+export const ConfiguredContextLimit = 400_000;
 
 const CodexBaseInstructions =
   "You are Codex, a coding agent running in a local CLI. You and the user share the same workspace. Use the available shell/file tools to inspect and change files when a task requires local state, and verify the result before claiming it is done.";
@@ -55,7 +56,7 @@ function buildCodexModelInfo(
     truncation_policy: { mode: "tokens", limit: 10_000 },
     supports_parallel_tool_calls: true,
     supports_image_detail_original: false,
-    context_window: 400_000,
+    context_window: ConfiguredContextLimit,
     experimental_supported_tools: [],
     input_modalities: ["text"],
   };

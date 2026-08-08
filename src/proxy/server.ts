@@ -7,7 +7,7 @@ import {
 } from "./clients";
 import { ConversationStore } from "./conversation-store";
 import { DebugMarkdownLogger } from "./logger";
-import { buildModelsResponse } from "./models";
+import { buildModelsResponse, ConfiguredContextLimit } from "./models";
 import {
   buildAssistantResponse,
   buildChatCompletion,
@@ -220,6 +220,9 @@ function buildHealthResponse(options: WrapperOptions): JsonObject {
     ),
     transport: options.transport,
     defaultModel: options.defaultModel,
+    configured_context_limit: ConfiguredContextLimit,
+    observed_safe_context_limit: null,
+    verified_provider_context_limit: null,
   };
 }
 
@@ -2395,8 +2398,7 @@ export function looksLikeConfabGiveUp(text: string | null | undefined): boolean 
 // canned "I can't reach the tools, restart the task" give-up. Each retry runs
 // on a fresh ephemeral conversation so no partial/confabulated turn pollutes the
 // context. Only the non-streaming paths use this: a true streaming turn has
-// already emitted deltas that cannot be retracted. A hard failure on retry is
-// discarded in favour of the original (soft) answer.
+// already emitted deltas that cannot be retracted.
 async function retryConfabGiveUp(
   services: Services,
   transport: string,
@@ -2448,7 +2450,24 @@ async function retryConfabGiveUp(
     }
     result = retryResult;
   }
-  return result;
+  const finalAssistantText = result.isSuccess
+    ? result.assistantText ??
+      extractCopilotAssistantText(result.responseJson, request.promptText) ??
+      ""
+    : "";
+  if (!result.isSuccess || !looksLikeConfabGiveUp(finalAssistantText)) {
+    return result;
+  }
+  const failure = classifyBridgeFailure("confab_recovery_exhausted");
+  return {
+    isSuccess: false,
+    statusCode: 502,
+    responseJson: null,
+    rawBody: JSON.stringify({ message: failure.message, code: failure.code }),
+    assistantText: null,
+    conversationId: null,
+    errorCode: failure.code,
+  };
 }
 
 function shouldRetrySimulatedToollessChatPayload(

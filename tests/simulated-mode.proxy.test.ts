@@ -44,6 +44,9 @@ describe("simulated transform mode proxy flow", () => {
     expect(body.status).toBe("ok");
     expect(body.openAiTransformMode).toBe(OpenAiTransformModes.Mapped);
     expect(body.defaultModel).toBe("gpt-5.6-sol");
+    expect(body.configured_context_limit).toBe(400_000);
+    expect(body.observed_safe_context_limit).toBeNull();
+    expect(body.verified_provider_context_limit).toBeNull();
   });
 
   test("mapped responses prompt inlines required local tool contract", () => {

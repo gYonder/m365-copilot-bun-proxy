@@ -21,6 +21,7 @@ const REAL_REASON_MAPPINGS = [
   ["image_generation_disabled", "capability_unavailable"],
   ["substrate_terminal_error", "transport_failed"],
   ["substrate_incomplete_terminal", "ambiguous_completion"],
+  ["confab_recovery_exhausted", "ambiguous_completion"],
   ["image_generation_failed", "artifact_rejected"],
 ] as const satisfies ReadonlyArray<readonly [InternalReason, BridgeErrorCode]>;
 

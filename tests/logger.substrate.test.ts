@@ -270,6 +270,41 @@ describe("DebugMarkdownLogger substrate response logging", () => {
     );
     expect(files.length).toBe(0);
   });
+
+  test("normal logging omits request and response bodies", async () => {
+    const debugPath = path.resolve("tests/.logger-body-check");
+    rmSync(debugPath, { recursive: true, force: true });
+    try {
+      const logger = new DebugMarkdownLogger(
+        createOptions(debugPath, LogLevels.Info),
+        true,
+      );
+      const secret = "seeded-body-secret";
+      await logger.logIncomingRequest(
+        new Request("http://localhost/v1/responses", { method: "POST" }),
+        JSON.stringify({ secret }),
+      );
+      await logger.logUpstreamRequest(
+        "POST",
+        "https://example.invalid/upstream",
+        [],
+        JSON.stringify({ secret }),
+      );
+      await logger.logOutgoingResponse(
+        200,
+        [["content-type", "application/json"]],
+        JSON.stringify({ secret }),
+      );
+
+      const files = readdirSync(debugPath);
+      const content = files
+        .map((file) => readFileSync(path.join(debugPath, file), "utf8"))
+        .join("\n");
+      expect(content).not.toContain(secret);
+    } finally {
+      rmSync(debugPath, { recursive: true, force: true });
+    }
+  });
 });
 
 function createOptions(

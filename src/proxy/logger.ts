@@ -361,7 +361,7 @@ export class DebugMarkdownLogger {
     for (const [header, value] of headers) {
       lines.push(`| ${header} | ${redactHeaderValue(header, value)} |`);
     }
-    if (body && body.trim()) {
+    if (body && body.trim() && this.isLevelEnabled("debug")) {
       lines.push("", "```json", tryPrettyJson(body), "```");
     }
     const content = lines.join("\n");
