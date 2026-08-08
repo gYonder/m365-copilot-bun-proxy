@@ -39,6 +39,7 @@ import {
   type BridgeFailure,
   type InternalReason,
 } from "./failure-classifier";
+import { hashCanonicalJson } from "./canonical-json";
 import { ResponsesEventWriter } from "./responses-event-writer";
 import {
   estimateResponsesContext,
@@ -76,6 +77,11 @@ import { ProxyTokenProvider } from "./token-provider";
 import { ProxyVizTraceStore } from "./viz-trace-store";
 import { ImageGenerationService } from "./image-generation";
 import { BridgeObservability } from "./observability";
+import {
+  type ToolCallToIssue,
+  type ToolLedger,
+  type ToolLedgerError,
+} from "./tool-ledger";
 import {
   cloneJsonValue,
   extractGraphErrorMessage,
@@ -1095,31 +1101,6 @@ async function handleResponsesCreateOnce(
     selectedTransport,
     requestHash,
   );
-  const isProtocolIdentity = replayIdentityKey.startsWith("protocol:");
-  const storedRequestReplay = isProtocolIdentity
-    ? responseStore.tryGetProtocolReplay(replayIdentityKey)
-    : hasPriorToolResult(payload.json)
-      ? null
-      : responseStore.tryGetRequestReplay(requestHash);
-  if (storedRequestReplay) {
-    services.observability?.record("dedup_hit", {
-      kind: isProtocolIdentity ? "protocol_replay" : "legacy_replay",
-    });
-    responseHeaders.set(
-      isProtocolIdentity
-        ? "x-m365-protocol-identity-replayed"
-        : "x-m365-request-hash-replayed",
-      "true",
-    );
-    return buildStoredReplayResponsesResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      storedRequestReplay.conversationId,
-      storedRequestReplay.response,
-      request.signal,
-    );
-  }
   const conversationSelection = selectConversation(
     request,
     payload.json,
@@ -1149,14 +1130,75 @@ async function handleResponsesCreateOnce(
     conversationId = previousConversationId;
   }
 
-  if (!conversationId) {
-    if (!conversationSelection.forceNewConversation && scopedConversationKey) {
-      const existing = conversationStore.tryGet(scopedConversationKey);
-      if (existing) {
-        conversationId = existing;
-      }
+  if (!conversationId && !conversationSelection.forceNewConversation && scopedConversationKey) {
+    const existing = conversationStore.tryGet(scopedConversationKey);
+    if (existing) {
+      conversationId = existing;
     }
+  }
 
+  const taskDeadlineMs = resolveResponsesTaskDeadlineMs(
+    payload.json,
+    responseStore,
+    options,
+  );
+  const isProtocolIdentity = replayIdentityKey.startsWith("protocol:");
+  const storedRequestReplay = isProtocolIdentity
+    ? responseStore.tryGetProtocolReplay(replayIdentityKey)
+    : hasPriorToolResult(payload.json)
+      ? null
+      : responseStore.tryGetRequestReplay(requestHash);
+  if (storedRequestReplay) {
+    services.observability?.record("dedup_hit", {
+      kind: isProtocolIdentity ? "protocol_replay" : "legacy_replay",
+    });
+    responseHeaders.set(
+      isProtocolIdentity
+        ? "x-m365-protocol-identity-replayed"
+        : "x-m365-request-hash-replayed",
+      "true",
+    );
+    return buildStoredReplayResponsesResult(
+      services,
+      parsedRequest,
+      responseHeaders,
+      storedRequestReplay.conversationId,
+      storedRequestReplay.response,
+      request.signal,
+    );
+  }
+
+  const toolLedgerScope = computeResponsesToolLedgerScope(
+    payload.json,
+    conversationId ??
+      parsedRequest.protocolIdentity.conversationId ??
+      scopedConversationKey,
+  );
+  const toolProfileKey = computeResponsesToolProfileKey(
+    baseRequest,
+    selectedTransport,
+  );
+  const toolLedger = responseStore.getOrCreateToolLedger(toolLedgerScope);
+  const toolResultFailure = validateResponsesToolResults(
+    payload.json,
+    toolLedger,
+    toolLedgerScope,
+    toolProfileKey,
+    responseStore,
+  );
+  if (toolResultFailure) {
+    return buildResponsesLedgerFailureResult(
+      services,
+      parsedRequest,
+      responseHeaders,
+      conversationId,
+      taskDeadlineMs,
+      toolResultFailure,
+      request.signal,
+    );
+  }
+
+  if (!conversationId) {
     if (!conversationId) {
       const createResult =
         selectedTransport === TransportNames.Substrate
@@ -1209,11 +1251,6 @@ async function handleResponsesCreateOnce(
   }
 
   const graphPayload = buildCopilotRequestPayload(baseRequest);
-  const taskDeadlineMs = resolveResponsesTaskDeadlineMs(
-    payload.json,
-    responseStore,
-    options,
-  );
   if (selectedTransport === TransportNames.Graph) {
     tracePane3(services, trace, graphPayload);
   }
@@ -1351,6 +1388,7 @@ async function handleResponsesCreateOnce(
             parsedRequest,
             conversationId,
             normalized.responseBody,
+            selectedTransport,
             responseHeaders,
             trace,
             replayIdentityKey,
@@ -1384,11 +1422,31 @@ async function handleResponsesCreateOnce(
       if (strictToolError) {
         return strictToolError;
       }
+      const responseId = createOpenAiResponseId();
+      const toolLedgerFailure = issueResponsesToolCalls(
+        services.responseStore,
+        computeResponsesToolLedgerScope(parsedRequest.rawRequest, conversationId),
+        computeResponsesToolProfileKey(baseRequest, selectedTransport),
+        responseId,
+        assistantToolCallsForLedger(assistantResponse.toolCalls),
+      );
+      if (toolLedgerFailure) {
+        return buildResponsesLedgerFailureResult(
+          services,
+          parsedRequest,
+          responseHeaders,
+          conversationId,
+          taskDeadlineMs,
+          toolLedgerFailure,
+          request.signal,
+        );
+      }
       return buildBufferedResponsesStreamResponse(
         services,
         parsedRequest,
         conversationId,
         assistantResponse,
+        responseId,
         responseHeaders,
         trace,
         replayIdentityKey,
@@ -1514,6 +1572,28 @@ async function handleResponsesCreateOnce(
         );
       }
 
+      const toolLedgerFailure = issueResponsesToolCalls(
+        responseStore,
+        computeResponsesToolLedgerScope(payload.json, conversationId),
+        computeResponsesToolProfileKey(baseRequest, selectedTransport),
+        normalized.responseId,
+        outputItemsForLedger(
+          Array.isArray(normalized.responseBody.output)
+            ? normalized.responseBody.output.filter(isJsonObject)
+            : [],
+        ),
+      );
+      if (toolLedgerFailure) {
+        return buildResponsesLedgerFailureResult(
+          services,
+          parsedRequest,
+          responseHeaders,
+          conversationId,
+          taskDeadlineMs,
+          toolLedgerFailure,
+          request.signal,
+        );
+      }
       responseStore.set(
         normalized.responseId,
         normalized.responseBody,
@@ -1583,6 +1663,24 @@ async function handleResponsesCreateOnce(
     options.includeConversationIdInResponseBody,
     conversationId,
   );
+  const toolLedgerFailure = issueResponsesToolCalls(
+    responseStore,
+    computeResponsesToolLedgerScope(payload.json, conversationId),
+    computeResponsesToolProfileKey(baseRequest, selectedTransport),
+    responseId,
+    assistantToolCallsForLedger(assistantResponse.toolCalls),
+  );
+  if (toolLedgerFailure) {
+    return buildResponsesLedgerFailureResult(
+      services,
+      parsedRequest,
+      responseHeaders,
+      conversationId,
+      taskDeadlineMs,
+      toolLedgerFailure,
+      request.signal,
+    );
+  }
   responseStore.set(responseId, responseBody, conversationId, taskDeadlineMs);
   rememberResponsesReplayIdentity(
     responseStore,
@@ -1994,13 +2092,13 @@ async function buildBufferedResponsesStreamResponse(
   parsedRequest: ParsedResponsesRequest,
   conversationId: string,
   assistantResponse: ReturnType<typeof buildAssistantResponse>,
+  responseId: string,
   headers: Headers,
   trace: TraceContext | null,
   replayIdentityKey: string,
   taskDeadlineMs: number,
   signal?: AbortSignal,
 ): Promise<Response> {
-  const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
   const includeConversationId = services.options.includeConversationIdInResponseBody;
   const stream = new ReadableStream<Uint8Array>({
@@ -3062,6 +3160,7 @@ async function buildSimulatedResponsesStreamResponse(
   parsedRequest: ParsedResponsesRequest,
   conversationId: string,
   payload: JsonObject,
+  selectedTransport: string,
   headers: Headers,
   trace: TraceContext | null,
   replayIdentityKey: string,
@@ -3105,6 +3204,24 @@ async function buildSimulatedResponsesStreamResponse(
     return normalizedItem;
   });
   const responseConversationId = includeConversationId ? conversationId : null;
+  const toolLedgerFailure = issueResponsesToolCalls(
+    services.responseStore,
+    computeResponsesToolLedgerScope(parsedRequest.rawRequest, conversationId),
+    computeResponsesToolProfileKey(parsedRequest.base, selectedTransport),
+    responseId,
+    outputItemsForLedger(finalizedOutputItems),
+  );
+  if (toolLedgerFailure) {
+    return buildResponsesLedgerFailureResult(
+      services,
+      parsedRequest,
+      headers,
+      conversationId,
+      taskDeadlineMs,
+      toolLedgerFailure,
+      signal,
+    );
+  }
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -3421,6 +3538,218 @@ export function computeResponsesTaskKey(requestJson: JsonObject): string {
     input,
   });
   return createHash("sha256").update(canonical).digest("hex");
+}
+
+function computeResponsesToolLedgerScope(
+  requestJson: JsonObject,
+  conversationScope: string | null,
+): string {
+  return hashCanonicalJson({
+    task: computeResponsesTaskKey(requestJson),
+    conversation: conversationScope?.trim() || null,
+  });
+}
+
+function computeResponsesToolProfileKey(
+  request: ParsedOpenAiRequest,
+  transport: string,
+): string {
+  return hashCanonicalJson({
+    model: request.model,
+    transform_mode: request.transformMode,
+    transport,
+    user_key: request.userKey,
+  });
+}
+
+function validateResponsesToolResults(
+  requestJson: JsonObject,
+  ledger: ToolLedger,
+  taskId: string,
+  requestProfileKey: string,
+  responseStore: ResponseStore,
+): ToolLedgerError | null {
+  const resultItems = Array.isArray(requestJson.input)
+    ? requestJson.input.filter((item): item is JsonObject => {
+        if (!isJsonObject(item)) return false;
+        const type = (tryGetString(item, "type") ?? "").toLowerCase();
+        return (
+          type === "function_call_output" || type === "custom_tool_call_output"
+        );
+      })
+    : [];
+  if (resultItems.length === 0) {
+    return null;
+  }
+
+  const hadPending = ledger.hasPending(taskId);
+  let accepted = false;
+  for (const item of resultItems) {
+    const callId = tryGetString(item, "call_id") ?? "";
+    const knownCall = ledger.get(callId);
+    if (!knownCall && !hadPending) {
+      continue;
+    }
+    const result = ledger.acceptResult(callId, requestProfileKey);
+    if (!result.ok) {
+      if (accepted) {
+        responseStore.saveToolLedger(taskId, ledger);
+      }
+      return result.error;
+    }
+    accepted = true;
+  }
+  if (accepted) {
+    responseStore.saveToolLedger(taskId, ledger);
+  }
+  return null;
+}
+
+function issueResponsesToolCalls(
+  responseStore: ResponseStore,
+  taskId: string,
+  requestProfileKey: string,
+  responseId: string,
+  calls: readonly ToolCallToIssue[],
+): ToolLedgerError | null {
+  if (calls.length === 0) {
+    return null;
+  }
+  const ledger = responseStore.getOrCreateToolLedger(taskId);
+  const issued = ledger.issueCalls({
+    taskId,
+    responseId,
+    requestProfileKey,
+    calls,
+    round: ledger.nextRound(taskId),
+  });
+  if (!issued.ok) {
+    return issued.error;
+  }
+  responseStore.saveToolLedger(taskId, ledger);
+  return null;
+}
+
+function assistantToolCallsForLedger(
+  toolCalls: readonly OpenAiAssistantToolCall[],
+): ToolCallToIssue[] {
+  return toolCalls.map((toolCall) => ({
+    call_id: toolCall.id,
+    name: toolCall.name,
+    type: toolCall.type,
+    arguments:
+      toolCall.type === "custom"
+        ? JSON.stringify(toolCall.argumentsJson)
+        : toolCall.argumentsJson,
+  }));
+}
+
+function outputItemsForLedger(
+  outputItems: readonly JsonObject[],
+): ToolCallToIssue[] {
+  const calls: ToolCallToIssue[] = [];
+  for (const item of outputItems) {
+    const type = (tryGetString(item, "type") ?? "").toLowerCase();
+    if (type !== "function_call" && type !== "custom_tool_call") {
+      continue;
+    }
+    calls.push({
+      call_id: tryGetString(item, "call_id") ?? "",
+      name: tryGetString(item, "name") ?? "",
+      type: type === "custom_tool_call" ? "custom" : "function",
+      arguments:
+        type === "custom_tool_call"
+          ? JSON.stringify(tryGetString(item, "input") ?? "")
+          : (item.arguments ?? "{}"),
+    });
+  }
+  return calls;
+}
+
+function buildResponsesLedgerFailureResult(
+  services: Services,
+  parsedRequest: ParsedResponsesRequest,
+  headers: Headers,
+  conversationId: string | null,
+  taskDeadlineMs: number,
+  failure: ToolLedgerError,
+  signal?: AbortSignal,
+): Response {
+  const responseId = createOpenAiResponseId();
+  const createdAt = nowUnix();
+  const responseConversationId =
+    services.options.includeConversationIdInResponseBody
+      ? conversationId
+      : null;
+  const inProgress = buildOpenAiResponseObject(
+    responseId,
+    createdAt,
+    parsedRequest.base.model,
+    "in_progress",
+    [],
+    parsedRequest,
+    responseConversationId,
+  );
+
+  if (!parsedRequest.base.stream) {
+    const writer = new ResponsesEventWriter(() => {});
+    emitResponsesFailureTerminal(writer, inProgress, failure.reason);
+    const terminalResponse =
+      writer.terminalState && writer.terminalState.kind !== "cancelled"
+        ? writer.terminalState.response
+        : inProgress;
+    services.responseStore.set(
+      responseId,
+      terminalResponse,
+      conversationId,
+      taskDeadlineMs,
+    );
+    headers.set("content-type", "application/json");
+    if (conversationId) {
+      headers.set("x-m365-conversation-id", conversationId);
+    }
+    return new Response(JSON.stringify(terminalResponse), {
+      status: 200,
+      headers,
+    });
+  }
+
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const encoder = new TextEncoder();
+      const writer = new ResponsesEventWriter((event) => {
+        enqueueSseJsonEvent(controller, encoder, event);
+      });
+      if (signal?.aborted) {
+        writer.clientAbort();
+      } else {
+        writer.created(inProgress);
+        writer.inProgress(inProgress);
+        emitResponsesFailureTerminal(writer, inProgress, failure.reason);
+        if (
+          writer.terminalState &&
+          writer.terminalState.kind !== "cancelled"
+        ) {
+          services.responseStore.set(
+            responseId,
+            writer.terminalState.response,
+            conversationId,
+            taskDeadlineMs,
+          );
+        }
+      }
+      if (writer.terminalState?.kind !== "cancelled") {
+        enqueueSseDoneEvent(controller, encoder);
+      }
+      controller.close();
+    },
+  });
+  headers.set("content-type", "text/event-stream");
+  headers.set("cache-control", "no-cache");
+  if (conversationId) {
+    headers.set("x-m365-conversation-id", conversationId);
+  }
+  return finalizeOutgoingStreamResponse(services, stream, headers);
 }
 
 function buildReplayResponseIdFromHash(requestHash: string): string {

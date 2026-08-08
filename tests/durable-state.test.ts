@@ -78,6 +78,35 @@ describe("durable continuation metadata", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
+  test("persists bounded tool ledger metadata without tool results", () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "m365-ledger-"));
+    const file = path.join(dir, "continuation.json");
+    const options = { conversationTtlMinutes: 180 } as WrapperOptions;
+    const first = new ResponseStore(options, new DurableStateStore(file));
+    const ledger = first.getOrCreateToolLedger("task-key");
+    const issued = ledger.issueCalls({
+      taskId: "task-key",
+      responseId: "response-1",
+      requestProfileKey: "profile-1",
+      calls: [
+        {
+          call_id: "call-1",
+          name: "read_file",
+          type: "function",
+          arguments: { path: "README.md" },
+        },
+      ],
+      round: 1,
+    });
+    expect(issued.ok).toBeTrue();
+    first.saveToolLedger("task-key", ledger);
+
+    const resumed = new ResponseStore(options, new DurableStateStore(file));
+    expect(resumed.getOrCreateToolLedger("task-key").get("call-1")).not.toBeNull();
+    expect(readFileSync(file, "utf8")).not.toContain("tool result body");
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   test("removes expired durable protocol replays", () => {
     const dir = mkdtempSync(path.join(tmpdir(), "m365-replay-expired-"));
     const file = path.join(dir, "continuation.json");

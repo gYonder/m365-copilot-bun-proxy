@@ -63,7 +63,7 @@ describe("ToolLedger", () => {
     expect(superseded.acceptResult("new-call", "profile-1").ok).toBe(true);
   });
 
-  test("bounds repeated canonical calls regardless of key order", () => {
+  test("resets repetition detection after a different call", () => {
     const ledger = new ToolLedger({ now: () => 1_000 });
     expect(issue(ledger, "call-1", { a: 1, b: 2 }).ok).toBe(true);
     expect(ledger.acceptResult("call-1", "profile-1").ok).toBe(true);
@@ -78,7 +78,26 @@ describe("ToolLedger", () => {
     ).toBe(true);
     expect(ledger.acceptResult("call-2", "profile-1").ok).toBe(true);
 
-    const repeated = issue(ledger, "call-3", { a: 1, b: 2 }, 3, "response-3");
+    expect(issue(ledger, "call-3", { path: "other.txt" }, 3, "response-3").ok).toBe(
+      true,
+    );
+    expect(ledger.acceptResult("call-3", "profile-1").ok).toBe(true);
+    expect(issue(ledger, "call-4", { a: 1, b: 2 }, 4, "response-4").ok).toBe(
+      true,
+    );
+  });
+
+  test("rejects a runaway sequence of consecutive identical calls", () => {
+    const ledger = new ToolLedger({ now: () => 1_000 });
+    for (let index = 1; index <= 4; index += 1) {
+      const callId = `call-${index}`;
+      expect(
+        issue(ledger, callId, { a: 1, b: 2 }, index, `response-${index}`).ok,
+      ).toBe(true);
+      expect(ledger.acceptResult(callId, "profile-1").ok).toBe(true);
+    }
+
+    const repeated = issue(ledger, "call-5", { a: 1, b: 2 }, 5, "response-5");
     expect(repeated.ok).toBe(false);
     if (!repeated.ok) {
       expect(repeated.error.kind).toBe("repetition_bound_exhausted");
@@ -124,6 +143,27 @@ describe("ToolLedger", () => {
     );
     expect(roundCap.ok).toBe(false);
     if (!roundCap.ok) expect(roundCap.error.kind).toBe("round_cap_exceeded");
+  });
+
+  test("does not evict pending calls when the entry cap is reached", () => {
+    const ledger = new ToolLedger({
+      now: () => 1_000,
+      maxEntries: 2,
+    });
+    expect(issue(ledger, "call-1", { one: 1 }).ok).toBe(true);
+    expect(issue(ledger, "call-2", { two: 2 }, 2, "response-2").ok).toBe(
+      true,
+    );
+
+    const rejected = issue(ledger, "call-3", { three: 3 }, 3, "response-3");
+    expect(rejected.ok).toBe(false);
+    if (!rejected.ok) {
+      expect(rejected.error.kind).toBe("ledger_capacity_exceeded");
+    }
+    expect(ledger.pendingCalls("task-1").map((entry) => entry.call_id)).toEqual([
+      "call-1",
+      "call-2",
+    ]);
   });
 
   test("allows one corrective re-ask per malformed call", () => {

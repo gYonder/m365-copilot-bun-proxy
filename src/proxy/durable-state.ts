@@ -31,12 +31,18 @@ export type DurableReplayEntry = {
   expiresAtUtc: number;
 };
 
+export type DurableToolLedgerEntry = {
+  serialized: string;
+  expiresAtUtc: number;
+};
+
 export type DurableState = {
   version: 1;
   responses: Record<string, DurableResponseEntry>;
   conversations: Record<string, DurableConversationEntry>;
   sessions: Record<string, DurableSessionEntry>;
   replays: Record<string, DurableReplayEntry>;
+  toolLedgers: Record<string, DurableToolLedgerEntry>;
 };
 
 const emptyState = (): DurableState => ({
@@ -45,6 +51,7 @@ const emptyState = (): DurableState => ({
   conversations: {},
   sessions: {},
   replays: {},
+  toolLedgers: {},
 });
 
 export function durableStatePath(): string | null {
@@ -77,6 +84,7 @@ export class DurableStateStore {
       this.state.conversations,
       this.state.sessions,
       this.state.replays,
+      this.state.toolLedgers,
     ]) {
       for (const [key, value] of Object.entries(collection)) {
         if (value.expiresAtUtc <= now) delete collection[key];
@@ -104,7 +112,24 @@ function parseState(value: unknown): DurableState {
     conversations: parseConversationEntries(value.conversations),
     sessions: parseSessionEntries(value.sessions),
     replays: parseReplayEntries(value.replays),
+    toolLedgers: parseToolLedgerEntries(value.toolLedgers),
   };
+}
+
+function parseToolLedgerEntries(
+  value: unknown,
+): Record<string, DurableToolLedgerEntry> {
+  const output: Record<string, DurableToolLedgerEntry> = {};
+  if (!isRecord(value)) return output;
+  for (const [key, entry] of Object.entries(value)) {
+    if (!isRecord(entry)) continue;
+    const serialized = readString(entry.serialized);
+    const expiresAtUtc = readPositiveNumber(entry.expiresAtUtc);
+    if (serialized && expiresAtUtc !== null) {
+      output[key] = { serialized, expiresAtUtc };
+    }
+  }
+  return output;
 }
 
 function parseReplayEntries(value: unknown): Record<string, DurableReplayEntry> {

@@ -8,9 +8,9 @@ import {
 // Keep this at or below response-store.ts:31's 60-second replay guard.
 export const TOOL_LEDGER_PENDING_TTL_MS = 60_000;
 export const MAX_TOOL_CALLS_PER_RESPONSE = 8;
-export const MAX_TOOL_ROUNDS_PER_TASK = 8;
+export const MAX_TOOL_ROUNDS_PER_TASK = 200;
 export const MAX_TOOL_LEDGER_ENTRIES = 128;
-export const MAX_TOOL_REPETITIONS_PER_TASK = 2;
+export const MAX_TOOL_REPETITIONS_PER_TASK = 4;
 export const MAX_TOOL_CORRECTIVE_REASKS_PER_CALL = 1;
 export const TOOL_LEDGER_STATE_VERSION = 1;
 
@@ -129,7 +129,8 @@ type CallMetadata = {
 
 type TaskState = {
   rounds: Set<number>;
-  repetitions: Map<string, number>;
+  lastRepetitionKey: string | null;
+  consecutiveRepetitions: number;
   responseCounts: Map<string, number>;
   correctiveReaskCallIds: Set<string>;
 };
@@ -217,10 +218,10 @@ export class ToolLedger {
     const prepared: Array<{
       input: ToolCallToIssue;
       canonicalArguments: string;
-      repetitionKey: string;
     }> = [];
     const callIds = new Set<string>();
-    const batchRepetitions = new Map<string, number>();
+    let batchRepetitionKey = task?.lastRepetitionKey ?? null;
+    let batchRepetitionCount = task?.consecutiveRepetitions ?? 0;
     for (const input of request.calls) {
       if (
         !isRecord(input) ||
@@ -236,26 +237,22 @@ export class ToolLedger {
       const canonical = canonicalArguments(input.arguments);
       if (!canonical.ok) return canonical;
       const repetitionKey = repetitionIdentity(input.name, canonical.value);
-      const previous = task?.repetitions.get(repetitionKey) ?? 0;
-      const inBatch = batchRepetitions.get(repetitionKey) ?? 0;
-      if (
-        previous + inBatch >= this.maxRepetitionsPerTask ||
-        (previous === 0 &&
-          !batchRepetitions.has(repetitionKey) &&
-          (task?.repetitions.size ?? 0) + batchRepetitions.size >=
-            MAX_TOOL_LEDGER_ENTRIES)
-      ) {
+      if (repetitionKey === batchRepetitionKey) {
+        batchRepetitionCount += 1;
+      } else {
+        batchRepetitionKey = repetitionKey;
+        batchRepetitionCount = 1;
+      }
+      if (batchRepetitionCount > this.maxRepetitionsPerTask) {
         return this.reject(
           "repetition_bound_exhausted",
           "tool_round_repetition_bound_exhausted",
         );
       }
       callIds.add(input.call_id);
-      batchRepetitions.set(repetitionKey, inBatch + 1);
       prepared.push({
         input,
         canonicalArguments: canonical.value,
-        repetitionKey,
       });
     }
 
@@ -265,6 +262,8 @@ export class ToolLedger {
     const state = task ?? emptyTask();
     this.tasks.set(request.taskId, state);
     state.rounds.add(request.round);
+    state.lastRepetitionKey = batchRepetitionKey;
+    state.consecutiveRepetitions = batchRepetitionCount;
     state.responseCounts.set(
       request.responseId,
       responseCount + prepared.length,
@@ -288,10 +287,6 @@ export class ToolLedger {
         round: request.round,
         sequence: this.sequence++,
       });
-      state.repetitions.set(
-        item.repetitionKey,
-        (state.repetitions.get(item.repetitionKey) ?? 0) + 1,
-      );
       issued.push({ ...entry });
     }
     return { ok: true, value: issued };
@@ -357,6 +352,17 @@ export class ToolLedger {
     return entry ? { ...entry } : null;
   }
 
+  hasTask(taskId: string): boolean {
+    this.expirePending(this.readNow());
+    return this.tasks.has(taskId);
+  }
+
+  nextRound(taskId: string): number {
+    this.expirePending(this.readNow());
+    const task = this.tasks.get(taskId);
+    return task ? Math.max(...task.rounds, 0) + 1 : 1;
+  }
+
   pendingCalls(taskId?: string): IssuedCall[] {
     this.expirePending(this.readNow());
     return [...this.entries.values()]
@@ -391,15 +397,21 @@ export class ToolLedger {
       tasks: [...this.tasks.entries()].map(([task_id, task]) => ({
         task_id,
         rounds: [...task.rounds].sort((left, right) => left - right),
-        repetitions: [...task.repetitions.entries()].map(
-          ([identity, count]) => {
-            const [name, canonical_arguments] = JSON.parse(identity) as [
-              string,
-              string,
-            ];
-            return { name, canonical_arguments, count };
-          },
-        ),
+        repetitions:
+          task.lastRepetitionKey === null
+            ? []
+            : (() => {
+                const [name, canonical_arguments] = JSON.parse(
+                  task.lastRepetitionKey,
+                ) as [string, string];
+                return [
+                  {
+                    name,
+                    canonical_arguments,
+                    count: task.consecutiveRepetitions,
+                  },
+                ];
+              })(),
         response_counts: [...task.responseCounts.entries()].map(
           ([key, count]) => ({ key, count }),
         ),
@@ -467,15 +479,13 @@ export class ToolLedger {
       taskIds.add(value.task_id);
       const task = emptyTask();
       task.rounds = new Set(value.rounds);
-      for (const repetition of value.repetitions) {
-        const key = repetitionIdentity(
+      if (value.repetitions.length > 0) {
+        const repetition = value.repetitions[value.repetitions.length - 1];
+        task.lastRepetitionKey = repetitionIdentity(
           repetition.name,
           repetition.canonical_arguments,
         );
-        if (task.repetitions.has(key)) {
-          throw malformed("duplicate repetition identity");
-        }
-        task.repetitions.set(key, repetition.count);
+        task.consecutiveRepetitions = repetition.count;
       }
       for (const count of value.response_counts) {
         if (task.responseCounts.has(count.key)) {
@@ -657,7 +667,8 @@ function validateIssueRequest(
 function emptyTask(): TaskState {
   return {
     rounds: new Set(),
-    repetitions: new Map(),
+    lastRepetitionKey: null,
+    consecutiveRepetitions: 0,
     responseCounts: new Map(),
     correctiveReaskCallIds: new Set(),
   };

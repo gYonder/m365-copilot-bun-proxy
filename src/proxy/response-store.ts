@@ -3,9 +3,11 @@ import type {
   StoredOpenAiResponseRecord,
   WrapperOptions,
 } from "./types";
+import { createHash } from "node:crypto";
 import { cloneJsonValue, nowUnix } from "./utils";
 import { DurableStateStore } from "./durable-state";
 import type { BridgeObservability } from "./observability";
+import { ToolLedger } from "./tool-ledger";
 
 type ConversationLinkEntry = {
   conversationId: string;
@@ -28,6 +30,11 @@ type TaskDeadlineEntry = {
   expiresAtUtc: number;
 };
 
+type ToolLedgerEntry = {
+  ledger: ToolLedger;
+  expiresAtUtc: number;
+};
+
 const RequestHashGuardTtlMs = 60_000;
 const MaxStoredResponses = 1_024;
 const MaxRequestHashes = 2_048;
@@ -37,6 +44,7 @@ export class ResponseStore {
   private readonly conversationLinks = new Map<string, ConversationLinkEntry>();
   private readonly requestHashes = new Map<string, RequestHashEntry>();
   private readonly taskDeadlines = new Map<string, TaskDeadlineEntry>();
+  private readonly toolLedgers = new Map<string, ToolLedgerEntry>();
   private readonly inFlightResponses = new Map<string, Promise<Response>>();
 
   constructor(
@@ -48,6 +56,24 @@ export class ResponseStore {
     for (const [id, entry] of Object.entries(this.durable.state.responses)) {
       if (entry.expiresAtUtc > now) this.conversationLinks.set(id, entry);
     }
+    for (const [key, entry] of Object.entries(this.durable.state.toolLedgers)) {
+      if (entry.expiresAtUtc <= now) continue;
+      try {
+        const recovered = ToolLedger.recover(entry.serialized, now, {
+          now: () => Date.now(),
+        });
+        this.recordToolLedgerRecovery(recovered.outcomes);
+        if (recovered.ledger.size > 0) {
+          this.toolLedgers.set(key, {
+            ledger: recovered.ledger,
+            expiresAtUtc: entry.expiresAtUtc,
+          });
+        }
+      } catch {
+        delete this.durable.state.toolLedgers[key];
+      }
+    }
+    this.durable.save();
   }
 
   set(
@@ -164,6 +190,50 @@ export class ResponseStore {
     });
     this.trimOldest(this.taskDeadlines, MaxStoredResponses, "task_deadline");
     return deadlineMs;
+  }
+
+  getOrCreateToolLedger(taskKey: string): ToolLedger {
+    this.purgeExpired();
+    const key = durableKey(taskKey);
+    const existing = this.toolLedgers.get(key);
+    if (existing) {
+      this.recordToolLedgerRecovery(existing.ledger.recoverExpired(Date.now()));
+      if (existing.ledger.size === 0) {
+        this.toolLedgers.delete(key);
+        delete this.durable.state.toolLedgers[key];
+      } else {
+        this.toolLedgers.delete(key);
+        this.toolLedgers.set(key, existing);
+        return existing.ledger;
+      }
+    }
+
+    const ledger = new ToolLedger();
+    this.toolLedgers.set(key, {
+      ledger,
+      expiresAtUtc: this.resolveExpiryMs(),
+    });
+    this.trimToolLedgers();
+    return ledger;
+  }
+
+  saveToolLedger(taskKey: string, ledger: ToolLedger): void {
+    const key = durableKey(taskKey);
+    if (ledger.size === 0) {
+      this.toolLedgers.delete(key);
+      if (delete this.durable.state.toolLedgers[key]) {
+        this.durable.save();
+      }
+      return;
+    }
+    const expiresAtUtc = this.resolveExpiryMs();
+    this.toolLedgers.set(key, { ledger, expiresAtUtc });
+    this.durable.state.toolLedgers[key] = {
+      serialized: ledger.serialize(),
+      expiresAtUtc,
+    };
+    this.trimToolLedgers();
+    this.durable.save();
   }
 
   tryDelete(responseId: string): boolean {
@@ -376,11 +446,27 @@ export class ResponseStore {
       }
     }
 
+    if (this.toolLedgers.size > 0) {
+      for (const [key, entry] of this.toolLedgers.entries()) {
+        if (entry.expiresAtUtc <= now) {
+          this.toolLedgers.delete(key);
+          this.recordEviction("tool_ledger", "ttl");
+        }
+      }
+    }
+
     for (const [key, entry] of Object.entries(this.durable.state.replays)) {
       if (entry.expiresAtUtc <= now) {
         delete this.durable.state.replays[key];
         durableReplayChanged = true;
         this.recordEviction("protocol_replay", "ttl");
+      }
+    }
+    for (const [key, entry] of Object.entries(this.durable.state.toolLedgers)) {
+      if (entry.expiresAtUtc <= now) {
+        delete this.durable.state.toolLedgers[key];
+        durableReplayChanged = true;
+        this.recordEviction("tool_ledger", "ttl");
       }
     }
     if (durableReplayChanged) {
@@ -398,6 +484,29 @@ export class ResponseStore {
       if (oldest.done) return;
       entries.delete(oldest.value);
       this.recordEviction(store, "lru");
+    }
+  }
+
+  private trimToolLedgers(): void {
+    while (this.toolLedgers.size > MaxStoredResponses) {
+      const oldest = this.toolLedgers.keys().next();
+      if (oldest.done) return;
+      this.toolLedgers.delete(oldest.value);
+      delete this.durable.state.toolLedgers[oldest.value];
+      this.recordEviction("tool_ledger", "lru");
+    }
+  }
+
+  private recordToolLedgerRecovery(
+    outcomes: Array<{ failure: { code: string; reason: string }; released: true }>,
+  ): void {
+    for (const outcome of outcomes) {
+      this.observability?.record("provider_drift", {
+        source: "tool_ledger",
+        code: outcome.failure.code,
+        reason: outcome.failure.reason,
+        released: outcome.released,
+      });
     }
   }
 
@@ -449,4 +558,8 @@ function readCreatedAt(response: JsonObject): number {
     }
   }
   return nowUnix();
+}
+
+function durableKey(key: string): string {
+  return createHash("sha256").update(key).digest("hex");
 }
