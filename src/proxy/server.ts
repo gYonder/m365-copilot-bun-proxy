@@ -1212,11 +1212,25 @@ async function handleResponsesCreateOnce(
   }
 
   const isProtocolIdentity = replayIdentityKey.startsWith("protocol:");
-  const storedRequestReplay = isProtocolIdentity
+  let storedRequestReplay = isProtocolIdentity
     ? responseStore.tryGetProtocolReplay(replayIdentityKey)
     : hasPriorToolResult(payload.json)
       ? null
       : responseStore.tryGetRequestReplay(requestHash);
+  if (storedRequestReplay && storedRequestReplay.response === null) {
+    // The identity survived a restart but its body did not, because bodies are
+    // deliberately never written to disk. Refusing is only correct when the
+    // turn carries tool results, where a second upstream invocation could
+    // duplicate a side effect. A plain turn is safe to answer again, and
+    // refusing it would strand the caller until the entry expired.
+    if (!hasPriorToolResult(payload.json)) {
+      services.observability?.record("store_eviction", {
+        kind: "protocol_replay_body_lost",
+      });
+      responseStore.forgetProtocolReplay(replayIdentityKey);
+      storedRequestReplay = null;
+    }
+  }
   if (storedRequestReplay) {
     if (storedRequestReplay.response === null) {
       services.observability?.record("dedup_hit", {

@@ -277,6 +277,30 @@ describe("durable continuation metadata", () => {
     });
     rmSync(dir, { recursive: true, force: true });
   });
+
+  test("forgets an unreplayable durable completion so the turn is not stranded", () => {
+    const dir = createTempDir("m365-forget-unreplayable");
+    const file = path.join(dir, "continuation.json");
+    const options = { conversationTtlMinutes: 180 } as WrapperOptions;
+    const first = new ResponseStore(options, new DurableStateStore(file));
+    first.rememberCompletedProtocolTurn("protocol:stranded", "conv_stranded", {
+      id: "resp_stranded",
+      output_text: "not persisted",
+    });
+
+    const resumed = new ResponseStore(options, new DurableStateStore(file));
+    expect(resumed.tryGetProtocolReplay("protocol:stranded")?.response).toBeNull();
+
+    resumed.forgetProtocolReplay("protocol:stranded");
+
+    // A plain turn must now be answered again rather than refused forever.
+    expect(resumed.tryGetProtocolReplay("protocol:stranded")).toBeNull();
+
+    // The entry is gone from disk too, so a later restart cannot resurrect it.
+    const restarted = new ResponseStore(options, new DurableStateStore(file));
+    expect(restarted.tryGetProtocolReplay("protocol:stranded")).toBeNull();
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
 
 function createTempDir(prefix: string): string {

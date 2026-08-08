@@ -351,6 +351,16 @@ export class ResponseStore {
     };
   }
 
+  forgetProtocolReplay(identityKey: string): void {
+    const key = identityKey.trim();
+    if (!key) return;
+    this.protocolReplayBodies.delete(key);
+    if (this.durable.state.replays[key]) {
+      delete this.durable.state.replays[key];
+      this.durable.save();
+    }
+  }
+
   rememberCompletedProtocolTurn(
     identityKey: string,
     conversationId: string | null,
