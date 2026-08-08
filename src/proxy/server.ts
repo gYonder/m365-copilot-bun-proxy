@@ -29,18 +29,17 @@ import {
   buildMessageOutputItem,
   buildOpenAiResponseFromAssistant,
   buildOpenAiResponseObject,
-  buildResponseContentPartAddedEvent,
-  buildResponseContentPartDoneEvent,
-  buildResponseCompletedEvent,
-  buildResponseCreatedEvent,
-  buildResponseInProgressEvent,
-  buildResponseOutputItemAddedEvent,
-  buildResponseOutputItemDoneEvent,
-  buildResponseOutputTextDeltaEvent,
-  buildResponseOutputTextDoneEvent,
   createOpenAiOutputItemId,
   createOpenAiResponseId,
 } from "./responses-api";
+import {
+  INTERNAL_REASONS,
+  classifyBridgeFailure,
+  classifyUnknownReason,
+  type BridgeFailure,
+  type InternalReason,
+} from "./failure-classifier";
+import { ResponsesEventWriter } from "./responses-event-writer";
 import {
   estimateResponsesContext,
   resolveContextInputTokens,
@@ -1118,6 +1117,7 @@ async function handleResponsesCreateOnce(
       responseHeaders,
       storedRequestReplay.conversationId,
       storedRequestReplay.response,
+      request.signal,
     );
   }
   const conversationSelection = selectConversation(
@@ -1355,6 +1355,7 @@ async function handleResponsesCreateOnce(
             trace,
             replayIdentityKey,
             taskDeadlineMs,
+            request.signal,
           );
         }
 
@@ -1392,6 +1393,7 @@ async function handleResponsesCreateOnce(
         trace,
         replayIdentityKey,
         taskDeadlineMs,
+        request.signal,
       );
     }
 
@@ -1420,6 +1422,7 @@ async function handleResponsesCreateOnce(
         trace,
         replayIdentityKey,
         taskDeadlineMs,
+        request.signal,
       );
     }
 
@@ -1728,6 +1731,7 @@ async function buildSuppressedReplayResponsesResult(
   conversationId: string | null,
   replayText: string | null,
   replayResponseId: string | null = null,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const responseId = replayResponseId?.trim()
     ? replayResponseId.trim()
@@ -1782,61 +1786,57 @@ async function buildSuppressedReplayResponsesResult(
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
-      const writeDataEvent = (event: JsonObject) => {
-        enqueueSseJsonEvent(controller, encoder, event);
-      };
+      const writer = createResponsesEventWriter(controller, encoder);
 
-      writeDataEvent(buildResponseCreatedEvent(inProgress));
-      writeDataEvent(buildResponseInProgressEvent(inProgress));
+      if (signal?.aborted) {
+        writer.clientAbort();
+        controller.close();
+        return;
+      }
+      writer.created(inProgress);
+      writer.inProgress(inProgress);
       for (let index = 0; index < outputItems.length; index += 1) {
+        if (signal?.aborted) {
+          writer.clientAbort();
+          controller.close();
+          return;
+        }
         const outputItem = outputItems[index];
         const outputItemId = String(outputItem.id ?? createOpenAiOutputItemId("msg"));
-        writeDataEvent(
-          buildResponseOutputItemAddedEvent(
-            responseId,
-            index,
-            buildMessageOutputItem(outputItemId, "", "in_progress"),
-          ),
+        writer.outputItemAdded(
+          responseId,
+          index,
+          buildMessageOutputItem(outputItemId, "", "in_progress"),
         );
-        writeDataEvent(
-          buildResponseContentPartAddedEvent(
-            responseId,
-            index,
-            outputItemId,
-            { type: "output_text", text: "" },
-          ),
+        writer.contentPartAdded(
+          responseId,
+          index,
+          outputItemId,
+          { type: "output_text", text: "" },
         );
         if (replayTextValue) {
-          writeDataEvent(
-            buildResponseOutputTextDeltaEvent(
-              responseId,
-              index,
-              outputItemId,
-              replayTextValue,
-            ),
+          writer.outputTextDelta(
+            responseId,
+            index,
+            outputItemId,
+            replayTextValue,
           );
         }
-        writeDataEvent(
-          buildResponseOutputTextDoneEvent(
-            responseId,
-            index,
-            outputItemId,
-            replayTextValue ?? "",
-          ),
+        writer.outputTextDone(
+          responseId,
+          index,
+          outputItemId,
+          replayTextValue ?? "",
         );
-        writeDataEvent(
-          buildResponseContentPartDoneEvent(
-            responseId,
-            index,
-            outputItemId,
-            { type: "output_text", text: replayTextValue ?? "" },
-          ),
+        writer.contentPartDone(
+          responseId,
+          index,
+          outputItemId,
+          { type: "output_text", text: replayTextValue ?? "" },
         );
-        writeDataEvent(
-          buildResponseOutputItemDoneEvent(responseId, index, outputItem),
-        );
+        writer.outputItemDone(responseId, index, outputItem);
       }
-      writeDataEvent(buildResponseCompletedEvent(completed));
+      writer.completed(completed);
       enqueueSseDoneEvent(controller, encoder);
       controller.close();
     },
@@ -1885,6 +1885,7 @@ async function buildStoredReplayResponsesResult(
   headers: Headers,
   conversationId: string | null,
   storedResponse: JsonObject,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const responseId =
     typeof storedResponse.id === "string" && storedResponse.id.trim()
@@ -1923,13 +1924,21 @@ async function buildStoredReplayResponsesResult(
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
-      const writeDataEvent = (event: JsonObject) => {
-        enqueueSseJsonEvent(controller, encoder, event);
-      };
+      const writer = createResponsesEventWriter(controller, encoder);
 
-      writeDataEvent(buildResponseCreatedEvent(inProgress));
-      writeDataEvent(buildResponseInProgressEvent(inProgress));
+      if (signal?.aborted) {
+        writer.clientAbort();
+        controller.close();
+        return;
+      }
+      writer.created(inProgress);
+      writer.inProgress(inProgress);
       for (let index = 0; index < outputItems.length; index += 1) {
+        if (signal?.aborted) {
+          writer.clientAbort();
+          controller.close();
+          return;
+        }
         const outputItem = outputItems[index];
         const outputItemType = String(outputItem.type ?? "message");
         const outputItemId = String(
@@ -1938,62 +1947,36 @@ async function buildStoredReplayResponsesResult(
 
         if (outputItemType === "message") {
           const text = extractOutputItemText(outputItem);
-          writeDataEvent(
-            buildResponseOutputItemAddedEvent(
-              responseId,
-              index,
-              buildMessageOutputItem(outputItemId, "", "in_progress"),
-            ),
+          writer.outputItemAdded(
+            responseId,
+            index,
+            buildMessageOutputItem(outputItemId, "", "in_progress"),
           );
-          writeDataEvent(
-            buildResponseContentPartAddedEvent(responseId, index, outputItemId, {
-              type: "output_text",
-              text: "",
-            }),
-          );
+          writer.contentPartAdded(responseId, index, outputItemId, {
+            type: "output_text",
+            text: "",
+          });
           if (text) {
-            writeDataEvent(
-              buildResponseOutputTextDeltaEvent(
-                responseId,
-                index,
-                outputItemId,
-                text,
-              ),
-            );
+            writer.outputTextDelta(responseId, index, outputItemId, text);
           }
-          writeDataEvent(
-            buildResponseOutputTextDoneEvent(
-              responseId,
-              index,
-              outputItemId,
-              text,
-            ),
-          );
-          writeDataEvent(
-            buildResponseContentPartDoneEvent(responseId, index, outputItemId, {
-              type: "output_text",
-              text,
-            }),
-          );
-          writeDataEvent(
-            buildResponseOutputItemDoneEvent(responseId, index, outputItem),
-          );
+          writer.outputTextDone(responseId, index, outputItemId, text);
+          writer.contentPartDone(responseId, index, outputItemId, {
+            type: "output_text",
+            text,
+          });
+          writer.outputItemDone(responseId, index, outputItem);
           continue;
         }
 
         // Non-message items (function_call above all): emit the item verbatim
         // via added/done so tool calls survive the replay intact.
-        writeDataEvent(
-          buildResponseOutputItemAddedEvent(responseId, index, {
+        writer.outputItemAdded(responseId, index, {
             ...outputItem,
             status: "in_progress",
-          }),
-        );
-        writeDataEvent(
-          buildResponseOutputItemDoneEvent(responseId, index, outputItem),
-        );
+          });
+        writer.outputItemDone(responseId, index, outputItem);
       }
-      writeDataEvent(buildResponseCompletedEvent(storedResponse));
+      writer.completed(storedResponse);
       enqueueSseDoneEvent(controller, encoder);
       controller.close();
     },
@@ -2015,6 +1998,7 @@ async function buildBufferedResponsesStreamResponse(
   trace: TraceContext | null,
   replayIdentityKey: string,
   taskDeadlineMs: number,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
@@ -2022,26 +2006,12 @@ async function buildBufferedResponsesStreamResponse(
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
-      const writeDataEvent = (event: JsonObject) => {
-        enqueueSseJsonEvent(controller, encoder, event);
-      };
-      const writeError = (message: string, code: string) => {
-        controller.enqueue(
-          encoder.encode(
-            `event: error\ndata: ${JSON.stringify({
-              error: {
-                message,
-                type: "api_error",
-                param: null,
-                code,
-              },
-            })}\n\n`,
-          ),
-        );
-      };
+      const writer = createResponsesEventWriter(controller, encoder);
+      let inProgress: JsonObject | null = null;
+      let outputItems: JsonObject[] = [];
 
       try {
-        const inProgress = buildOpenAiResponseObject(
+        inProgress = buildOpenAiResponseObject(
           responseId,
           createdAt,
           parsedRequest.base.model,
@@ -2050,10 +2020,10 @@ async function buildBufferedResponsesStreamResponse(
           parsedRequest,
           includeConversationId ? conversationId : null,
         );
-        writeDataEvent(buildResponseCreatedEvent(inProgress));
-        writeDataEvent(buildResponseInProgressEvent(inProgress));
+        writer.created(inProgress);
+        writer.inProgress(inProgress);
 
-        const outputItems =
+        outputItems =
           assistantResponse.toolCalls.length > 0
             ? buildFunctionCallOutputItems(assistantResponse.toolCalls, "completed")
             : [
@@ -2065,72 +2035,68 @@ async function buildBufferedResponsesStreamResponse(
               ];
 
         for (let index = 0; index < outputItems.length; index++) {
+          if (signal?.aborted) {
+            writer.clientAbort();
+            return;
+          }
           const item = outputItems[index];
-          writeDataEvent(
-            buildResponseOutputItemAddedEvent(
-              responseId,
-              index,
-              item.type === "message"
-                ? buildMessageOutputItem(String(item.id ?? ""), "", "in_progress")
-                : item,
-            ),
+          writer.outputItemAdded(
+            responseId,
+            index,
+            item.type === "message"
+              ? buildMessageOutputItem(String(item.id ?? ""), "", "in_progress")
+              : item,
           );
           if (item.type === "message") {
             const content = assistantResponse.content ?? "";
-            writeDataEvent(
-              buildResponseContentPartAddedEvent(
-                responseId,
-                index,
-                String(item.id ?? ""),
-                { type: "output_text", text: "" },
-              ),
+            writer.contentPartAdded(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              { type: "output_text", text: "" },
             );
             if (content) {
-              writeDataEvent(
-                buildResponseOutputTextDeltaEvent(
-                  responseId,
-                  index,
-                  String(item.id ?? ""),
-                  content,
-                ),
-              );
-            }
-            writeDataEvent(
-              buildResponseOutputTextDoneEvent(
+              writer.outputTextDelta(
                 responseId,
                 index,
                 String(item.id ?? ""),
                 content,
-              ),
+              );
+            }
+            writer.outputTextDone(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              content,
             );
-            writeDataEvent(
-              buildResponseContentPartDoneEvent(
-                responseId,
-                index,
-                String(item.id ?? ""),
-                { type: "output_text", text: content },
-              ),
+            writer.contentPartDone(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              { type: "output_text", text: content },
             );
           } else if (item.type === "custom_tool_call") {
             const input = tryGetString(item, "input") ?? "";
-            writeDataEvent({
-              type: "response.custom_tool_call_input.delta",
-              response_id: responseId,
-              output_index: index,
-              item_id: String(item.id ?? ""),
-              delta: input,
-            });
-            writeDataEvent({
-              type: "response.custom_tool_call_input.done",
-              response_id: responseId,
-              output_index: index,
-              item_id: String(item.id ?? ""),
+            writer.customToolInputDelta(
+              responseId,
+              index,
+              String(item.id ?? ""),
               input,
-            });
+            );
+            writer.customToolInputDone(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              input,
+            );
           }
-          writeDataEvent(buildResponseOutputItemDoneEvent(responseId, index, item));
+          writer.outputItemDone(responseId, index, item);
         }
 
+        if (signal?.aborted) {
+          writer.clientAbort();
+          return;
+        }
         const completed = buildOpenAiResponseObject(
           responseId,
           createdAt,
@@ -2140,7 +2106,7 @@ async function buildBufferedResponsesStreamResponse(
           parsedRequest,
           includeConversationId ? conversationId : null,
         );
-        writeDataEvent(buildResponseCompletedEvent(completed));
+        writer.completed(completed);
         services.responseStore.set(
           responseId,
           completed,
@@ -2167,12 +2133,43 @@ async function buildBufferedResponsesStreamResponse(
           },
           500,
         );
-        writeError(
-          `Failed to build streaming response. ${String(error)}`,
-          "response_stream_error",
-        );
+        if (signal?.aborted) {
+          if (!writer.terminalState) {
+            writer.clientAbort();
+          }
+        } else if (inProgress) {
+          const failure = classifyResponsesFailure("response_stream_error");
+          const terminalResponse = buildOpenAiResponseObject(
+            responseId,
+            createdAt,
+            parsedRequest.base.model,
+            "in_progress",
+            outputItems,
+            parsedRequest,
+            includeConversationId ? conversationId : null,
+            undefined,
+            failure.terminal === "failed"
+              ? {
+                  status: "failed",
+                  error: { code: failure.code, message: failure.message },
+                  incomplete_details: null,
+                }
+              : {
+                  status: "incomplete",
+                  error: null,
+                  incomplete_details: { reason: failure.reason },
+                },
+          );
+          emitResponsesFailureTerminal(
+            writer,
+            terminalResponse,
+            "response_stream_error",
+          );
+        }
       } finally {
-        enqueueSseDoneEvent(controller, encoder);
+        if (writer.terminalState?.kind !== "cancelled") {
+          enqueueSseDoneEvent(controller, encoder);
+        }
         controller.close();
       }
     },
@@ -3069,6 +3066,7 @@ async function buildSimulatedResponsesStreamResponse(
   trace: TraceContext | null,
   replayIdentityKey: string,
   taskDeadlineMs: number,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
   const normalized = normalizeSimulatedResponsesPayload(
@@ -3111,104 +3109,144 @@ async function buildSimulatedResponsesStreamResponse(
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
-      const writeDataEvent = (event: JsonObject) => {
-        enqueueSseJsonEvent(controller, encoder, event);
-      };
+      const writer = createResponsesEventWriter(controller, encoder);
+      let inProgress: JsonObject | null = null;
+      try {
+        inProgress = buildOpenAiResponseObject(
+          responseId,
+          createdAt,
+          resolvedModel,
+          "in_progress",
+          [],
+          parsedRequest,
+          responseConversationId,
+        );
+        writer.created(inProgress);
+        writer.inProgress(inProgress);
 
-      const inProgress = buildOpenAiResponseObject(
-        responseId,
-        createdAt,
-        resolvedModel,
-        "in_progress",
-        [],
-        parsedRequest,
-        responseConversationId,
-      );
-      writeDataEvent(buildResponseCreatedEvent(inProgress));
-      writeDataEvent(buildResponseInProgressEvent(inProgress));
-
-      for (let index = 0; index < finalizedOutputItems.length; index++) {
-        const item = finalizedOutputItems[index];
-        const itemId = tryGetString(item, "id") ?? createOpenAiOutputItemId("out");
-        const itemType = (tryGetString(item, "type") ?? "").toLowerCase();
-        if (itemType === "message") {
-          const text = extractMessageOutputText(item);
-          writeDataEvent(
-            buildResponseOutputItemAddedEvent(
+        for (let index = 0; index < finalizedOutputItems.length; index++) {
+          if (signal?.aborted) {
+            writer.clientAbort();
+            return;
+          }
+          const item = finalizedOutputItems[index];
+          const itemId = tryGetString(item, "id") ?? createOpenAiOutputItemId("out");
+          const itemType = (tryGetString(item, "type") ?? "").toLowerCase();
+          if (itemType === "message") {
+            const text = extractMessageOutputText(item);
+            writer.outputItemAdded(
               responseId,
               index,
               buildMessageOutputItem(itemId, "", "in_progress"),
-            ),
-          );
-          writeDataEvent(
-            buildResponseContentPartAddedEvent(
+            );
+            writer.contentPartAdded(
               responseId,
               index,
               itemId,
               { type: "output_text", text: "" },
-            ),
-          );
-          if (text) {
-            writeDataEvent(
-              buildResponseOutputTextDeltaEvent(responseId, index, itemId, text),
             );
-          }
-          writeDataEvent(
-            buildResponseOutputTextDoneEvent(responseId, index, itemId, text),
-          );
-          writeDataEvent(
-            buildResponseContentPartDoneEvent(
+            if (text) {
+              writer.outputTextDelta(responseId, index, itemId, text);
+            }
+            writer.outputTextDone(responseId, index, itemId, text);
+            writer.contentPartDone(
               responseId,
               index,
               itemId,
               { type: "output_text", text },
-            ),
-          );
-          writeDataEvent(
-            buildResponseOutputItemDoneEvent(
+            );
+            writer.outputItemDone(
               responseId,
               index,
               buildMessageOutputItem(itemId, text, "completed"),
+            );
+            continue;
+          }
+
+          writer.outputItemAdded(responseId, index, item);
+          if (itemType === "custom_tool_call") {
+            const input = tryGetString(item, "input") ?? "";
+            writer.customToolInputDelta(
+              responseId,
+              index,
+              itemId,
+              input,
+            );
+            writer.customToolInputDone(
+              responseId,
+              index,
+              itemId,
+              input,
+            );
+          }
+          writer.outputItemDone(responseId, index, item);
+        }
+
+        if (signal?.aborted) {
+          writer.clientAbort();
+          return;
+        }
+        const completed = buildOpenAiResponseObject(
+          responseId,
+          createdAt,
+          resolvedModel,
+          "completed",
+          finalizedOutputItems,
+          parsedRequest,
+          responseConversationId,
+        );
+        writer.completed(completed);
+        services.responseStore.set(
+          responseId,
+          completed,
+          conversationId,
+          taskDeadlineMs,
+        );
+        rememberResponsesReplayIdentity(
+          services.responseStore,
+          replayIdentityKey,
+          conversationId,
+          completed,
+        );
+        tracePane2(services, trace, completed, 200);
+        traceComplete(services, trace, 200);
+      } catch (error) {
+        traceError(
+          services,
+          trace,
+          {
+            message: `Failed to build simulated streaming response. ${String(error)}`,
+            type: "api_error",
+            param: null,
+            code: "response_stream_error",
+          },
+          500,
+        );
+        if (signal?.aborted) {
+          if (!writer.terminalState) {
+            writer.clientAbort();
+          }
+        } else if (inProgress) {
+          emitResponsesFailureTerminal(
+            writer,
+            buildOpenAiResponseObject(
+              responseId,
+              createdAt,
+              resolvedModel,
+              "in_progress",
+              finalizedOutputItems,
+              parsedRequest,
+              responseConversationId,
             ),
+            "response_stream_error",
           );
-          continue;
         }
-
-        writeDataEvent(buildResponseOutputItemAddedEvent(responseId, index, item));
-        if ((tryGetString(item, "type") ?? "").toLowerCase() === "custom_tool_call") {
-          const input = tryGetString(item, "input") ?? "";
-          writeDataEvent({ type: "response.custom_tool_call_input.delta", response_id: responseId, output_index: index, item_id: itemId, delta: input });
-          writeDataEvent({ type: "response.custom_tool_call_input.done", response_id: responseId, output_index: index, item_id: itemId, input });
+      } finally {
+        if (writer.terminalState?.kind !== "cancelled") {
+          enqueueSseDoneEvent(controller, encoder);
         }
-        writeDataEvent(buildResponseOutputItemDoneEvent(responseId, index, item));
+        controller.close();
       }
-
-      const completed = buildOpenAiResponseObject(
-        responseId,
-        createdAt,
-        resolvedModel,
-        "completed",
-        finalizedOutputItems,
-        parsedRequest,
-        responseConversationId,
-      );
-      writeDataEvent(buildResponseCompletedEvent(completed));
-      services.responseStore.set(
-        responseId,
-        completed,
-        conversationId,
-        taskDeadlineMs,
-      );
-      rememberResponsesReplayIdentity(
-        services.responseStore,
-        replayIdentityKey,
-        conversationId,
-        completed,
-      );
-      tracePane2(services, trace, completed, 200);
-      traceComplete(services, trace, 200);
-      enqueueSseDoneEvent(controller, encoder);
-      controller.close();
     },
   });
 
@@ -3707,6 +3745,7 @@ async function transformGraphStreamToResponses(
   trace: TraceContext | null,
   replayIdentityKey: string,
   taskDeadlineMs: number,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const includeConversationId = services.options.includeConversationIdInResponseBody;
   const responseId = createOpenAiResponseId();
@@ -3719,24 +3758,7 @@ async function transformGraphStreamToResponses(
   const stream = new ReadableStream<Uint8Array>({
     start: async (controller) => {
       const encoder = new TextEncoder();
-      const writeDataEvent = (event: JsonObject) => {
-        enqueueSseJsonEvent(controller, encoder, event);
-      };
-      const writeError = (message: string, code: string) => {
-        controller.enqueue(
-          encoder.encode(
-            `event: error\ndata: ${JSON.stringify({
-              error: {
-                message,
-                type: "api_error",
-                param: null,
-                code,
-              },
-            })}\n\n`,
-          ),
-        );
-      };
-
+      const writer = createResponsesEventWriter(controller, encoder);
       const inProgress = buildOpenAiResponseObject(
         responseId,
         createdAt,
@@ -3746,32 +3768,34 @@ async function transformGraphStreamToResponses(
         parsedRequest,
         includeConversationId ? conversationId : null,
       );
-      writeDataEvent(buildResponseCreatedEvent(inProgress));
-      writeDataEvent(buildResponseInProgressEvent(inProgress));
-      writeDataEvent(
-        buildResponseOutputItemAddedEvent(
-          responseId,
-          0,
-          buildMessageOutputItem(messageItemId, "", "in_progress"),
-        ),
+      writer.created(inProgress);
+      writer.inProgress(inProgress);
+      writer.outputItemAdded(
+        responseId,
+        0,
+        buildMessageOutputItem(messageItemId, "", "in_progress"),
       );
-      writeDataEvent(
-        buildResponseContentPartAddedEvent(
-          responseId,
-          0,
-          messageItemId,
-          { type: "output_text", text: "" },
-        ),
+      writer.contentPartAdded(
+        responseId,
+        0,
+        messageItemId,
+        { type: "output_text", text: "" },
       );
 
+      let sawUpstreamTerminal = false;
       try {
         if (graphResponse.body) {
           for await (const event of readSseEvents(graphResponse.body)) {
+            if (signal?.aborted) {
+              writer.clientAbort();
+              return;
+            }
             const data = event.data.trim();
             if (!data) {
               continue;
             }
             if (data.toLowerCase() === "[done]") {
+              sawUpstreamTerminal = true;
               break;
             }
             upstreamItems.push(tryParseJsonObject(data) ?? { rawText: data });
@@ -3808,34 +3832,49 @@ async function transformGraphStreamToResponses(
             }
 
             emittedContent += delta;
-            writeDataEvent(
-              buildResponseOutputTextDeltaEvent(responseId, 0, messageItemId, delta),
-            );
+            writer.outputTextDelta(responseId, 0, messageItemId, delta);
           }
         }
 
-        writeDataEvent(
-          buildResponseOutputTextDoneEvent(
-            responseId,
-            0,
-            messageItemId,
-            emittedContent,
-          ),
+        if (signal?.aborted) {
+          writer.clientAbort();
+          return;
+        }
+        if (!sawUpstreamTerminal) {
+          emitResponsesFailureTerminal(
+            writer,
+            buildOpenAiResponseObject(
+              responseId,
+              createdAt,
+              parsedRequest.base.model,
+              "in_progress",
+              [buildMessageOutputItem(messageItemId, emittedContent, "in_progress")],
+              parsedRequest,
+              includeConversationId ? conversationId : null,
+            ),
+            "substrate_incomplete_terminal",
+          );
+          return;
+        }
+
+        writer.outputTextDone(
+          responseId,
+          0,
+          messageItemId,
+          emittedContent,
         );
-        writeDataEvent(
-          buildResponseContentPartDoneEvent(
-            responseId,
-            0,
-            messageItemId,
-            { type: "output_text", text: emittedContent },
-          ),
+        writer.contentPartDone(
+          responseId,
+          0,
+          messageItemId,
+          { type: "output_text", text: emittedContent },
         );
         const outputItem = buildMessageOutputItem(
           messageItemId,
           emittedContent,
           "completed",
         );
-        writeDataEvent(buildResponseOutputItemDoneEvent(responseId, 0, outputItem));
+        writer.outputItemDone(responseId, 0, outputItem);
 
         const completed = buildOpenAiResponseObject(
           responseId,
@@ -3846,7 +3885,7 @@ async function transformGraphStreamToResponses(
           parsedRequest,
           includeConversationId ? conversationId : null,
         );
-        writeDataEvent(buildResponseCompletedEvent(completed));
+        writer.completed(completed);
         services.responseStore.set(
           responseId,
           completed,
@@ -3885,12 +3924,29 @@ async function transformGraphStreamToResponses(
           },
           500,
         );
-        writeError(
-          `Microsoft Graph chatOverStream request failed. ${String(error)}`,
-          "graph_error",
-        );
+        if (signal?.aborted) {
+          if (!writer.terminalState) {
+            writer.clientAbort();
+          }
+        } else {
+          emitResponsesFailureTerminal(
+            writer,
+            buildOpenAiResponseObject(
+              responseId,
+              createdAt,
+              parsedRequest.base.model,
+              "in_progress",
+              [buildMessageOutputItem(messageItemId, emittedContent, "in_progress")],
+              parsedRequest,
+              includeConversationId ? conversationId : null,
+            ),
+            "graph_error",
+          );
+        }
       } finally {
-        enqueueSseDoneEvent(controller, encoder);
+        if (writer.terminalState?.kind !== "cancelled") {
+          enqueueSseDoneEvent(controller, encoder);
+        }
         controller.close();
       }
     },
@@ -3927,23 +3983,7 @@ async function streamSubstrateAsResponses(
   const stream = new ReadableStream<Uint8Array>({
     start: async (controller) => {
       const encoder = new TextEncoder();
-      const writeDataEvent = (event: JsonObject) => {
-        enqueueSseJsonEvent(controller, encoder, event);
-      };
-      const writeError = (message: string, code: string) => {
-        controller.enqueue(
-          encoder.encode(
-            `event: error\ndata: ${JSON.stringify({
-              error: {
-                message,
-                type: "api_error",
-                param: null,
-                code,
-              },
-            })}\n\n`,
-          ),
-        );
-      };
+      const writer = createResponsesEventWriter(controller, encoder);
 
       const inProgress = buildOpenAiResponseObject(
         responseId,
@@ -3954,146 +3994,186 @@ async function streamSubstrateAsResponses(
         parsedRequest,
         includeConversationId ? conversationId : null,
       );
-      writeDataEvent(buildResponseCreatedEvent(inProgress));
-      writeDataEvent(buildResponseInProgressEvent(inProgress));
-      writeDataEvent(
-        buildResponseOutputItemAddedEvent(
-          responseId,
-          0,
-          buildMessageOutputItem(messageItemId, "", "in_progress"),
-        ),
+      writer.created(inProgress);
+      writer.inProgress(inProgress);
+      writer.outputItemAdded(
+        responseId,
+        0,
+        buildMessageOutputItem(messageItemId, "", "in_progress"),
       );
-      writeDataEvent(
-        buildResponseContentPartAddedEvent(
-          responseId,
-          0,
-          messageItemId,
-          { type: "output_text", text: "" },
-        ),
+      writer.contentPartAdded(
+        responseId,
+        0,
+        messageItemId,
+        { type: "output_text", text: "" },
       );
 
-      const substrateResponse = await services.substrateClient.chatStream(
-        authorizationHeader,
-        conversationId,
-        parsedRequest.base,
-        createdConversation,
-        async (update) => {
-          traceSubstrateStreamUpdate(services, trace, update);
-          if (update.conversationId) {
-            conversationId = update.conversationId;
-            if (scopedConversationKey) {
-              services.conversationStore.set(scopedConversationKey, conversationId);
+      try {
+        const substrateResponse = await services.substrateClient.chatStream(
+          authorizationHeader,
+          conversationId,
+          parsedRequest.base,
+          createdConversation,
+          async (update) => {
+            traceSubstrateStreamUpdate(services, trace, update);
+            if (update.conversationId) {
+              conversationId = update.conversationId;
+              if (scopedConversationKey) {
+                services.conversationStore.set(scopedConversationKey, conversationId);
+              }
             }
-          }
-          if (!update.deltaText) {
-            return;
-          }
-          emitted += update.deltaText;
-          writeDataEvent(
-            buildResponseOutputTextDeltaEvent(
+            if (!update.deltaText) {
+              return;
+            }
+            emitted += update.deltaText;
+            writer.outputTextDelta(
               responseId,
               0,
               messageItemId,
               update.deltaText,
-            ),
-          );
-        },
-        signal,
-        taskDeadlineMs,
-      );
-      tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
-      tracePane4(
-        services,
-        trace,
-        substrateResponse.upstreamResponsePayload ?? null,
-        substrateResponse.statusCode,
-      );
-
-      if (!substrateResponse.isSuccess) {
-        const details = extractGraphErrorMessage(substrateResponse.rawBody);
-        writeError(
-          details
-            ? `Substrate chat request failed. ${details}`
-            : "Substrate chat request failed.",
-          "substrate_error",
+            );
+          },
+          signal,
+          taskDeadlineMs,
         );
-        traceError(
+        tracePane3(services, trace, substrateResponse.upstreamRequestPayload ?? null);
+        tracePane4(
           services,
           trace,
-          {
-            message: details
-              ? `Substrate chat request failed. ${details}`
-              : "Substrate chat request failed.",
-            type: "api_error",
-            param: null,
-            code: "substrate_error",
-          },
+          substrateResponse.upstreamResponsePayload ?? null,
           substrateResponse.statusCode,
         );
-        enqueueSseDoneEvent(controller, encoder);
-        controller.close();
-        return;
-      }
 
-      if (substrateResponse.conversationId) {
-        conversationId = substrateResponse.conversationId;
-      }
-      const assistantText =
-        substrateResponse.assistantText ??
-        extractCopilotAssistantText(
-          substrateResponse.responseJson,
-          parsedRequest.base.promptText,
-        ) ??
-        "";
+        if (signal?.aborted) {
+          writer.clientAbort();
+          return;
+        }
 
-      const trailing = computeTrailingDelta(emitted, assistantText);
-      if (trailing) {
-        emitted += trailing;
-        writeDataEvent(
-          buildResponseOutputTextDeltaEvent(responseId, 0, messageItemId, trailing),
-        );
-      }
+        if (!substrateResponse.isSuccess) {
+          const details = extractGraphErrorMessage(substrateResponse.rawBody);
+          const reason = substrateResponse.errorCode ?? "substrate_error";
+          traceError(
+            services,
+            trace,
+            {
+              message: details
+                ? `Substrate chat request failed. ${details}`
+                : "Substrate chat request failed.",
+              type: "api_error",
+              param: null,
+              code: reason,
+            },
+            substrateResponse.statusCode,
+          );
+          emitResponsesFailureTerminal(
+            writer,
+            buildOpenAiResponseObject(
+              responseId,
+              createdAt,
+              parsedRequest.base.model,
+              "in_progress",
+              [buildMessageOutputItem(messageItemId, emitted, "in_progress")],
+              parsedRequest,
+              includeConversationId ? conversationId : null,
+            ),
+            reason,
+          );
+          return;
+        }
 
-      writeDataEvent(
-        buildResponseOutputTextDoneEvent(responseId, 0, messageItemId, emitted),
-      );
-      writeDataEvent(
-        buildResponseContentPartDoneEvent(
+        if (substrateResponse.conversationId) {
+          conversationId = substrateResponse.conversationId;
+        }
+        const assistantText =
+          substrateResponse.assistantText ??
+          extractCopilotAssistantText(
+            substrateResponse.responseJson,
+            parsedRequest.base.promptText,
+          ) ??
+          "";
+
+        const trailing = computeTrailingDelta(emitted, assistantText);
+        if (trailing) {
+          emitted += trailing;
+          writer.outputTextDelta(
+            responseId,
+            0,
+            messageItemId,
+            trailing,
+          );
+        }
+
+        writer.outputTextDone(responseId, 0, messageItemId, emitted);
+        writer.contentPartDone(
           responseId,
           0,
           messageItemId,
           { type: "output_text", text: emitted },
-        ),
-      );
-      const outputItem = buildMessageOutputItem(messageItemId, emitted, "completed");
-      writeDataEvent(buildResponseOutputItemDoneEvent(responseId, 0, outputItem));
+        );
+        const outputItem = buildMessageOutputItem(messageItemId, emitted, "completed");
+        writer.outputItemDone(responseId, 0, outputItem);
 
-      const completed = buildOpenAiResponseObject(
-        responseId,
-        createdAt,
-        parsedRequest.base.model,
-        "completed",
-        [outputItem],
-        parsedRequest,
-        includeConversationId ? conversationId : null,
-      );
-      services.responseStore.set(
-        responseId,
-        completed,
-        conversationId,
-        taskDeadlineMs,
-      );
-      rememberResponsesReplayIdentity(
-        services.responseStore,
-        replayIdentityKey,
-        conversationId,
-        completed,
-      );
-      writeDataEvent(buildResponseCompletedEvent(completed));
-      tracePane2(services, trace, completed, 200);
-      traceComplete(services, trace, 200);
-      enqueueSseDoneEvent(controller, encoder);
-      controller.close();
+        const completed = buildOpenAiResponseObject(
+          responseId,
+          createdAt,
+          parsedRequest.base.model,
+          "completed",
+          [outputItem],
+          parsedRequest,
+          includeConversationId ? conversationId : null,
+        );
+        services.responseStore.set(
+          responseId,
+          completed,
+          conversationId,
+          taskDeadlineMs,
+        );
+        rememberResponsesReplayIdentity(
+          services.responseStore,
+          replayIdentityKey,
+          conversationId,
+          completed,
+        );
+        writer.completed(completed);
+        tracePane2(services, trace, completed, 200);
+        traceComplete(services, trace, 200);
+      } catch (error) {
+        traceError(
+          services,
+          trace,
+          {
+            message: `Substrate response stream failed. ${String(error)}`,
+            type: "api_error",
+            param: null,
+            code: "response_stream_error",
+          },
+          500,
+        );
+        if (signal?.aborted) {
+          if (!writer.terminalState) {
+            writer.clientAbort();
+          }
+        } else {
+          emitResponsesFailureTerminal(
+            writer,
+            buildOpenAiResponseObject(
+              responseId,
+              createdAt,
+              parsedRequest.base.model,
+              "in_progress",
+              [buildMessageOutputItem(messageItemId, emitted, "in_progress")],
+              parsedRequest,
+              includeConversationId ? conversationId : null,
+            ),
+            "response_stream_error",
+          );
+        }
+      } finally {
+        if (writer.terminalState?.kind !== "cancelled") {
+          enqueueSseDoneEvent(controller, encoder);
+        }
+        controller.close();
+      }
     },
   });
 
@@ -4205,6 +4285,45 @@ function enqueueSseDoneEvent(
   encoder: TextEncoder,
 ): void {
   controller.enqueue(encoder.encode("event: done\ndata: [DONE]\n\n"));
+}
+
+function createResponsesEventWriter(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  encoder: TextEncoder,
+): ResponsesEventWriter {
+  return new ResponsesEventWriter((event) => {
+    enqueueSseJsonEvent(controller, encoder, event);
+  });
+}
+
+function classifyResponsesFailure(rawReason: string): BridgeFailure {
+  const reason = rawReason.trim();
+  if ((INTERNAL_REASONS as readonly string[]).includes(reason)) {
+    return classifyBridgeFailure(reason as InternalReason);
+  }
+  return classifyUnknownReason(rawReason);
+}
+
+function emitResponsesFailureTerminal(
+  writer: ResponsesEventWriter,
+  response: JsonObject,
+  rawReason: string,
+): void {
+  if (writer.terminalState) {
+    return;
+  }
+  try {
+    const failure = classifyResponsesFailure(rawReason);
+    if (failure.terminal === "incomplete") {
+      writer.incomplete(response, failure);
+    } else {
+      writer.failed(response, failure);
+    }
+  } catch {
+    if (!writer.terminalState) {
+      writer.clientAbort();
+    }
+  }
 }
 
 const MaxLoggedOutgoingStreamBodyChars = 1_000_000;
