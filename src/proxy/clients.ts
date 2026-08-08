@@ -433,14 +433,101 @@ export class CopilotSubstrateClient {
 
     const transcript: string[] = [];
     let invocationPayload: JsonObject | null = null;
+    let activeInvocationId: string | null = null;
+    let invocationStarted = false;
+    let invocationSendPromise: Promise<void> | null = null;
+    let cancellationRequested = false;
+    let cancellationStarted = false;
+    let socketClosed = false;
+    let receiverDisposed = false;
     let resolvedConversationId = conversationId;
     const receiver = this.createReceiver(ws);
-    const onAbort = () => {
+    const disposeReceiver = () => {
+      if (receiverDisposed) {
+        return;
+      }
+      receiverDisposed = true;
+      receiver.dispose();
+    };
+    const closeSocket = (reason: string | null, hard: boolean) => {
+      if (socketClosed) {
+        return;
+      }
+      socketClosed = true;
       try {
-        ws.close(1000, "client disconnected");
+        if (
+          hard &&
+          typeof (ws as { terminate?: () => void }).terminate === "function"
+        ) {
+          (ws as { terminate: () => void }).terminate();
+          return;
+        }
+        if (reason) {
+          ws.close(1000, reason);
+        } else {
+          ws.close();
+        }
       } catch {
         // ignore
       }
+    };
+    const cancelUpstream = async (): Promise<void> => {
+      let stopSent = false;
+      let acknowledgement: SubstrateCancellationAcknowledgement | null = null;
+      try {
+        if (!invocationStarted && invocationSendPromise) {
+          const invocationSend = await settlePromiseWithin(
+            invocationSendPromise,
+            SubstrateCancelAckTimeoutMs,
+          );
+          if (invocationSend.completed && !invocationSend.error) {
+            invocationStarted = true;
+          } else {
+            invocationSendPromise = null;
+          }
+        }
+
+        const invocationId = activeInvocationId;
+        if (
+          invocationStarted &&
+          invocationId &&
+          ws.readyState === WebSocket.OPEN
+        ) {
+          acknowledgement = createSubstrateCancellationAcknowledgement(
+            ws,
+            invocationId,
+            SubstrateCancelAckTimeoutMs,
+          );
+          const stop = await settlePromiseWithin(
+            sendFrame(ws, requestUri, this.logger, {
+              type: SignalRCancelInvocationType,
+              invocationId,
+            }),
+            SubstrateCancelAckTimeoutMs,
+          );
+          stopSent = stop.completed && !stop.error;
+        }
+      } catch {
+        // Cancellation is best effort and must never reject the turn.
+      }
+
+      disposeReceiver();
+      if (stopSent && acknowledgement) {
+        await acknowledgement.wait;
+      }
+      acknowledgement?.dispose();
+      closeSocket("client disconnected", true);
+    };
+    const onAbort = () => {
+      cancellationRequested = true;
+      if (cancellationStarted) {
+        return;
+      }
+      cancellationStarted = true;
+      void cancelUpstream().catch(() => {
+        disposeReceiver();
+        closeSocket("client disconnected", true);
+      });
     };
     if (signal) {
       if (signal.aborted) {
@@ -450,6 +537,12 @@ export class CopilotSubstrateClient {
       }
     }
     try {
+      if (cancellationRequested || signal?.aborted) {
+        return buildFailure(
+          499,
+          "Substrate turn cancelled by client disconnect.",
+        );
+      }
       await sendFrame(ws, requestUri, this.logger, {
         protocol: "json",
         version: 1,
@@ -457,6 +550,12 @@ export class CopilotSubstrateClient {
       const handshakeDeadlineMs = Date.now() + remainingHandshakeMs;
       const handshakePayload = await receiver.next(remainingHandshakeMs);
       if (handshakePayload === null) {
+        if (cancellationRequested || signal?.aborted) {
+          return buildFailure(
+            499,
+            "Substrate turn cancelled by client disconnect.",
+          );
+        }
         if (Date.now() >= handshakeDeadlineMs) {
           return buildFailure(504, "Substrate websocket handshake timed out.");
         }
@@ -490,6 +589,12 @@ export class CopilotSubstrateClient {
         }
       }
 
+      if (cancellationRequested || signal?.aborted) {
+        return buildFailure(
+            499,
+            "Substrate turn cancelled by client disconnect.",
+        );
+      }
       await sendFrame(ws, requestUri, this.logger, { type: 6 });
       invocationPayload = buildInvocationPayload(
         request,
@@ -500,6 +605,7 @@ export class CopilotSubstrateClient {
         this.options,
         this.observability,
       );
+      activeInvocationId = tryGetString(invocationPayload, "invocationId");
       if (onStreamUpdate) {
         await onStreamUpdate({
           deltaText: null,
@@ -508,12 +614,24 @@ export class CopilotSubstrateClient {
           upstreamResponsePayload: buildSubstrateTranscriptPayload(transcript),
         });
       }
-      await sendFrame(
+      if (cancellationRequested || signal?.aborted) {
+        return buildFailure(
+          499,
+          "Substrate turn cancelled by client disconnect.",
+        );
+      }
+      invocationSendPromise = sendFrame(
         ws,
         requestUri,
         this.logger,
         invocationPayload,
       );
+      try {
+        await invocationSendPromise;
+        invocationStarted = true;
+      } finally {
+        invocationSendPromise = null;
+      }
 
       let assistantText = "";
       let deltaBuilder = "";
@@ -540,7 +658,7 @@ export class CopilotSubstrateClient {
       };
 
       while (!completed && ws.readyState === WebSocket.OPEN) {
-        if (signal?.aborted) {
+        if (cancellationRequested || signal?.aborted) {
           break;
         }
         const remainingMs = turnDeadlineMs - Date.now();
@@ -549,6 +667,9 @@ export class CopilotSubstrateClient {
         }
         const payload = await receiver.next(remainingMs);
         if (payload === null) {
+          if (cancellationRequested || signal?.aborted) {
+            break;
+          }
           if (Date.now() >= turnDeadlineMs) {
             return buildFailure(
               504,
@@ -559,11 +680,17 @@ export class CopilotSubstrateClient {
           }
           break;
         }
+        if (cancellationRequested || signal?.aborted) {
+          break;
+        }
         await this.logger.logSubstrateFrame(
           requestUri.toString(),
           "response",
           payload,
         );
+        if (cancellationRequested || signal?.aborted) {
+          break;
+        }
         transcript.push(payload);
         if (onStreamUpdate) {
           await onStreamUpdate({
@@ -572,8 +699,14 @@ export class CopilotSubstrateClient {
             upstreamResponsePayload: buildSubstrateTranscriptPayload(transcript),
           });
         }
+        if (cancellationRequested || signal?.aborted) {
+          break;
+        }
 
         for (const frame of splitFrames(payload)) {
+          if (cancellationRequested || signal?.aborted) {
+            break;
+          }
           if (!frame.trim()) {
             continue;
           }
@@ -627,17 +760,26 @@ export class CopilotSubstrateClient {
                 conversationId: resolvedConversationId,
               });
             }
+            if (cancellationRequested || signal?.aborted) {
+              break;
+            }
           }
 
           const deltaText = extractSubstrateDeltaText(json);
           if (deltaText) {
             deltaBuilder += deltaText;
             await logDeltaSource("writeAtCursor", deltaText);
+            if (cancellationRequested || signal?.aborted) {
+              break;
+            }
             if (onStreamUpdate) {
               await onStreamUpdate({
                 deltaText,
                 conversationId: resolvedConversationId,
               });
+            }
+            if (cancellationRequested || signal?.aborted) {
+              break;
             }
           }
 
@@ -659,11 +801,17 @@ export class CopilotSubstrateClient {
             if (snapshotDelta) {
               deltaBuilder += snapshotDelta;
               await logDeltaSource("snapshotText", snapshotDelta);
+              if (cancellationRequested || signal?.aborted) {
+                break;
+              }
               if (onStreamUpdate) {
                 await onStreamUpdate({
                   deltaText: snapshotDelta,
                   conversationId: resolvedConversationId,
                 });
+              }
+              if (cancellationRequested || signal?.aborted) {
+                break;
               }
 
             }
@@ -714,13 +862,11 @@ export class CopilotSubstrateClient {
         }
       }
 
-      try {
-        ws.close(1000, "completed");
-      } catch {
-        // ignore
+      if (!cancellationRequested && !signal?.aborted) {
+        closeSocket("completed", false);
       }
 
-      if (signal?.aborted) {
+      if (cancellationRequested || signal?.aborted) {
         return buildFailure(
           499,
           "Substrate turn cancelled by client disconnect.",
@@ -780,6 +926,14 @@ export class CopilotSubstrateClient {
         upstreamResponsePayload: buildSubstrateTranscriptPayload(transcript),
       };
     } catch (error) {
+      if (cancellationRequested || signal?.aborted) {
+        return buildFailure(
+          499,
+          "Substrate turn cancelled by client disconnect.",
+          invocationPayload,
+          buildSubstrateTranscriptPayload(transcript),
+        );
+      }
       const message = String(error);
       if (message.toLowerCase().includes("timeout")) {
         return buildFailure(
@@ -799,11 +953,9 @@ export class CopilotSubstrateClient {
       if (signal) {
         signal.removeEventListener("abort", onAbort);
       }
-      receiver.dispose();
-      try {
-        ws.close();
-      } catch {
-        // ignore
+      disposeReceiver();
+      if (!cancellationRequested && !signal?.aborted) {
+        closeSocket(null, false);
       }
     }
   }
@@ -986,7 +1138,7 @@ export function buildInvocationPayload(
     plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }],
     isSbsSupported: true,
     renderReferencesBehindEOS: true,
-    disconnectBehavior: "continue",
+    disconnectBehavior: "stop",
   };
 
   if (capabilities.optionsSets.length > 0) {
@@ -1001,7 +1153,7 @@ export function buildInvocationPayload(
 
   return {
     arguments: [argument],
-    invocationId: "0",
+    invocationId: DefaultSubstrateInvocationId,
     target: capabilities.invocationTarget,
     type: capabilities.invocationType,
   };
@@ -1117,11 +1269,125 @@ function resolveTimeZoneOffsetMinutes(timeZoneId: string): number {
   }
 }
 
+const DefaultSubstrateInvocationId = "0";
+// SignalR Hub Protocol CancelInvocation (type 5) uses the StreamInvocation ID:
+// https://github.com/dotnet/aspnetcore/blob/main/src/SignalR/docs/specs/HubProtocol.md
+const SignalRCancelInvocationType = 5;
+const SubstrateCancelAckTimeoutMs = 500;
+
 export function splitFrames(payload: string): string[] {
   return payload
     .split("\u001e")
     .map((frame) => frame.trim())
     .filter((frame) => frame.length > 0);
+}
+
+type SettledPromise<T> = {
+  completed: boolean;
+  value?: T;
+  error?: unknown;
+};
+
+type SubstrateCancellationAcknowledgement = {
+  wait: Promise<boolean>;
+  dispose: () => void;
+};
+
+function settlePromiseWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<SettledPromise<T>> {
+  return new Promise<SettledPromise<T>>((resolve) => {
+    let settled = false;
+    const finish = (result: SettledPromise<T>) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(
+      () => finish({ completed: false }),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => finish({ completed: true, value }),
+      (error) => finish({ completed: true, error }),
+    );
+  });
+}
+
+function createSubstrateCancellationAcknowledgement(
+  ws: WebSocket,
+  invocationId: string,
+  timeoutMs: number,
+): SubstrateCancellationAcknowledgement {
+  let settled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let resolveWait!: (acknowledged: boolean) => void;
+  let removeMessageListener = () => {};
+  const wait = new Promise<boolean>((resolve) => {
+    resolveWait = resolve;
+  });
+  const finish = (acknowledged: boolean) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    removeMessageListener();
+    resolveWait(acknowledged);
+  };
+  try {
+    removeMessageListener = listenToWebSocketEvent(ws, "message", (data) => {
+      const payload = webSocketMessageToString(data);
+      if (!payload) {
+        return;
+      }
+      for (const frame of splitFrames(payload)) {
+        const json = tryParseJsonObject(frame);
+        if (
+          tryGetInt(json, "type") === 3 &&
+          tryGetString(json, "invocationId") === invocationId
+        ) {
+          finish(true);
+          return;
+        }
+      }
+    });
+  } catch {
+    // Test doubles and alternate WebSocket implementations may not expose events.
+  }
+  timer = setTimeout(() => finish(false), timeoutMs);
+  return {
+    wait,
+    dispose: () => finish(false),
+  };
+}
+
+function webSocketMessageToString(data: unknown): string {
+  if (typeof data === "string") {
+    return data;
+  }
+  if (Buffer.isBuffer(data)) {
+    return data.toString("utf8");
+  }
+  if (Array.isArray(data)) {
+    return Buffer.concat(data).toString("utf8");
+  }
+  if (data instanceof ArrayBuffer) {
+    return Buffer.from(data).toString("utf8");
+  }
+  if (ArrayBuffer.isView(data)) {
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString(
+      "utf8",
+    );
+  }
+  return String(data ?? "");
 }
 
 function parseRawJsonValue(rawBody: string): JsonValue {
@@ -1166,7 +1432,14 @@ async function connectWithAbort(
       if (settled) {
         if (!(value instanceof Error)) {
           try {
-            value.close(1000, "client disconnected");
+            if (
+              typeof (value as { terminate?: () => void }).terminate ===
+              "function"
+            ) {
+              (value as { terminate: () => void }).terminate();
+            } else {
+              value.close(1000, "client disconnected");
+            }
           } catch {
             // ignore
           }

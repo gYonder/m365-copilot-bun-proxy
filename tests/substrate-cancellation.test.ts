@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   CopilotSubstrateClient,
+  buildInvocationPayload,
   type SubstrateReceiverFactory,
   type SubstrateWebSocketConnector,
 } from "../src/proxy/clients";
@@ -66,21 +67,45 @@ function makeRequest(): ParsedOpenAiRequest {
  * socket makes subsequent reads resolve to null (mirroring the real receiver's
  * close→flush(null) behaviour), which is how the turn loop unwinds.
  */
-function makeFakeTransport(onBlockingRead: () => void): {
+function makeFakeTransport(
+  onBlockingRead: () => void,
+  blockingReadCall = 2,
+  throwOnCancel = false,
+): {
   connect: SubstrateWebSocketConnector;
   createReceiver: SubstrateReceiverFactory;
   closeCalls: Array<{ code?: number; reason?: string }>;
+  events: string[];
+  sentFrames: string[];
+  closedPromise: Promise<void>;
 } {
   const closeCalls: Array<{ code?: number; reason?: string }> = [];
-  let closed = false;
+  const events: string[] = [];
+  const sentFrames: string[] = [];
+  let resolveClosed!: () => void;
+  const closedPromise = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+  let socketClosed = false;
+  let resolvePendingRead: ((value: string | null) => void) | null = null;
   const ws = {
     readyState: 1, // WebSocket.OPEN
-    send: (_payload: string) => {},
+    send: (payload: string) => {
+      if (throwOnCancel && payload.includes('"type":5')) {
+        throw new Error("cancel send failed");
+      }
+      sentFrames.push(payload);
+      events.push(`send:${payload}`);
+    },
     close: (code?: number, reason?: string) => {
-      if (!closed) {
-        closed = true;
+      if (!socketClosed) {
+        socketClosed = true;
         (ws as { readyState: number }).readyState = 3; // WebSocket.CLOSED
         closeCalls.push({ code, reason });
+        events.push("close");
+        resolvePendingRead?.(null);
+        resolvePendingRead = null;
+        resolveClosed();
       }
     },
   };
@@ -89,35 +114,74 @@ function makeFakeTransport(onBlockingRead: () => void): {
   const receiver = {
     next: async (_timeoutMs: number): Promise<string | null> => {
       nextCall += 1;
-      if (closed) {
+      if (socketClosed) {
         return null;
+      }
+      if (nextCall === blockingReadCall) {
+        // The turn loop is now awaiting upstream output. Simulate the client
+        // going away; the abort handler must close the socket.
+        return new Promise<string | null>((resolve) => {
+          resolvePendingRead = resolve;
+          onBlockingRead();
+        });
       }
       if (nextCall === 1) {
         return "{}"; // handshake frame, no error
       }
-      if (nextCall === 2) {
-        // The turn loop is now awaiting upstream output. Simulate the client
-        // going away; the abort handler must close the socket.
-        onBlockingRead();
-      }
       // Once the abort closed the socket, the read completes with null and the
       // loop terminates. Otherwise it would block forever (the real "in-flight"
       // state) — which is exactly what cancellation must interrupt.
-      return closed ? null : await new Promise<string | null>(() => {});
+      return socketClosed ? null : await new Promise<string | null>(() => {});
     },
-    dispose: () => {},
+    dispose: () => {
+      resolvePendingRead?.(null);
+      resolvePendingRead = null;
+    },
   };
 
   const connect: SubstrateWebSocketConnector = async () =>
     ws as unknown as FakeWebSocket;
   const createReceiver: SubstrateReceiverFactory = () => receiver;
-  return { connect, createReceiver, closeCalls };
+  return {
+    connect,
+    createReceiver,
+    closeCalls,
+    events,
+    sentFrames,
+    closedPromise,
+  };
 }
 
 describe("Substrate client cancellation via AbortSignal", () => {
+  test("uses disconnectBehavior stop in the stream invocation payload", () => {
+    const payload = buildInvocationPayload(
+      makeRequest(),
+      "conv-payload",
+      "session-payload",
+      "request-payload",
+      true,
+      createOptions(),
+    );
+    const argument = payload.arguments[0] as {
+      disconnectBehavior?: string;
+    };
+
+    expect(argument.disconnectBehavior).toBe("stop");
+    expect(JSON.stringify(payload)).not.toContain("continue");
+  });
+
   test("closes the socket and returns a cancelled result when the client disconnects mid-turn", async () => {
     const controller = new AbortController();
-    const { connect, createReceiver, closeCalls } = makeFakeTransport(() => {
+    let abortAt = 0;
+    const {
+      connect,
+      createReceiver,
+      closeCalls,
+      events,
+      sentFrames,
+      closedPromise,
+    } = makeFakeTransport(() => {
+      abortAt = Date.now();
       controller.abort();
     });
     const client = new CopilotSubstrateClient(
@@ -139,10 +203,133 @@ describe("Substrate client cancellation via AbortSignal", () => {
 
     expect(result.isSuccess).toBeFalse();
     expect(result.statusCode).toBe(499);
+    await closedPromise;
+    expect(Date.now() - abortAt).toBeLessThan(1_000);
     // Upstream work was actually stopped: the socket was closed for the abort.
     expect(
       closeCalls.some((call) => call.reason === "client disconnected"),
     ).toBeTrue();
+    const invocationFrame = sentFrames.find((frame) =>
+      frame.includes('"target":"chat"'),
+    );
+    const invocationId = JSON.parse(
+      invocationFrame?.replace(/\u001e$/, "") ?? "{}",
+    ).invocationId;
+    const stopFrame = sentFrames.find((frame) =>
+      frame.includes('"type":5'),
+    );
+    const stopIndex = events.findIndex((event) =>
+      event.includes('"type":5'),
+    );
+    expect(stopIndex).toBeGreaterThanOrEqual(0);
+    expect(stopIndex).toBeLessThan(events.indexOf("close"));
+    expect(sentFrames.filter((frame) => frame.includes('"type":5'))).toHaveLength(
+      1,
+    );
+    expect(stopFrame).toBe(
+      `${JSON.stringify({ type: 5, invocationId })}\u001e`,
+    );
+  });
+
+  test("closes during handshake without sending a cancellation frame", async () => {
+    const controller = new AbortController();
+    const transport = makeFakeTransport(
+      () => controller.abort(),
+      1,
+    );
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      transport.connect,
+      transport.createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-handshake-cancel",
+      makeRequest(),
+      true,
+      undefined,
+      controller.signal,
+    );
+
+    expect(result.statusCode).toBe(499);
+    await transport.closedPromise;
+    expect(
+      transport.sentFrames.some((frame) => frame.includes('"type":5')),
+    ).toBeFalse();
+    expect(transport.closeCalls).toHaveLength(1);
+  });
+
+  test("sends one cancellation frame and closes once on a double abort", async () => {
+    const controller = new AbortController();
+    const transport = makeFakeTransport(() => {
+      controller.abort();
+      controller.signal.dispatchEvent(new Event("abort"));
+    });
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      transport.connect,
+      transport.createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-double-cancel",
+      makeRequest(),
+      true,
+      undefined,
+      controller.signal,
+    );
+
+    expect(result.statusCode).toBe(499);
+    await transport.closedPromise;
+    expect(
+      transport.sentFrames.filter((frame) => frame.includes('"type":5')),
+    ).toHaveLength(1);
+    expect(transport.closeCalls).toHaveLength(1);
+  });
+
+  test("closes when cancellation frame sending throws without an unhandled rejection", async () => {
+    const controller = new AbortController();
+    const transport = makeFakeTransport(
+      () => controller.abort(),
+      2,
+      true,
+    );
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const client = new CopilotSubstrateClient(
+        createOptions(),
+        stubLogger,
+        undefined,
+        transport.connect,
+        transport.createReceiver,
+      );
+      const result = await client.chat(
+        makeJwtAuthHeader(),
+        "conv-send-failure",
+        makeRequest(),
+        true,
+        undefined,
+        controller.signal,
+      );
+
+      expect(result.statusCode).toBe(499);
+      await transport.closedPromise;
+      expect(transport.closeCalls).toHaveLength(1);
+      await Bun.sleep(0);
+      expect(unhandled).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
   });
 
   test("does not open a socket when the request is already aborted before start", async () => {
