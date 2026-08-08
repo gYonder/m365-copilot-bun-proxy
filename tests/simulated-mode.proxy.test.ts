@@ -14,6 +14,7 @@ import {
   type ChatResult,
   type CreateConversationResult,
   type JsonObject,
+  type ParsedOpenAiRequest,
   type WrapperOptions,
 } from "../src/proxy/types";
 import {
@@ -153,6 +154,52 @@ describe("simulated transform mode proxy flow", () => {
         format: null,
       },
     ]);
+  });
+
+  test("responses derives native search only from the latest user message", () => {
+    const search = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        input: [
+          {
+            type: "message",
+            role: "developer",
+            content: "The instructions mention web search, current events, and news.",
+          },
+          {
+            type: "message",
+            role: "user",
+            content: "What is the current top headline on BBC News?",
+          },
+        ],
+      },
+      createOptions(),
+    );
+    expect(search.ok).toBeTrue();
+    if (!search.ok) return;
+    expect(search.request.base.hostedWebSearch).toBeTrue();
+
+    const coding = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        input: [
+          {
+            type: "message",
+            role: "developer",
+            content: "The instructions mention web search, current events, and news.",
+          },
+          {
+            type: "message",
+            role: "user",
+            content: "Explain this TypeScript function.",
+          },
+        ],
+      },
+      createOptions(),
+    );
+    expect(coding.ok).toBeTrue();
+    if (!coding.ok) return;
+    expect(coding.request.base.hostedWebSearch).toBeFalse();
   });
 
   test(
@@ -2910,6 +2957,96 @@ describe("simulated transform mode proxy flow", () => {
     expect(capturedPrompt).toContain(
       "This request requires at least one tool call. Do not return a plain-text-only assistant response.",
     );
+    expect(capturedPrompt).toContain(
+      "CRITICAL OUTPUT CONTRACT — this instruction appears after the request",
+    );
+    expect(capturedPrompt).toContain(
+      '"type":"function_call","call_id":"call_1","name":"TOOL_NAME"',
+    );
+    expect(capturedPrompt.lastIndexOf("CRITICAL OUTPUT CONTRACT")).toBeGreaterThan(
+      capturedPrompt.lastIndexOf("```"),
+    );
+  });
+
+  test("responses retries an invalid initial local-tool payload with a protocol correction", async () => {
+    const capturedPrompts: string[] = [];
+    let callCount = 0;
+    const services = createSubstrateStreamingServices(
+      async () => {
+        throw new Error("buffered simulated responses should not use chatStream");
+      },
+      (request) => {
+        callCount += 1;
+        capturedPrompts.push(request?.promptText ?? "");
+        const payload =
+          callCount === 1
+            ? {
+                id: "resp_toolless_first",
+                object: "response",
+                status: "completed",
+                output: [
+                  {
+                    type: "message",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: "The path is unknown." }],
+                  },
+                ],
+                output_text: "The path is unknown.",
+              }
+            : {
+                id: "resp_tool_retry",
+                object: "response",
+                status: "completed",
+                output: [
+                  {
+                    type: "function_call",
+                    call_id: "call_retry",
+                    name: "exec_command",
+                    arguments: "{\"cmd\":\"pwd\"}",
+                  },
+                ],
+              };
+        return buildGraphChatResult(
+          "conv_simulated_substrate_stream",
+          {},
+          toMarkdownJson(payload),
+        );
+      },
+    );
+    services.options.substrate.earlyCompleteOnSimulatedPayload = true;
+    const app = createProxyApp(services);
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: true,
+          input: "Use the shell to run pwd.",
+          tools: [
+            {
+              type: "function",
+              name: "exec_command",
+              description: "Run a command",
+              parameters: {
+                type: "object",
+                properties: { cmd: { type: "string" } },
+                required: ["cmd"],
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(2);
+    expect(capturedPrompts[1]).toContain("PROTOCOL RETRY 1:");
+    expect(capturedPrompts[1]).toContain(
+      "Return only the minified JSON tool-call object",
+    );
   });
 
   test("responses simulated prompt treats copying previous output to the clipboard as a local tool action", async () => {
@@ -3669,7 +3806,7 @@ function createSubstrateStreamingServices(
       conversationId: string | null;
     }) => Promise<void>,
   ) => Promise<ChatResult>,
-  onChat: () => ChatResult,
+  onChat: (request?: ParsedOpenAiRequest) => ChatResult,
   configureOptions?: (options: WrapperOptions) => void,
 ): Parameters<typeof createProxyApp>[0] {
   const options = createOptions();
@@ -3702,7 +3839,11 @@ function createSubstrateStreamingServices(
       conversationId: "conv_simulated_substrate_stream",
       rawBody: "{}",
     }),
-    chat: async (): Promise<ChatResult> => onChat(),
+    chat: async (
+      _authorizationHeader: string,
+      _conversationId: string,
+      request: ParsedOpenAiRequest,
+    ): Promise<ChatResult> => onChat(request),
     chatStream: async (
       _authorizationHeader: string,
       _conversationId: string,

@@ -1442,7 +1442,7 @@ export function buildInvocationPayload(
       deviceType: options.substrate.deviceType?.trim() || "Desktop",
     },
     message,
-    plugins: capabilities.webSearch
+    plugins: capabilities.webSearch && request.hostedWebSearch
       ? [{ Id: "BingWebSearch", Source: "BuiltIn" }]
       : [],
     isSbsSupported: true,

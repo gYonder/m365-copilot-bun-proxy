@@ -57,6 +57,7 @@ export function deriveRequestProfile({
 }: RequestProfileInput): RequestProfile {
   const structuredTypes = collectStructuredTypes(requestJson);
   const hostedWebSearch =
+    request.hostedWebSearch === true ||
     [...structuredTypes].some((type) => HostedWebSearchTypes.has(type)) ||
     isJsonObject(requestJson.web_search_options);
   const nativeCodeInterpreter = [...structuredTypes].some((type) =>

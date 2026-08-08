@@ -1354,12 +1354,13 @@ async function handleResponsesCreateOnce(
   const executeChatTurn = async (
     turnConversationId: string = conversationId!,
     turnIsStartOfSession: boolean = createdConversation,
+    turnRequest: ParsedOpenAiRequest = baseRequest,
   ): Promise<ChatResult> => {
     if (selectedTransport === TransportNames.Substrate) {
       const result = await substrateClient.chat(
         authorizationHeader,
         turnConversationId,
-        baseRequest,
+        turnRequest,
         turnIsStartOfSession,
         async (update) => {
           traceSubstrateStreamUpdate(services, trace, update);
@@ -1398,17 +1399,29 @@ async function handleResponsesCreateOnce(
       result,
       executeChatTurn,
     );
-    if (
-      baseRequest.transformMode === OpenAiTransformModes.Simulated &&
-      isInvalidSimulatedResponsesResult(
-        options,
-        result,
-        parsedRequest,
-        conversationId!,
-        options.includeConversationIdInResponseBody,
-      )
-    ) {
-      result = await executeChatTurn();
+    for (let retry = 0; retry < 2; retry += 1) {
+      if (
+        baseRequest.transformMode !== OpenAiTransformModes.Simulated ||
+        !isInvalidSimulatedResponsesResult(
+          options,
+          result,
+          parsedRequest,
+          conversationId!,
+          options.includeConversationIdInResponseBody,
+        )
+      ) {
+        break;
+      }
+      const retryConversationId =
+        services.substrateClient.createConversation().conversationId;
+      if (!retryConversationId) {
+        break;
+      }
+      result = await executeChatTurn(
+        retryConversationId,
+        true,
+        buildSimulatedProtocolRetryRequest(baseRequest, retry + 1),
+      );
     }
     return result;
   };
@@ -2453,6 +2466,21 @@ export function looksLikeConfabGiveUp(text: string | null | undefined): boolean 
     return false;
   }
   return ConfabGiveUpPatterns.some((pattern) => pattern.test(text));
+}
+
+function buildSimulatedProtocolRetryRequest(
+  request: ParsedOpenAiRequest,
+  attempt: number,
+): ParsedOpenAiRequest {
+  return {
+    ...request,
+    promptText: [
+      request.promptText,
+      "",
+      `PROTOCOL RETRY ${attempt}: The previous response was rejected because it did not contain the required valid local tool call.`,
+      "Do not answer the user request in prose. Return only the minified JSON tool-call object required above.",
+    ].join("\n"),
+  };
 }
 
 // Re-issue a buffered (non-streaming) Substrate turn when the model returns a

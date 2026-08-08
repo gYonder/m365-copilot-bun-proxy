@@ -16,9 +16,26 @@ import {
 } from "../src/proxy/types";
 
 describe("M365 native search compatibility", () => {
-  test("advertises Bing by default so the substrate can search when it decides to", () => {
+  test("omits Bing for an ordinary coding request", () => {
     const payload = buildInvocationPayload(
       makeRequest(),
+      "conversation-1",
+      "session-1",
+      "request-1",
+      true,
+      createOptions(),
+    );
+
+    expect((payload.arguments[0] as JsonObject).plugins).toEqual([]);
+  });
+
+  test("advertises Bing when the prompt asks for current web information", () => {
+    const payload = buildInvocationPayload(
+      {
+        ...makeRequest(),
+        hostedWebSearch: true,
+        promptText: "What is the current top headline on BBC News?",
+      },
       "conversation-1",
       "session-1",
       "request-1",
@@ -31,20 +48,18 @@ describe("M365 native search compatibility", () => {
     ]);
   });
 
-  test("advertises Bing even though no request can signal hosted web search", () => {
-    // Codex 0.146 sends no web_search tool to a custom provider regardless of
-    // web_search_mode, so the request-derived flag stays false. The capability
-    // must not depend on it.
+  test("advertises Bing when a request explicitly signals hosted web search", () => {
     const profile = deriveRequestProfile({
       requestJson: {
         model: "m365-copilot",
         input: "inspect",
+        tools: [{ type: "web_search" }],
       },
       request: makeRequest(),
       options: createOptions(),
       transport: TransportNames.Substrate,
     });
-    expect(profile.hostedWebSearch).toBeFalse();
+    expect(profile.hostedWebSearch).toBeTrue();
 
     const payload = buildInvocationPayload(
       { ...makeRequest(), hostedWebSearch: profile.hostedWebSearch },
@@ -58,6 +73,24 @@ describe("M365 native search compatibility", () => {
     expect((payload.arguments[0] as JsonObject).plugins).toEqual([
       { Id: "BingWebSearch", Source: "BuiltIn" },
     ]);
+  });
+
+  test("omits Bing when an initial local action is required", () => {
+    const request = makeRequest();
+    const payload = buildInvocationPayload(
+      {
+        ...request,
+        promptText: "Search the local repository and run its tests.",
+        tooling: { ...request.tooling, requiredByLocalAction: true },
+      },
+      "conversation-1",
+      "session-1",
+      "request-1",
+      true,
+      createOptions(),
+    );
+
+    expect((payload.arguments[0] as JsonObject).plugins).toEqual([]);
   });
 
   test("omits Bing when web search is turned off in config", () => {

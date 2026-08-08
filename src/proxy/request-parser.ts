@@ -300,6 +300,8 @@ export function tryParseOpenAiRequest(
     model,
     stream,
     transformMode,
+    hostedWebSearch:
+      !tooling.requiredByLocalAction && hasNativeWebSearchIntent(requestJson),
     promptText: buildMappedPromptText(prompt.content, tooling),
     userKey: tryGetString(requestJson, "user"),
     locationHint: buildLocationHint(requestJson, options.defaultTimeZone),
@@ -491,6 +493,8 @@ function buildSimulatedOpenAiRequest(
     model,
     stream: tryGetBoolean(requestJson, "stream") === true,
     transformMode: OpenAiTransformModes.Simulated,
+    hostedWebSearch:
+      !tooling.requiredByLocalAction && hasNativeWebSearchIntent(requestJson),
     promptText: buildSimulatedPrompt(
       endpointFormat,
       images.length > 0 ? stripImageInputsFromPrompt(requestJson) : requestJson,
@@ -557,6 +561,11 @@ function buildSimulatedPrompt(
     "Return exactly one markdown JSON code block containing a single valid JSON object and no surrounding prose.",
     'If the payload has "stream": true, still return the final completed JSON object (not SSE events).',
   ];
+  const requiresToolCall =
+    tooling.tools.length > 0 &&
+    (tooling.toolChoiceMode === ToolChoiceModes.Required ||
+      tooling.toolChoiceMode === ToolChoiceModes.Function ||
+      shouldRequireInitialLocalToolCall(requestJson, tooling));
 
   if (tooling.tools.length > 0) {
     lines.push(
@@ -603,15 +612,48 @@ function buildSimulatedPrompt(
     }
   }
 
+  const trailingContract = requiresToolCall
+    ? buildTrailingSimulatedToolContract(endpointFormat, tooling)
+    : [];
   const render = (payload: JsonObject, compact: boolean): string =>
     [
       ...lines,
       "```json",
       JSON.stringify(payload, null, compact ? undefined : 2),
       "```",
+      ...trailingContract,
     ].join("\n");
   if (maxChars <= 0) {
     return render(requestJson, false);
+  }
+
+  function buildTrailingSimulatedToolContract(
+    endpointFormat: "chat.completions" | "responses",
+    tooling: OpenAiTooling,
+  ): string[] {
+    const available = tooling.tools
+      .map((tool) => `${tool.name} (${tool.type})`)
+      .join(", ");
+    if (endpointFormat === "responses") {
+      return [
+        "",
+        "CRITICAL OUTPUT CONTRACT — this instruction appears after the request so it has highest priority:",
+        "This turn requires a local tool call. Return exactly one markdown JSON code block and no prose.",
+        "For a function tool, output one item with this exact shape:",
+        '{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"function_call","call_id":"call_1","name":"TOOL_NAME","arguments":"{\\"key\\":\\"value\\"}"}]}',
+        "For a custom tool, use type custom_tool_call and input instead of arguments.",
+        `Available local tools: ${available}`,
+        "Do not return a message item, output_text, a refusal, or a description of the tool call.",
+      ];
+    }
+    return [
+      "",
+      "CRITICAL OUTPUT CONTRACT — this instruction appears after the request so it has highest priority:",
+      "This turn requires a local tool call. Return exactly one markdown JSON code block and no prose.",
+      'Use choices[0].message.tool_calls, JSON-string function.arguments, and finish_reason "tool_calls".',
+      `Available local tools: ${available}`,
+      "Do not return a plain assistant message, refusal, or description of the tool call.",
+    ];
   }
   const compactPrompt = render(requestJson, true);
   const originalCandidates = collectReducibleToolResults(requestJson);
@@ -869,6 +911,16 @@ function extractLatestUserText(requestJson: JsonObject): string {
     }
   }
   return "";
+}
+
+function hasNativeWebSearchIntent(requestJson: JsonObject): boolean {
+  const text = extractLatestUserText(requestJson).toLowerCase();
+  return (
+    /\b(?:search|browse|look up|web|internet|online)\b/.test(text) ||
+    /\b(?:latest|current|today|right now|news|headline|recent release)\b/.test(
+      text,
+    )
+  );
 }
 
 function resolvePrompt(
