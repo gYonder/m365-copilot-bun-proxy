@@ -577,13 +577,15 @@ export class CopilotSubstrateClient {
         ) {
           acknowledgement = createSubstrateCancellationAcknowledgement(
             ws,
-            invocationId,
-            SubstrateCancelAckTimeoutMs,
+            StopSubstrateInvocationId,
+            SubstrateStopAckTimeoutMs,
           );
           const stop = await settlePromiseWithin(
             sendFrame(ws, requestUri, this.logger, {
-              type: SignalRCancelInvocationType,
-              invocationId,
+              arguments: [{}],
+              invocationId: StopSubstrateInvocationId,
+              target: "stop",
+              type: 1,
             }),
             SubstrateCancelAckTimeoutMs,
           );
@@ -1448,8 +1450,9 @@ export function buildInvocationPayload(
     // Verified against the live substrate: `disconnectBehavior: "stop"` is
     // rejected and fails every invocation with a server-side Chat error, so
     // "continue" is the only accepted value. Cancellation therefore relies on
-    // the CancelInvocation frame plus a hard socket close rather than on this
-    // field. Do not change this without a live substrate turn to prove it.
+    // the substrate Stop invocation, a bounded acknowledgement wait, and a
+    // hard socket close rather than on this field. Do not change this without
+    // a live substrate turn to prove it.
     disconnectBehavior: "continue",
   };
 
@@ -1582,10 +1585,20 @@ function resolveTimeZoneOffsetMinutes(timeZoneId: string): number {
 }
 
 const DefaultSubstrateInvocationId = "0";
-// SignalR Hub Protocol CancelInvocation (type 5) uses the StreamInvocation ID:
-// https://github.com/dotnet/aspnetcore/blob/main/src/SignalR/docs/specs/HubProtocol.md
-const SignalRCancelInvocationType = 5;
+// Cancelling a turn is a normal hub invocation of `stop`, captured from the
+// real m365.cloud.microsoft client pressing "Stop generating". It is
+// deliberately NOT a SignalR CancelInvocation (type 5), which the substrate
+// ignores, and it carries its own invocation id distinct from the chat
+// invocation's `DefaultSubstrateInvocationId`. The server answers with a
+// type-3 completion for this id and discards the partial answer.
+const StopSubstrateInvocationId = "1";
+// Bound on flushing a frame onto the socket.
 const SubstrateCancelAckTimeoutMs = 500;
+// Bound on the substrate's type-3 answer to the stop invocation. The reference
+// client allows two seconds before closing; closing sooner risks tearing down
+// the socket before the substrate has acted on the stop, which would leave the
+// turn generating upstream. Nothing user-facing waits on this.
+const SubstrateStopAckTimeoutMs = 2_000;
 
 export function splitFrames(payload: string): string[] {
   return payload

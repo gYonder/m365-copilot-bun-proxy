@@ -73,6 +73,7 @@ function makeFakeTransport(
   onBlockingRead: () => void,
   blockingReadCall = 2,
   throwOnCancel = false,
+  acknowledgeStop = false,
 ): {
   connect: SubstrateWebSocketConnector;
   createReceiver: SubstrateReceiverFactory;
@@ -92,12 +93,18 @@ function makeFakeTransport(
   let resolvePendingRead: ((value: string | null) => void) | null = null;
   const ws = {
     readyState: 1, // WebSocket.OPEN
+    onmessage: null as ((event: { data?: unknown }) => void) | null,
     send: (payload: string) => {
-      if (throwOnCancel && payload.includes('"type":5')) {
+      if (throwOnCancel && payload.includes('"target":"stop"')) {
         throw new Error("cancel send failed");
       }
       sentFrames.push(payload);
       events.push(`send:${payload}`);
+      if (acknowledgeStop && payload.includes('"target":"stop"')) {
+        ws.onmessage?.({
+          data: `${JSON.stringify({ type: 3, invocationId: "1" })}\u001e`,
+        });
+      }
     },
     close: (code?: number, reason?: string) => {
       if (!socketClosed) {
@@ -173,7 +180,7 @@ describe("Substrate client cancellation via AbortSignal", () => {
     expect(argument.disconnectBehavior).toBe("continue");
   });
 
-  test("closes the socket and returns a cancelled result when the client disconnects mid-turn", async () => {
+  test("waits for a bounded stop acknowledgement then closes without one", async () => {
     const controller = new AbortController();
     let abortAt = 0;
     const {
@@ -207,7 +214,8 @@ describe("Substrate client cancellation via AbortSignal", () => {
     expect(result.isSuccess).toBeFalse();
     expect(result.statusCode).toBe(499);
     await closedPromise;
-    expect(Date.now() - abortAt).toBeLessThan(1_000);
+    expect(Date.now() - abortAt).toBeGreaterThanOrEqual(1_900);
+    expect(Date.now() - abortAt).toBeLessThan(4_000);
     // Upstream work was actually stopped: the socket was closed for the abort.
     expect(
       closeCalls.some((call) => call.reason === "client disconnected"),
@@ -215,23 +223,74 @@ describe("Substrate client cancellation via AbortSignal", () => {
     const invocationFrame = sentFrames.find((frame) =>
       frame.includes('"target":"chat"'),
     );
-    const invocationId = JSON.parse(
+    const chatInvocationId = JSON.parse(
       invocationFrame?.replace(/\u001e$/, "") ?? "{}",
     ).invocationId;
     const stopFrame = sentFrames.find((frame) =>
-      frame.includes('"type":5'),
+      frame.includes('"target":"stop"'),
     );
     const stopIndex = events.findIndex((event) =>
-      event.includes('"type":5'),
+      event.includes('"target":"stop"'),
     );
     expect(stopIndex).toBeGreaterThanOrEqual(0);
     expect(stopIndex).toBeLessThan(events.indexOf("close"));
-    expect(sentFrames.filter((frame) => frame.includes('"type":5'))).toHaveLength(
-      1,
+    expect(
+      sentFrames.filter((frame) => frame.includes('"target":"stop"')),
+    ).toHaveLength(1);
+    const stop = JSON.parse(stopFrame?.replace(/\u001e$/, "") ?? "{}");
+    expect(chatInvocationId).toBe("0");
+    expect(stop).toEqual({
+      arguments: [{}],
+      invocationId: "1",
+      target: "stop",
+      type: 1,
+    });
+    expect(stop.invocationId).not.toBe(chatInvocationId);
+  });
+
+  test("resolves a stop acknowledgement with the stop invocation id", async () => {
+    const controller = new AbortController();
+    let abortAt = 0;
+    const transport = makeFakeTransport(
+      () => {
+        abortAt = Date.now();
+        controller.abort();
+      },
+      2,
+      false,
+      true,
     );
-    expect(stopFrame).toBe(
-      `${JSON.stringify({ type: 5, invocationId })}\u001e`,
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      transport.connect,
+      transport.createReceiver,
     );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-stop-ack",
+      makeRequest(),
+      true,
+      undefined,
+      controller.signal,
+    );
+
+    expect(result.statusCode).toBe(499);
+    await transport.closedPromise;
+    expect(Date.now() - abortAt).toBeLessThan(250);
+    expect(
+      transport.sentFrames.some((frame) =>
+        frame.includes('"invocationId":"1"') &&
+        frame.includes('"target":"stop"'),
+      ),
+    ).toBeTrue();
+    expect(
+      transport.closeCalls.some(
+        (call) => call.reason === "client disconnected",
+      ),
+    ).toBeTrue();
   });
 
   test("closes during handshake without sending a cancellation frame", async () => {
@@ -260,7 +319,7 @@ describe("Substrate client cancellation via AbortSignal", () => {
     expect(result.statusCode).toBe(499);
     await transport.closedPromise;
     expect(
-      transport.sentFrames.some((frame) => frame.includes('"type":5')),
+      transport.sentFrames.some((frame) => frame.includes('"target":"stop"')),
     ).toBeFalse();
     expect(transport.closeCalls).toHaveLength(1);
   });
@@ -291,7 +350,7 @@ describe("Substrate client cancellation via AbortSignal", () => {
     expect(result.statusCode).toBe(499);
     await transport.closedPromise;
     expect(
-      transport.sentFrames.filter((frame) => frame.includes('"type":5')),
+      transport.sentFrames.filter((frame) => frame.includes('"target":"stop"')),
     ).toHaveLength(1);
     expect(transport.closeCalls).toHaveLength(1);
   });
