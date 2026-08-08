@@ -75,8 +75,16 @@ export class SubstrateSessionStore {
       };
       this.entries.delete(normalizedConversationId);
       this.entries.set(normalizedConversationId, refreshed);
-      this.durable.state.sessions[normalizedConversationId] = refreshed;
-      this.durable.save();
+      if (
+        this.shouldRefreshDurableSession(
+          normalizedConversationId,
+          existing.sessionId,
+          nowUtcMs,
+        )
+      ) {
+        this.durable.state.sessions[normalizedConversationId] = refreshed;
+        this.durable.save();
+      }
       return existing.sessionId;
     }
 
@@ -137,6 +145,22 @@ export class SubstrateSessionStore {
     return this.ttlMinutes <= 0
       ? Number.MAX_SAFE_INTEGER
       : nowUtcMs + this.ttlMinutes * 60_000;
+  }
+
+  private shouldRefreshDurableSession(
+    conversationId: string,
+    sessionId: string,
+    nowUtcMs: number,
+  ): boolean {
+    const persisted = this.durable.state.sessions[conversationId];
+    if (!persisted || persisted.sessionId !== sessionId) {
+      return true;
+    }
+    if (this.ttlMinutes <= 0) {
+      return persisted.expiresAtUtc !== Number.MAX_SAFE_INTEGER;
+    }
+    const refreshWindowMs = (this.ttlMinutes * 60_000) / 2;
+    return persisted.expiresAtUtc <= nowUtcMs + refreshWindowMs;
   }
 
   private purgeExpired(nowUtcMs: number): void {

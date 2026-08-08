@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import path from "node:path";
+import { DurableStateStore } from "../src/proxy/durable-state";
 import {
   SubstrateSessionStore,
   TurnQueueWaitError,
@@ -16,6 +19,42 @@ describe("SubstrateSessionStore", () => {
     expect(first).toBe("session-1");
     expect(second).toBe("session-1");
     expect(created).toBe(1);
+  });
+
+  test("refreshes durable session expiry only after half the ttl is consumed", () => {
+    const dir = mkdtempSync(path.join(process.cwd(), ".m365-session-refresh-"));
+    const file = path.join(dir, "continuation.json");
+    try {
+      const durable = new DurableStateStore(file);
+      const store = new SubstrateSessionStore(1, 512, durable);
+      const startedAt = Date.now();
+
+      expect(
+        store.getOrCreate("conversation-1", () => "session-1", startedAt),
+      ).toBe("session-1");
+      const initial = JSON.parse(readFileSync(file, "utf8"));
+      expect(initial.sessions["conversation-1"].expiresAtUtc).toBe(
+        startedAt + 60_000,
+      );
+
+      expect(
+        store.getOrCreate("conversation-1", () => "unexpected", startedAt + 1_000),
+      ).toBe("session-1");
+      const beforeThreshold = JSON.parse(readFileSync(file, "utf8"));
+      expect(beforeThreshold.sessions["conversation-1"].expiresAtUtc).toBe(
+        startedAt + 60_000,
+      );
+
+      expect(
+        store.getOrCreate("conversation-1", () => "unexpected", startedAt + 31_000),
+      ).toBe("session-1");
+      const afterThreshold = JSON.parse(readFileSync(file, "utf8"));
+      expect(afterThreshold.sessions["conversation-1"].expiresAtUtc).toBe(
+        startedAt + 91_000,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("creates a new session id after ttl expiration", () => {
