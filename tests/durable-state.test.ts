@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { ConversationStore } from "../src/proxy/conversation-store";
 import { DurableStateStore } from "../src/proxy/durable-state";
@@ -10,7 +17,7 @@ import type { WrapperOptions } from "../src/proxy/types";
 
 describe("durable continuation metadata", () => {
   test("survives process-store reconstruction without storing content", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "m365-state-"));
+    const dir = createTempDir("m365-state");
     const file = path.join(dir, "continuation.json");
     const options = { conversationTtlMinutes: 180 } as WrapperOptions;
     const first = new DurableStateStore(file);
@@ -51,7 +58,7 @@ describe("durable continuation metadata", () => {
   });
 
   test("persists explicit completed protocol replays across reconstruction", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "m365-replay-"));
+    const dir = createTempDir("m365-replay");
     const file = path.join(dir, "continuation.json");
     const options = { conversationTtlMinutes: 180 } as WrapperOptions;
     const first = new ResponseStore(options, new DurableStateStore(file));
@@ -69,17 +76,22 @@ describe("durable continuation metadata", () => {
       completed,
     );
 
+    expect(first.tryGetProtocolReplay("protocol:durable-turn")).toEqual({
+      conversationId: "conv_protocol_1",
+      response: completed,
+    });
+
     const resumed = new ResponseStore(options, new DurableStateStore(file));
     expect(resumed.tryGetProtocolReplay("protocol:durable-turn")).toEqual({
       conversationId: "conv_protocol_1",
-      response: completed,
+      response: null,
     });
     expect(statSync(file).mode & 0o777).toBe(0o600);
     rmSync(dir, { recursive: true, force: true });
   });
 
   test("persists bounded tool ledger metadata without tool results", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "m365-ledger-"));
+    const dir = createTempDir("m365-ledger");
     const file = path.join(dir, "continuation.json");
     const options = { conversationTtlMinutes: 180 } as WrapperOptions;
     const first = new ResponseStore(options, new DurableStateStore(file));
@@ -108,14 +120,14 @@ describe("durable continuation metadata", () => {
   });
 
   test("removes expired durable protocol replays", () => {
-    const dir = mkdtempSync(path.join(tmpdir(), "m365-replay-expired-"));
+    const dir = createTempDir("m365-replay-expired");
     const file = path.join(dir, "continuation.json");
     const options = { conversationTtlMinutes: 180 } as WrapperOptions;
     const durable = new DurableStateStore(file);
     durable.state.replays["protocol:expired-turn"] = {
       conversationId: "conv_expired",
-      response: { id: "resp_expired" },
       expiresAtUtc: Date.now() - 1,
+      responseFingerprint: "expired",
     };
     durable.save();
 
@@ -124,4 +136,157 @@ describe("durable continuation metadata", () => {
     expect(readFileSync(file, "utf8")).not.toContain("protocol:expired-turn");
     rmSync(dir, { recursive: true, force: true });
   });
+
+  test("quarantines the old body-bearing state format", () => {
+    const dir = createTempDir("m365-old-state");
+    const file = path.join(dir, "continuation.json");
+    writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        replays: {
+          "protocol:old": {
+            conversationId: "conv_old",
+            response: { output_text: "old body" },
+            expiresAtUtc: Date.now() + 60_000,
+          },
+        },
+      }),
+    );
+
+    const store = new DurableStateStore(file);
+
+    expect(store.state.replays).toEqual({});
+    expect(existsSync(file)).toBeFalse();
+    expect(quarantineFiles(file)).toHaveLength(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("quarantines an unparseable state file", () => {
+    const dir = createTempDir("m365-corrupt-state");
+    const file = path.join(dir, "continuation.json");
+    writeFileSync(file, "{not-json");
+
+    const store = new DurableStateStore(file);
+
+    expect(store.state.replays).toEqual({});
+    expect(existsSync(file)).toBeFalse();
+    expect(quarantineFiles(file)).toHaveLength(1);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("starts clean without quarantining an absent state file", () => {
+    const dir = createTempDir("m365-absent-state");
+    const file = path.join(dir, "continuation.json");
+
+    const store = new DurableStateStore(file);
+
+    expect(store.state.replays).toEqual({});
+    expect(existsSync(file)).toBeFalse();
+    expect(quarantineFiles(file)).toHaveLength(0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("never overwrites an existing quarantine file", () => {
+    const dir = createTempDir("m365-quarantine-collision");
+    const file = path.join(dir, "continuation.json");
+    const fixedNow = 1_700_000_000_000;
+    const existingQuarantine = `${file}.incompatible-${fixedNow}`;
+    writeFileSync(file, JSON.stringify({ version: 1 }));
+    writeFileSync(existingQuarantine, "keep this evidence");
+
+    const originalDateNow = Date.now;
+    Date.now = () => fixedNow;
+    try {
+      new DurableStateStore(file);
+    } finally {
+      Date.now = originalDateNow;
+    }
+
+    expect(readFileSync(existingQuarantine, "utf8")).toBe("keep this evidence");
+    expect(existsSync(`${existingQuarantine}-1`)).toBeTrue();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("does not persist prompts, output, or inline image data in replay state", () => {
+    const dir = createTempDir("m365-replay-content");
+    const file = path.join(dir, "continuation.json");
+    const store = new ResponseStore(
+      { conversationTtlMinutes: 180 } as WrapperOptions,
+      new DurableStateStore(file),
+    );
+    store.rememberCompletedProtocolTurn("protocol:content", "conv_content", {
+      id: "resp_content",
+      input: [{ role: "user", content: "secret prompt text" }],
+      output: [{ type: "message", text: "secret model output" }],
+      image: "data:image/png;base64,secret-image-bytes",
+    });
+
+    const persisted = readFileSync(file, "utf8");
+    expect(persisted).not.toContain("secret prompt text");
+    expect(persisted).not.toContain("secret model output");
+    expect(persisted).not.toContain("data:image/");
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("round-trips the new state envelope and durable content", () => {
+    const dir = createTempDir("m365-round-trip");
+    const file = path.join(dir, "continuation.json");
+    const first = new DurableStateStore(file);
+    first.state.responses.response_1 = {
+      conversationId: "conv_1",
+      expiresAtUtc: Date.now() + 60_000,
+      contextInputTokens: 42,
+      contextWindowId: "window_1",
+    };
+    first.state.replays.replay_1 = {
+      conversationId: "conv_1",
+      expiresAtUtc: Date.now() + 60_000,
+      responseFingerprint: "fingerprint",
+    };
+    first.save();
+
+    const second = new DurableStateStore(file);
+
+    expect(second.state).toEqual(first.state);
+    expect(second.state.schema_version).toBe(1);
+    expect(second.state.contract_version).toBe(2);
+    expect(second.state.adapter_route).toBe("substrate-coding");
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("reports an unreplayable durable completion without a response body", () => {
+    const dir = createTempDir("m365-unreplayable");
+    const file = path.join(dir, "continuation.json");
+    const options = { conversationTtlMinutes: 180 } as WrapperOptions;
+    const first = new ResponseStore(options, new DurableStateStore(file));
+    first.rememberCompletedProtocolTurn(
+      "protocol:unreplayable",
+      "conv_unreplayable",
+      { id: "resp_unreplayable", output_text: "not persisted" },
+    );
+
+    const resumed = new ResponseStore(options, new DurableStateStore(file));
+    const replay = resumed.tryGetProtocolReplay("protocol:unreplayable");
+
+    expect(replay).toEqual({
+      conversationId: "conv_unreplayable",
+      response: null,
+    });
+    rmSync(dir, { recursive: true, force: true });
+  });
 });
+
+function createTempDir(prefix: string): string {
+  return mkdtempSync(path.join(process.cwd(), `.${prefix}-`));
+}
+
+function quarantineFiles(file: string): string[] {
+  const dir = path.dirname(file);
+  const base = path.basename(file);
+  return readdirSync(dir).filter((name) =>
+    name.startsWith(`${base}.incompatible-`),
+  );
+}

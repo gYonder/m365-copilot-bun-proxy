@@ -7,6 +7,13 @@ import {
   writeFileSync,
 } from "node:fs";
 import path from "node:path";
+import packageMetadata from "../../package.json";
+
+const StateSchemaVersion = 1;
+const BridgeContractVersion = 2;
+const AdapterRoute = "substrate-coding";
+const ProviderRuntimeVersion = packageMetadata.version;
+const MaxDurableEntries = 1_024;
 
 type DurableResponseEntry = {
   conversationId: string;
@@ -27,8 +34,8 @@ type DurableSessionEntry = {
 
 export type DurableReplayEntry = {
   conversationId: string | null;
-  response: Record<string, unknown>;
   expiresAtUtc: number;
+  responseFingerprint?: string;
 };
 
 export type DurableToolLedgerEntry = {
@@ -37,7 +44,10 @@ export type DurableToolLedgerEntry = {
 };
 
 export type DurableState = {
-  version: 1;
+  schema_version: typeof StateSchemaVersion;
+  contract_version: typeof BridgeContractVersion;
+  adapter_route: typeof AdapterRoute;
+  provider_runtime_version: string;
   responses: Record<string, DurableResponseEntry>;
   conversations: Record<string, DurableConversationEntry>;
   sessions: Record<string, DurableSessionEntry>;
@@ -45,8 +55,25 @@ export type DurableState = {
   toolLedgers: Record<string, DurableToolLedgerEntry>;
 };
 
+type QuarantineStatus = {
+  count: number;
+  lastOccurredAtUnix: number | null;
+};
+
+class DurableStateParseError extends Error {
+  constructor(
+    readonly reason: string,
+    readonly found: Record<string, unknown> = {},
+  ) {
+    super(reason);
+  }
+}
+
 const emptyState = (): DurableState => ({
-  version: 1,
+  schema_version: StateSchemaVersion,
+  contract_version: BridgeContractVersion,
+  adapter_route: AdapterRoute,
+  provider_runtime_version: ProviderRuntimeVersion,
   responses: {},
   conversations: {},
   sessions: {},
@@ -62,16 +89,34 @@ export function durableStatePath(): string | null {
 export class DurableStateStore {
   readonly path: string | null;
   state: DurableState;
+  private quarantineCountValue = 0;
+  private lastQuarantineAtUnixValue: number | null = null;
+
   constructor(filePath = durableStatePath()) {
     this.path = filePath;
     this.state = this.load();
+  }
+
+  get quarantineStatus(): QuarantineStatus {
+    return {
+      count: this.quarantineCountValue,
+      lastOccurredAtUnix: this.lastQuarantineAtUnixValue,
+    };
   }
 
   private load(): DurableState {
     if (!this.path || !existsSync(this.path)) return emptyState();
     try {
       return parseState(JSON.parse(readFileSync(this.path, "utf8")));
-    } catch {
+    } catch (error) {
+      if (!existsSync(this.path)) {
+        return emptyState();
+      }
+      const failure =
+        error instanceof DurableStateParseError
+          ? error
+          : new DurableStateParseError("unparseable_state");
+      this.quarantine(failure);
       return emptyState();
     }
   }
@@ -90,7 +135,12 @@ export class DurableStateStore {
         if (value.expiresAtUtc <= now) delete collection[key];
       }
       const keys = Object.keys(collection);
-      for (const key of keys.slice(0, Math.max(0, keys.length - 1024))) delete collection[key];
+      for (const key of keys.slice(
+        0,
+        Math.max(0, keys.length - MaxDurableEntries),
+      )) {
+        delete collection[key];
+      }
     }
     const dir = path.dirname(this.path);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -100,14 +150,80 @@ export class DurableStateStore {
     renameSync(temp, this.path);
     chmodSync(this.path, 0o600);
   }
+
+  private quarantine(error: DurableStateParseError): void {
+    this.quarantineCountValue += 1;
+    this.lastQuarantineAtUnixValue = Math.floor(Date.now() / 1000);
+
+    let quarantinePath: string | null = null;
+    if (this.path) {
+      const base = `${this.path}.incompatible-${Date.now()}`;
+      let candidate = base;
+      let suffix = 0;
+      while (existsSync(candidate)) {
+        suffix += 1;
+        candidate = `${base}-${suffix}`;
+      }
+      try {
+        renameSync(this.path, candidate);
+        quarantinePath = candidate;
+      } catch {
+        quarantinePath = null;
+      }
+    }
+
+    console.error(
+      JSON.stringify({
+        event: "durable_state_quarantined",
+        path: this.path,
+        quarantine_path: quarantinePath,
+        reason: error.reason,
+        expected: {
+          schema_version: StateSchemaVersion,
+          contract_version: BridgeContractVersion,
+          adapter_route: AdapterRoute,
+        },
+        found: {
+          schema_version: boundedVersionForLog(error.found.schema_version),
+          contract_version: boundedVersionForLog(error.found.contract_version),
+          adapter_route: boundedVersionForLog(error.found.adapter_route),
+        },
+      }),
+    );
+  }
 }
 
 function parseState(value: unknown): DurableState {
-  if (!isRecord(value) || value.version !== 1) {
-    return emptyState();
+  if (!isRecord(value)) {
+    throw new DurableStateParseError("state_root_not_object");
   }
+
+  const found = {
+    schema_version: value.schema_version ?? null,
+    contract_version: value.contract_version ?? null,
+    adapter_route: value.adapter_route ?? null,
+  };
+  if (value.schema_version !== StateSchemaVersion) {
+    throw new DurableStateParseError("unsupported_schema_version", found);
+  }
+  if (value.contract_version !== BridgeContractVersion) {
+    throw new DurableStateParseError("unsupported_contract_version", found);
+  }
+  if (value.adapter_route !== AdapterRoute) {
+    throw new DurableStateParseError("unsupported_adapter_route", found);
+  }
+  if (
+    typeof value.provider_runtime_version !== "string" ||
+    !value.provider_runtime_version.trim()
+  ) {
+    throw new DurableStateParseError("missing_provider_runtime_version", found);
+  }
+
   return {
-    version: 1,
+    schema_version: StateSchemaVersion,
+    contract_version: BridgeContractVersion,
+    adapter_route: AdapterRoute,
+    provider_runtime_version: value.provider_runtime_version.trim(),
     responses: parseResponseEntries(value.responses),
     conversations: parseConversationEntries(value.conversations),
     sessions: parseSessionEntries(value.sessions),
@@ -119,51 +235,86 @@ function parseState(value: unknown): DurableState {
 function parseToolLedgerEntries(
   value: unknown,
 ): Record<string, DurableToolLedgerEntry> {
+  const record = requireRecord(value, "tool_ledger_collection");
   const output: Record<string, DurableToolLedgerEntry> = {};
-  if (!isRecord(value)) return output;
-  for (const [key, entry] of Object.entries(value)) {
-    if (!isRecord(entry)) continue;
-    const serialized = readString(entry.serialized);
-    const expiresAtUtc = readPositiveNumber(entry.expiresAtUtc);
-    if (serialized && expiresAtUtc !== null) {
-      output[key] = { serialized, expiresAtUtc };
-    }
+  for (const [key, entry] of Object.entries(record)) {
+    const item = requireRecord(entry, "tool_ledger_entry");
+    const serialized = requireString(item.serialized, "tool_ledger_serialized");
+    const expiresAtUtc = requirePositiveNumber(
+      item.expiresAtUtc,
+      "tool_ledger_expiry",
+    );
+    output[key] = { serialized, expiresAtUtc };
   }
   return output;
 }
 
 function parseReplayEntries(value: unknown): Record<string, DurableReplayEntry> {
+  const record = requireRecord(value, "replay_collection");
   const output: Record<string, DurableReplayEntry> = {};
-  if (!isRecord(value)) return output;
-  for (const [key, entry] of Object.entries(value)) {
-    if (!isRecord(entry) || !isRecord(entry.response)) continue;
-    const expiresAtUtc = readPositiveNumber(entry.expiresAtUtc);
-    if (expiresAtUtc === null) continue;
+  for (const [key, entry] of Object.entries(record)) {
+    const item = requireRecord(entry, "replay_entry");
+    if (Object.hasOwn(item, "response")) {
+      throw new DurableStateParseError("replay_response_body_present");
+    }
+    const expiresAtUtc = requirePositiveNumber(
+      item.expiresAtUtc,
+      "replay_expiry",
+    );
+    let conversationId: string | null;
+    if (item.conversationId === null) {
+      conversationId = null;
+    } else {
+      conversationId = requireString(item.conversationId, "replay_conversation");
+    }
+
+    const responseFingerprint =
+      item.responseFingerprint === undefined
+        ? undefined
+        : requireBoundedString(
+            item.responseFingerprint,
+            "replay_fingerprint",
+            128,
+          );
     output[key] = {
-      conversationId:
-        entry.conversationId === null ? null : readString(entry.conversationId) ?? null,
-      response: entry.response,
+      conversationId,
       expiresAtUtc,
+      ...(responseFingerprint === undefined ? {} : { responseFingerprint }),
     };
   }
   return output;
 }
 
 function parseResponseEntries(value: unknown): Record<string, DurableResponseEntry> {
+  const record = requireRecord(value, "response_collection");
   const output: Record<string, DurableResponseEntry> = {};
-  if (!isRecord(value)) return output;
-  for (const [key, entry] of Object.entries(value)) {
-    if (!isRecord(entry)) continue;
-    const conversationId = readString(entry.conversationId);
-    const expiresAtUtc = readPositiveNumber(entry.expiresAtUtc);
-    if (!conversationId || expiresAtUtc === null) continue;
-    const contextInputTokens = readPositiveNumber(entry.contextInputTokens);
+  for (const [key, entry] of Object.entries(record)) {
+    const item = requireRecord(entry, "response_entry");
+    const conversationId = requireString(
+      item.conversationId,
+      "response_conversation",
+    );
+    const expiresAtUtc = requirePositiveNumber(
+      item.expiresAtUtc,
+      "response_expiry",
+    );
+    const contextInputTokens =
+      item.contextInputTokens === undefined
+        ? undefined
+        : requirePositiveNumber(
+            item.contextInputTokens,
+            "response_context_tokens",
+          );
     const contextWindowId =
-      entry.contextWindowId === null ? null : readString(entry.contextWindowId);
+      item.contextWindowId === undefined
+        ? undefined
+        : item.contextWindowId === null
+          ? null
+          : requireString(item.contextWindowId, "response_context_window");
     output[key] = {
       conversationId,
       expiresAtUtc,
-      ...(contextInputTokens === null ? {} : { contextInputTokens }),
+      ...(contextInputTokens === undefined ? {} : { contextInputTokens }),
       ...(contextWindowId === undefined ? {} : { contextWindowId }),
     };
   }
@@ -173,43 +324,76 @@ function parseResponseEntries(value: unknown): Record<string, DurableResponseEnt
 function parseConversationEntries(
   value: unknown,
 ): Record<string, DurableConversationEntry> {
+  const record = requireRecord(value, "conversation_collection");
   const output: Record<string, DurableConversationEntry> = {};
-  if (!isRecord(value)) return output;
-  for (const [key, entry] of Object.entries(value)) {
-    if (!isRecord(entry)) continue;
-    const conversationId = readString(entry.conversationId);
-    const expiresAtUtc = readPositiveNumber(entry.expiresAtUtc);
-    if (conversationId && expiresAtUtc !== null) {
-      output[key] = { conversationId, expiresAtUtc };
-    }
+  for (const [key, entry] of Object.entries(record)) {
+    const item = requireRecord(entry, "conversation_entry");
+    output[key] = {
+      conversationId: requireString(
+        item.conversationId,
+        "conversation_id",
+      ),
+      expiresAtUtc: requirePositiveNumber(
+        item.expiresAtUtc,
+        "conversation_expiry",
+      ),
+    };
   }
   return output;
 }
 
 function parseSessionEntries(value: unknown): Record<string, DurableSessionEntry> {
+  const record = requireRecord(value, "session_collection");
   const output: Record<string, DurableSessionEntry> = {};
-  if (!isRecord(value)) return output;
-  for (const [key, entry] of Object.entries(value)) {
-    if (!isRecord(entry)) continue;
-    const sessionId = readString(entry.sessionId);
-    const expiresAtUtc = readPositiveNumber(entry.expiresAtUtc);
-    if (sessionId && expiresAtUtc !== null) {
-      output[key] = { sessionId, expiresAtUtc };
-    }
+  for (const [key, entry] of Object.entries(record)) {
+    const item = requireRecord(entry, "session_entry");
+    output[key] = {
+      sessionId: requireString(item.sessionId, "session_id"),
+      expiresAtUtc: requirePositiveNumber(item.expiresAtUtc, "session_expiry"),
+    };
   }
   return output;
 }
 
+function requireRecord(value: unknown, reason: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new DurableStateParseError(reason);
+  }
+  return value;
+}
+
+function requireString(value: unknown, reason: string): string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new DurableStateParseError(reason);
+  }
+  return value.trim();
+}
+
+function requireBoundedString(
+  value: unknown,
+  reason: string,
+  maxLength: number,
+): string {
+  const normalized = requireString(value, reason);
+  if (normalized.length > maxLength) {
+    throw new DurableStateParseError(reason);
+  }
+  return normalized;
+}
+
+function requirePositiveNumber(value: unknown, reason: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new DurableStateParseError(reason);
+  }
+  return value;
+}
+
+function boundedVersionForLog(value: unknown): string | number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") return value.slice(0, 64);
+  return null;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function readString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function readPositiveNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0
-    ? value
-    : null;
 }

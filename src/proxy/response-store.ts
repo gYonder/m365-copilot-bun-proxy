@@ -22,7 +22,7 @@ type RequestHashEntry = {
 
 export type StoredReplayResult = {
   conversationId: string | null;
-  response: JsonObject;
+  response: JsonObject | null;
 };
 
 type TaskDeadlineEntry = {
@@ -43,6 +43,7 @@ export class ResponseStore {
   private readonly entries = new Map<string, StoredOpenAiResponseRecord>();
   private readonly conversationLinks = new Map<string, ConversationLinkEntry>();
   private readonly requestHashes = new Map<string, RequestHashEntry>();
+  private readonly protocolReplayBodies = new Map<string, JsonObject>();
   private readonly taskDeadlines = new Map<string, TaskDeadlineEntry>();
   private readonly toolLedgers = new Map<string, ToolLedgerEntry>();
   private readonly inFlightResponses = new Map<string, Promise<Response>>();
@@ -330,13 +331,23 @@ export class ResponseStore {
     const entry = this.durable.state.replays[key];
     if (!entry) return null;
     if (entry.expiresAtUtc <= Date.now()) {
+      this.protocolReplayBodies.delete(key);
       delete this.durable.state.replays[key];
       this.durable.save();
       return null;
     }
+    const response = this.protocolReplayBodies.get(key);
+    if (!response) {
+      return {
+        conversationId: entry.conversationId,
+        response: null,
+      };
+    }
+    this.protocolReplayBodies.delete(key);
+    this.protocolReplayBodies.set(key, response);
     return {
       conversationId: entry.conversationId,
-      response: cloneJsonValue(entry.response as JsonObject),
+      response: cloneJsonValue(response),
     };
   }
 
@@ -347,11 +358,23 @@ export class ResponseStore {
   ): void {
     const key = identityKey.trim();
     if (!key) return;
+    this.purgeExpired();
+    const expiresAtUtc = this.resolveExpiryMs();
+    this.protocolReplayBodies.set(key, cloneJsonValue(response));
     this.durable.state.replays[key] = {
       conversationId: conversationId?.trim() || null,
-      response: cloneJsonValue(response),
-      expiresAtUtc: this.resolveExpiryMs(),
+      expiresAtUtc,
+      responseFingerprint: createHash("sha256")
+        .update(JSON.stringify(response))
+        .digest("hex"),
     };
+    while (this.protocolReplayBodies.size > MaxStoredResponses) {
+      const oldest = this.protocolReplayBodies.keys().next();
+      if (oldest.done) break;
+      this.protocolReplayBodies.delete(oldest.value);
+      delete this.durable.state.replays[oldest.value];
+      this.recordEviction("protocol_replay", "lru");
+    }
     this.durable.save();
   }
 
@@ -455,9 +478,16 @@ export class ResponseStore {
       }
     }
 
+    for (const [key] of this.protocolReplayBodies.entries()) {
+      const entry = this.durable.state.replays[key];
+      if (!entry || entry.expiresAtUtc <= now) {
+        this.protocolReplayBodies.delete(key);
+      }
+    }
     for (const [key, entry] of Object.entries(this.durable.state.replays)) {
       if (entry.expiresAtUtc <= now) {
         delete this.durable.state.replays[key];
+        this.protocolReplayBodies.delete(key);
         durableReplayChanged = true;
         this.recordEviction("protocol_replay", "ttl");
       }

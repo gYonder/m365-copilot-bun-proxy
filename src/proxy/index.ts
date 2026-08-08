@@ -66,6 +66,7 @@ const app = createProxyApp({
   graphClient,
   substrateClient,
   conversationStore,
+  durableState,
   responseStore,
   tokenProvider,
   vizTraceStore,

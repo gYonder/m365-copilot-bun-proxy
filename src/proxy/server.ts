@@ -6,6 +6,7 @@ import {
   summarizeUpstreamFailure,
 } from "./clients";
 import { ConversationStore } from "./conversation-store";
+import { DurableStateStore } from "./durable-state";
 import { DebugMarkdownLogger } from "./logger";
 import { buildModelsResponse, ConfiguredContextLimit } from "./models";
 import {
@@ -108,6 +109,7 @@ type Services = {
   graphClient: CopilotGraphClient;
   substrateClient: CopilotSubstrateClient;
   conversationStore: ConversationStore;
+  durableState?: DurableStateStore;
   responseStore: ResponseStore;
   tokenProvider: ProxyTokenProvider;
   vizTraceStore?: ProxyVizTraceStore;
@@ -143,7 +145,9 @@ export function createProxyApp(services: Services): Hono {
     await next();
   });
 
-  app.get("/healthz", (c) => c.json(buildHealthResponse(services.options)));
+  app.get("/healthz", (c) =>
+    c.json(buildHealthResponse(services.options, services.durableState ?? null)),
+  );
   app.get("/readyz", (c) =>
     c.json(
       services.observability?.readiness() ?? {
@@ -217,7 +221,10 @@ export function createProxyApp(services: Services): Hono {
   return app;
 }
 
-function buildHealthResponse(options: WrapperOptions): JsonObject {
+function buildHealthResponse(
+  options: WrapperOptions,
+  durableState: DurableStateStore | null = null,
+): JsonObject {
   return {
     status: "ok",
     openAiTransformMode: normalizeOpenAiTransformMode(
@@ -228,6 +235,11 @@ function buildHealthResponse(options: WrapperOptions): JsonObject {
     configured_context_limit: ConfiguredContextLimit,
     observed_safe_context_limit: null,
     verified_provider_context_limit: null,
+    continuation_state: {
+      quarantine_count: durableState?.quarantineStatus.count ?? 0,
+      last_quarantine_at_unix:
+        durableState?.quarantineStatus.lastOccurredAtUnix ?? null,
+    },
   };
 }
 
@@ -1206,6 +1218,21 @@ async function handleResponsesCreateOnce(
       ? null
       : responseStore.tryGetRequestReplay(requestHash);
   if (storedRequestReplay) {
+    if (storedRequestReplay.response === null) {
+      services.observability?.record("dedup_hit", {
+        kind: "protocol_replay_unavailable",
+      });
+      responseHeaders.set("x-m365-protocol-replay-unavailable", "true");
+      return buildResponsesFailureResult(
+        services,
+        parsedRequest,
+        responseHeaders,
+        storedRequestReplay.conversationId,
+        taskDeadlineMs,
+        "duplicate_tool_result_or_replay",
+        request.signal,
+      );
+    }
     services.observability?.record("dedup_hit", {
       kind: isProtocolIdentity ? "protocol_replay" : "legacy_replay",
     });
