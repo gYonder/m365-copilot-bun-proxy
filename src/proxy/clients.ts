@@ -184,6 +184,29 @@ export type SubstrateReceiverFactory = (
   ws: WebSocket,
 ) => SubstrateWebSocketReceiver;
 
+// SignalR Hub Protocol types 1/2/3/6/7 are the observed Substrate decoder
+// allowlist; keep private-protocol constants beside this decoder (PRD §15
+// rule 5). https://github.com/dotnet/aspnetcore/blob/main/src/SignalR/docs/specs/HubProtocol.md
+const SignalRInvocationType = 1;
+const SignalRStreamItemType = 2;
+const SignalRCompletionType = 3;
+const SignalRPingType = 6;
+const SignalRCloseType = 7;
+const AllowlistedSubstrateFrameTypes = new Set<number>([
+  SignalRInvocationType,
+  SignalRStreamItemType,
+  SignalRCompletionType,
+  SignalRPingType,
+  SignalRCloseType,
+]);
+const KnownSubstrateMessageTypes = new Set(["chat", "disengaged"]);
+const MaxSubstrateDriftObservations = 8;
+type SubstrateDriftReason =
+  | "unknown_frame_type"
+  | "unknown_message_type"
+  | "malformed_semantic_payload"
+  | "unrecognized_terminal_semantics";
+
 export class CopilotSubstrateClient {
   constructor(
     private readonly options: WrapperOptions,
@@ -442,6 +465,37 @@ export class CopilotSubstrateClient {
     let receiverDisposed = false;
     let resolvedConversationId = conversationId;
     const receiver = this.createReceiver(ws);
+    let providerDriftObserved = false;
+    const driftObservationKeys = new Set<string>();
+    const recordDrift = (
+      reason: SubstrateDriftReason,
+      frameType: number | null,
+      envelope: JsonObject | null,
+      target: string | null = null,
+      messageType: string | null = null,
+    ) => {
+      providerDriftObserved = true;
+      if (driftObservationKeys.size >= MaxSubstrateDriftObservations) {
+        return;
+      }
+      const observation = buildSubstrateDriftObservation(
+        reason,
+        frameType,
+        envelope,
+        target,
+        messageType,
+      );
+      const key = JSON.stringify(observation);
+      if (driftObservationKeys.has(key)) {
+        return;
+      }
+      driftObservationKeys.add(key);
+      this.observability?.record(
+        "provider_drift",
+        observation,
+        clientRequestId,
+      );
+    };
     const disposeReceiver = () => {
       if (receiverDisposed) {
         return;
@@ -712,11 +766,19 @@ export class CopilotSubstrateClient {
           }
           const json = tryParseJsonObject(frame);
           if (!json) {
+            recordDrift("malformed_semantic_payload", null, null);
             continue;
           }
           const frameType = tryGetInt(json, "type");
-          if (frameType === 6) {
+          if (frameType === SignalRPingType) {
             await sendFrame(ws, requestUri, this.logger, { type: 6 });
+            continue;
+          }
+          if (
+            frameType === null ||
+            !AllowlistedSubstrateFrameTypes.has(frameType)
+          ) {
+            recordDrift("unknown_frame_type", frameType, json);
             continue;
           }
 
@@ -745,6 +807,21 @@ export class CopilotSubstrateClient {
             activeBotMessageId = frameBotMessageId;
           } else if (!activeBotMessageId && frameBotMessageId) {
             activeBotMessageId = frameBotMessageId;
+          }
+
+          if (
+            frameType === SignalRInvocationType ||
+            frameType === SignalRStreamItemType
+          ) {
+            for (const issue of inspectSubstrateSemanticPayload(json)) {
+              recordDrift(
+                issue.reason,
+                frameType,
+                json,
+                issue.target,
+                issue.messageType,
+              );
+            }
           }
 
           const extractedConversationId = extractSubstrateConversationId(json);
@@ -845,14 +922,46 @@ export class CopilotSubstrateClient {
               `Substrate returned result '${resultValue}'.`;
           }
 
-          if (frameType === 7) {
-            responseError ??= "Substrate websocket closed with an error frame.";
-            responseErrorCode ??= "substrate_terminal_error";
+          if (frameType === SignalRCloseType) {
+            const hasUsableTerminalError =
+              Boolean(tryGetString(json, "error")?.trim()) ||
+              Boolean(
+                resultValue &&
+                  !isSubstrateResultSuccess(resultValue) &&
+                  extractSubstrateResultMessage(json)?.trim(),
+              );
+            if (!hasUsableTerminalError) {
+              recordDrift(
+                "unrecognized_terminal_semantics",
+                frameType,
+                json,
+              );
+              responseError =
+                "Substrate websocket closed with an unrecognized terminal frame.";
+              responseErrorCode = "provider_drift";
+            } else {
+              responseError ??=
+                "Substrate websocket closed with an error frame.";
+              responseErrorCode ??= "substrate_terminal_error";
+            }
             completed = true;
             break;
           }
 
-          if (frameType === 3) {
+          if (frameType === SignalRCompletionType) {
+            if (
+              hasSubstrateResultValue(json) &&
+              (!resultValue || !isSubstrateResultSuccess(resultValue))
+            ) {
+              recordDrift(
+                "unrecognized_terminal_semantics",
+                frameType,
+                json,
+              );
+              responseError =
+                "Substrate completion returned an unrecognized result.";
+              responseErrorCode = "provider_drift";
+            }
             if (!responseError) {
               receivedSuccessfulTerminal = true;
             }
@@ -884,17 +993,21 @@ export class CopilotSubstrateClient {
           `Substrate chat failed. ${responseError}`,
           invocationPayload,
           buildSubstrateTranscriptPayload(transcript),
-          responseErrorCode,
+          providerDriftObserved ? "provider_drift" : responseErrorCode,
         );
       }
 
       if (!receivedSuccessfulTerminal) {
         return buildFailure(
           502,
-          "Substrate chat ended without a successful terminal frame.",
+          providerDriftObserved
+            ? "Substrate chat ended after provider protocol drift."
+            : "Substrate chat ended without a successful terminal frame.",
           invocationPayload,
           buildSubstrateTranscriptPayload(transcript),
-          "substrate_incomplete_terminal",
+          providerDriftObserved
+            ? "provider_drift"
+            : "substrate_incomplete_terminal",
         );
       }
 
@@ -906,6 +1019,9 @@ export class CopilotSubstrateClient {
         return buildFailure(
           502,
           "Substrate chat returned no assistant content.",
+          invocationPayload,
+          buildSubstrateTranscriptPayload(transcript),
+          providerDriftObserved ? "provider_drift" : null,
         );
       }
 
@@ -972,6 +1088,162 @@ function resolveConversationPath(
     "{conversationId}",
     encodeURIComponent(conversationId),
   );
+}
+
+type SubstrateSemanticIssue = {
+  reason: SubstrateDriftReason;
+  target: string | null;
+  messageType: string | null;
+};
+
+function inspectSubstrateSemanticPayload(
+  envelope: JsonObject,
+): SubstrateSemanticIssue[] {
+  const issues: SubstrateSemanticIssue[] = [];
+  const addIssue = (
+    reason: SubstrateDriftReason,
+    target: string | null = null,
+    messageType: string | null = null,
+  ) => {
+    issues.push({ reason, target, messageType });
+  };
+  const target = envelope.target;
+  if (target !== undefined && typeof target !== "string") {
+    addIssue("malformed_semantic_payload");
+  } else if (
+    typeof target === "string" &&
+    target.trim() &&
+    target.trim().toLowerCase() !== "update"
+  ) {
+    addIssue("unknown_message_type", target.trim());
+  }
+
+  const inspectMessageArray = (value: JsonValue | undefined) => {
+    if (value === undefined) {
+      return;
+    }
+    if (!Array.isArray(value)) {
+      addIssue("malformed_semantic_payload");
+      return;
+    }
+    for (const message of value) {
+      if (!isJsonObject(message)) {
+        addIssue("malformed_semantic_payload");
+        continue;
+      }
+      const messageType = message.messageType;
+      if (messageType !== undefined && typeof messageType !== "string") {
+        addIssue("malformed_semantic_payload");
+      } else if (
+        typeof messageType === "string" &&
+        messageType.trim() &&
+        !KnownSubstrateMessageTypes.has(messageType.trim().toLowerCase())
+      ) {
+        addIssue("unknown_message_type", null, messageType.trim());
+      }
+      for (const textKey of ["text", "hiddenText", "spokenText"]) {
+        if (
+          Object.prototype.hasOwnProperty.call(message, textKey) &&
+          typeof message[textKey] !== "string"
+        ) {
+          addIssue("malformed_semantic_payload");
+        }
+      }
+    }
+  };
+  const inspectContainer = (container: JsonObject) => {
+    inspectMessageArray(container.messages);
+    if (
+      Object.prototype.hasOwnProperty.call(container, "writeAtCursor") &&
+      typeof container.writeAtCursor !== "string"
+    ) {
+      addIssue("malformed_semantic_payload");
+    }
+    if (container.item !== undefined) {
+      if (!isJsonObject(container.item)) {
+        addIssue("malformed_semantic_payload");
+      } else {
+        inspectMessageArray(container.item.messages);
+      }
+    }
+  };
+
+  inspectContainer(envelope);
+  if (envelope.arguments !== undefined) {
+    if (!Array.isArray(envelope.arguments)) {
+      addIssue("malformed_semantic_payload");
+    } else {
+      for (const argument of envelope.arguments) {
+        if (!isJsonObject(argument)) {
+          addIssue("malformed_semantic_payload");
+          continue;
+        }
+        inspectContainer(argument);
+      }
+    }
+  }
+  return issues;
+}
+
+function buildSubstrateDriftObservation(
+  reason: SubstrateDriftReason,
+  frameType: number | null,
+  envelope: JsonObject | null,
+  target: string | null,
+  messageType: string | null,
+): JsonObject {
+  const observation: JsonObject = {
+    reason,
+    frameType,
+    shape: describeSubstrateFrameShape(envelope),
+  };
+  const safeTarget = sanitizeSubstrateDiagnosticLabel(target);
+  const safeMessageType = sanitizeSubstrateDiagnosticLabel(messageType);
+  if (safeTarget) {
+    observation.target = safeTarget;
+  }
+  if (safeMessageType) {
+    observation.messageType = safeMessageType;
+  }
+  return observation;
+}
+
+function describeSubstrateFrameShape(envelope: JsonObject | null): string {
+  if (!envelope) {
+    return "unparseable";
+  }
+  const keys = Object.keys(envelope)
+    .sort()
+    .map((key) => key.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 24))
+    .filter(Boolean);
+  if (keys.length === 0) {
+    return "empty";
+  }
+  const shown = keys.slice(0, 8);
+  return keys.length > shown.length
+    ? `${shown.join(",")}+${keys.length - shown.length}`
+    : shown.join(",");
+}
+
+function sanitizeSubstrateDiagnosticLabel(value: string | null): string | null {
+  if (!value) {
+    return null;
+  }
+  const normalized = value.trim();
+  if (!normalized) {
+    return null;
+  }
+  if (
+    /(?:prompt|assistant|token|secret|bearer|cookie|account|tenant)/i.test(
+      normalized,
+    )
+  ) {
+    return "[redacted-label]";
+  }
+  if (!/^[A-Za-z][A-Za-z0-9_.:-]{0,31}$/.test(normalized)) {
+    return "present";
+  }
+  return normalized;
 }
 
 function buildFailure(
@@ -1969,6 +2241,16 @@ function extractSubstrateResultValue(envelope: JsonObject): string | null {
     return tryGetString(envelope.result, "value");
   }
   return null;
+}
+
+function hasSubstrateResultValue(envelope: JsonObject): boolean {
+  if (Object.prototype.hasOwnProperty.call(envelope, "result")) {
+    return true;
+  }
+  return (
+    isJsonObject(envelope.item) &&
+    Object.prototype.hasOwnProperty.call(envelope.item, "result")
+  );
 }
 
 function isSubstrateResultSuccess(resultValue: string): boolean {

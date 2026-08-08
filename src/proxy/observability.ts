@@ -11,7 +11,8 @@ export type BridgeEventName =
   | "store_eviction"
   | "truncation"
   | "image_quota"
-  | "cancellation";
+  | "cancellation"
+  | "provider_drift";
 
 export type BridgeEvent = {
   sequence: number;

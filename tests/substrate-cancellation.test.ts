@@ -11,9 +11,11 @@ import {
   OpenAiTransformModes,
   ToolChoiceModes,
   TransportNames,
+  type JsonObject,
   type ParsedOpenAiRequest,
   type WrapperOptions,
 } from "../src/proxy/types";
+import { BridgeObservability } from "../src/proxy/observability";
 
 type FakeWebSocket = Parameters<SubstrateReceiverFactory>[0];
 
@@ -369,26 +371,12 @@ describe("Substrate client cancellation via AbortSignal", () => {
 describe("Substrate client lifecycle hardening", () => {
   test("echoes SignalR type-6 pings during a turn", async () => {
     const sentFrames: string[] = [];
+    const observability = new BridgeObservability();
     const { connect, createReceiver } = makeFrameTransport(
       [
         "{}",
         `${JSON.stringify({ type: 6 })}\u001e`,
-        `${JSON.stringify({
-          type: 1,
-          target: "update",
-          arguments: [
-            {
-              messages: [
-                {
-                  author: "bot",
-                  messageType: "Chat",
-                  messageId: "message-1",
-                  text: "done",
-                },
-              ],
-            },
-          ],
-        })}\u001e`,
+        makeStreamItemFrame("done"),
         `${JSON.stringify({ type: 3, invocationId: "0" })}\u001e`,
       ],
       sentFrames,
@@ -399,6 +387,8 @@ describe("Substrate client lifecycle hardening", () => {
       undefined,
       connect,
       createReceiver,
+      undefined,
+      observability,
     );
 
     const result = await client.chat(
@@ -412,6 +402,200 @@ describe("Substrate client lifecycle hardening", () => {
     expect(
       sentFrames.filter((frame) => frame.includes('"type":6')).length,
     ).toBe(2);
+    expect(getProviderDriftEvents(observability)).toHaveLength(0);
+  });
+
+  test("records drift for an unknown frame but still completes a valid turn", async () => {
+    const token = "synthetic-secret-token";
+    const prompt = "private prompt text";
+    const unknownFrame =
+      JSON.stringify({
+        type: 42,
+        prompt,
+        token,
+        nested: { prompt, token },
+      }) + "\u001e";
+    const observability = new BridgeObservability();
+    const client = makeObservedClient(
+      [
+        "{}",
+        unknownFrame,
+        makeChatUpdateFrame("done"),
+        makeCompletionFrame(),
+      ],
+      observability,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-unknown-frame",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeTrue();
+    const driftEvents = getProviderDriftEvents(observability);
+    expect(driftEvents).toHaveLength(1);
+    expect(JSON.stringify(driftEvents)).not.toContain(token);
+    expect(JSON.stringify(driftEvents)).not.toContain(prompt);
+    expect(JSON.stringify(driftEvents[0])).toContain("unknown_frame_type");
+  });
+
+  test("maps an unknown frame followed by socket closure to provider drift", async () => {
+    const observability = new BridgeObservability();
+    const client = makeObservedClient(
+      [
+        "{}",
+        JSON.stringify({ type: 42 }) + "\u001e",
+        makeChatUpdateFrame("partial"),
+      ],
+      observability,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-unknown-incomplete",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.errorCode).toBe("provider_drift");
+    expect(result.errorCode).not.toBe("substrate_incomplete_terminal");
+  });
+
+  test("records malformed semantic payload drift without aborting a valid turn", async () => {
+    const observability = new BridgeObservability();
+    const client = makeObservedClient(
+      [
+        "{}",
+        "{not-json}\u001e",
+        JSON.stringify({
+          type: 1,
+          target: "update",
+          arguments: "not-an-array",
+        }) + "\u001e",
+        makeChatUpdateFrame("done"),
+        makeCompletionFrame(),
+      ],
+      observability,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-malformed-semantic",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeTrue();
+    expect(getProviderDriftEvents(observability).map((event) =>
+      JSON.stringify(event),
+    ).join("")).toContain("malformed_semantic_payload");
+  });
+
+  test("records unknown semantic message types", async () => {
+    const observability = new BridgeObservability();
+    const client = makeObservedClient(
+      [
+        "{}",
+        JSON.stringify({
+          type: 1,
+          target: "update",
+          arguments: [{
+            messages: [{
+              author: "bot",
+              messageType: "FutureMessageType",
+              text: "ignored",
+            }],
+          }],
+        }) + "\u001e",
+        makeChatUpdateFrame("done"),
+        makeCompletionFrame(),
+      ],
+      observability,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-unknown-message-type",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeTrue();
+    const driftEvents = getProviderDriftEvents(observability);
+    expect(driftEvents).toHaveLength(1);
+    expect(JSON.stringify(driftEvents[0])).toContain("FutureMessageType");
+  });
+
+  test("maps a type-7 close without usable error information to provider drift", async () => {
+    const observability = new BridgeObservability();
+    const client = makeObservedClient(
+      ["{}", makeChatUpdateFrame("partial"), makeCloseFrame()],
+      observability,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-close-without-error",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.errorCode).toBe("provider_drift");
+    expect(JSON.stringify(getProviderDriftEvents(observability))).toContain(
+      "unrecognized_terminal_semantics",
+    );
+  });
+
+  test("maps an unrecognized type-3 result to provider drift", async () => {
+    const observability = new BridgeObservability();
+    const client = makeObservedClient(
+      [
+        "{}",
+        makeChatUpdateFrame("partial"),
+        JSON.stringify({
+          type: 3,
+          result: { value: "future-terminal-state" },
+        }) + "\u001e",
+      ],
+      observability,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-unrecognized-completion",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.errorCode).toBe("provider_drift");
+    expect(JSON.stringify(getProviderDriftEvents(observability))).toContain(
+      "unrecognized_terminal_semantics",
+    );
+  });
+
+  test("bounds distinct drift observations per turn", async () => {
+    const observability = new BridgeObservability();
+    const unknownFrames = Array.from({ length: 20 }, (_, index) =>
+      JSON.stringify({ type: 100 + index, shapeOnly: `frame-${index}` }) +
+      "\u001e",
+    );
+    const client = makeObservedClient(["{}", ...unknownFrames], observability);
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-drift-bound",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeFalse();
+    expect(result.errorCode).toBe("provider_drift");
+    expect(getProviderDriftEvents(observability)).toHaveLength(8);
   });
 
   test("returns a typed failure for Disengaged messages", async () => {
@@ -530,6 +714,7 @@ describe("Substrate client lifecycle hardening", () => {
   });
 
   test("rejects socket closure without a successful terminal frame", async () => {
+    const observability = new BridgeObservability();
     const { connect, createReceiver } = makeFrameTransport([
       "{}",
       JSON.stringify({
@@ -551,6 +736,8 @@ describe("Substrate client lifecycle hardening", () => {
       undefined,
       connect,
       createReceiver,
+      undefined,
+      observability,
     );
 
     const result = await client.chat(
@@ -562,6 +749,7 @@ describe("Substrate client lifecycle hardening", () => {
 
     expect(result.isSuccess).toBeFalse();
     expect(result.errorCode).toBe("substrate_incomplete_terminal");
+    expect(getProviderDriftEvents(observability)).toHaveLength(0);
   });
 
   test("honors an already-expired task-level deadline", async () => {
@@ -744,6 +932,79 @@ function makeFrameTransport(
       dispose: () => {},
     }),
   };
+}
+
+function makeObservedClient(
+  frames: string[],
+  observability: BridgeObservability,
+): CopilotSubstrateClient {
+  const { connect, createReceiver } = makeFrameTransport(frames);
+  return new CopilotSubstrateClient(
+    createOptions(),
+    stubLogger,
+    undefined,
+    connect,
+    createReceiver,
+    undefined,
+    observability,
+  );
+}
+
+function getProviderDriftEvents(
+  observability: BridgeObservability,
+): JsonObject[] {
+  const recentEvents = observability.readiness().recentEvents;
+  if (!Array.isArray(recentEvents)) {
+    return [];
+  }
+  return recentEvents.filter(
+    (event) =>
+      typeof event === "object" &&
+      event !== null &&
+      (event as JsonObject).name === "provider_drift",
+  ) as JsonObject[];
+}
+
+function makeChatUpdateFrame(text: string): string {
+  return (
+    JSON.stringify({
+      type: 1,
+      target: "update",
+      arguments: [{
+        messages: [{
+          author: "bot",
+          messageType: "Chat",
+          messageId: "message-test",
+          text,
+        }],
+      }],
+    }) + "\u001e"
+  );
+}
+
+function makeStreamItemFrame(text: string): string {
+  return (
+    JSON.stringify({
+      type: 2,
+      invocationId: "0",
+      item: {
+        messages: [{
+          author: "bot",
+          messageType: "Chat",
+          messageId: "message-stream-item",
+          text,
+        }],
+      },
+    }) + "\u001e"
+  );
+}
+
+function makeCompletionFrame(): string {
+  return JSON.stringify({ type: 3, invocationId: "0" }) + "\u001e";
+}
+
+function makeCloseFrame(): string {
+  return JSON.stringify({ type: 7 }) + "\u001e";
 }
 
 function createOptions(): WrapperOptions {
