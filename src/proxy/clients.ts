@@ -1410,7 +1410,12 @@ export function buildInvocationPayload(
     plugins: [{ Id: "BingWebSearch", Source: "BuiltIn" }],
     isSbsSupported: true,
     renderReferencesBehindEOS: true,
-    disconnectBehavior: "stop",
+    // Verified against the live substrate: `disconnectBehavior: "stop"` is
+    // rejected and fails every invocation with a server-side Chat error, so
+    // "continue" is the only accepted value. Cancellation therefore relies on
+    // the CancelInvocation frame plus a hard socket close rather than on this
+    // field. Do not change this without a live substrate turn to prove it.
+    disconnectBehavior: "continue",
   };
 
   if (capabilities.optionsSets.length > 0) {

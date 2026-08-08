@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deriveRequestProfile } from "../src/proxy/substrate-profiles";
+import { deriveRequestProfile, isSupportedTaskScope } from "../src/proxy/substrate-profiles";
 import {
   OpenAiTransformModes,
   TransportNames,
@@ -197,3 +197,17 @@ function createOptions(): WrapperOptions {
     retrySimulatedToollessResponses: true,
   };
 }
+
+describe("task scope aliases", () => {
+  test("accepts the canonical scope and its natural short spelling", () => {
+    expect(isSupportedTaskScope("coding_project")).toBe(true);
+    expect(isSupportedTaskScope("coding")).toBe(true);
+    expect(isSupportedTaskScope("Coding")).toBe(true);
+    expect(isSupportedTaskScope("")).toBe(true);
+  });
+
+  test("still rejects scopes this coding-only provider cannot serve", () => {
+    expect(isSupportedTaskScope("chat")).toBe(false);
+    expect(isSupportedTaskScope("research")).toBe(false);
+  });
+});

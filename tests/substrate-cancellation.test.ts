@@ -155,7 +155,7 @@ function makeFakeTransport(
 }
 
 describe("Substrate client cancellation via AbortSignal", () => {
-  test("uses disconnectBehavior stop in the stream invocation payload", () => {
+  test("keeps the only disconnectBehavior the substrate accepts", () => {
     const payload = buildInvocationPayload(
       makeRequest(),
       "conv-payload",
@@ -168,8 +168,9 @@ describe("Substrate client cancellation via AbortSignal", () => {
       disconnectBehavior?: string;
     };
 
-    expect(argument.disconnectBehavior).toBe("stop");
-    expect(JSON.stringify(payload)).not.toContain("continue");
+    // "stop" is rejected by the live substrate and fails the whole invocation,
+    // so cancellation must not depend on this field.
+    expect(argument.disconnectBehavior).toBe("continue");
   });
 
   test("closes the socket and returns a cancelled result when the client disconnects mid-turn", async () => {

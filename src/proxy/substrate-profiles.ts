@@ -8,6 +8,8 @@ import type {
 } from "./types";
 import { isJsonObject, tryGetString } from "./utils";
 
+const CODING_TASK_SCOPE_ALIASES = new Set(["coding", "coding_project", "code", "coding-project"]);
+
 export type RequestProfile = {
   profileId: string;
   compatibilityKey: string;
@@ -146,7 +148,12 @@ export function isSupportedTaskScope(taskScope: string): boolean {
 
 function normalizeTaskScope(taskScope: string | null | undefined): string {
   const normalized = normalizeValue(taskScope);
-  return normalized || "coding_project";
+  if (!normalized) {
+    return "coding_project";
+  }
+  // `coding` is the natural short spelling of the only supported scope, so it
+  // must not be read as a different, unsupported one.
+  return CODING_TASK_SCOPE_ALIASES.has(normalized) ? "coding_project" : normalized;
 }
 
 function normalizeValue(value: string | null | undefined): string {

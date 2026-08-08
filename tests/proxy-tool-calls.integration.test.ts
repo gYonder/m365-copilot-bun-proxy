@@ -4,6 +4,23 @@ import { readSseEvents, tryParseJsonObject } from "../src/proxy/utils";
 const proxyBaseUrl = Bun.env.PROXY_BASE_URL ?? "http://localhost:4000";
 const testModel = Bun.env.PROXY_TEST_MODEL ?? "m365-copilot";
 const testTransport = Bun.env.PROXY_TEST_TRANSPORT ?? "substrate";
+const gatewayToken = readGatewayToken();
+
+function readGatewayToken(): string {
+  const configured = Bun.env.PROXY_GATEWAY_TOKEN?.trim();
+  if (configured) {
+    return configured;
+  }
+  const home = Bun.env.CODEX_HOME?.trim();
+  if (!home) {
+    return "";
+  }
+  try {
+    return require("node:fs").readFileSync(`${home}/gateway-token`, "utf8").trim();
+  } catch {
+    return "";
+  }
+}
 
 const toolDefinition = [
   {
@@ -373,6 +390,10 @@ async function postJson(
     "content-type": "application/json",
     "x-m365-transport": testTransport,
   });
+  // The running proxy may require the launcher gateway token on this surface.
+  if (gatewayToken) {
+    headers.set("x-runtime-token", gatewayToken);
+  }
   if (options?.conversationId?.trim()) {
     headers.set("x-m365-conversation-id", options.conversationId.trim());
   }
