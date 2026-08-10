@@ -14,7 +14,8 @@ export type BridgeEventName =
   | "cancellation"
   | "tool_ledger_recovery"
   | "provider_drift"
-  | "attempted_tool_call_in_unguarded_stream";
+  | "attempted_tool_call_in_unguarded_stream"
+  | "tool_call_recovery_exhausted";
 
 export type BridgeEvent = {
   sequence: number;

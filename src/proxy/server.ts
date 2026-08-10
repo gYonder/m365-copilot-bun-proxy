@@ -655,12 +655,13 @@ async function handleChat(
   const executeChatTurn = async (
     turnConversationId: string = conversationId!,
     turnIsStartOfSession: boolean = createdConversation,
+    turnRequest: ParsedOpenAiRequest = parsedRequest,
   ): Promise<ChatResult> => {
     if (selectedTransport === TransportNames.Substrate) {
       const result = await substrateClient.chat(
         authorizationHeader,
         turnConversationId,
-        parsedRequest,
+        turnRequest,
         turnIsStartOfSession,
         async (update) => {
           traceSubstrateStreamUpdate(services, trace, update);
@@ -711,7 +712,19 @@ async function handleChat(
         options.includeConversationIdInResponseBody,
       )
     ) {
-      result = await executeChatTurn();
+      services.observability?.record("retry", {
+        reason: "simulated_protocol_correction",
+        retryCount: 1,
+      });
+      const retryConversationId =
+        services.substrateClient.createConversation().conversationId;
+      if (retryConversationId) {
+        result = await executeChatTurn(
+          retryConversationId,
+          true,
+          buildSimulatedProtocolRetryRequest(parsedRequest, 1),
+        );
+      }
     }
     return result;
   };
@@ -815,19 +828,17 @@ async function handleChat(
         parsedRequest,
         assistantText,
       );
-      const strictToolError = await tryWriteStrictToolOutputError(
-        services,
-        assistantResponse,
-      );
-      if (strictToolError) {
-        return strictToolError;
-      }
       if (
         parsedRequest.tooling.tools.length > 0 &&
         assistantResponse.toolCalls.length === 0
       ) {
         const classification = classifyToolAttempt(assistantText, parsedRequest.tooling);
         if (classification.kind === "invalid_attempt") {
+          services.observability?.record("tool_call_recovery_exhausted", {
+            reason: classification.reason,
+            toolChoiceMode: parsedRequest.tooling.toolChoiceMode,
+            preview: assistantText.slice(0, 200),
+          });
           return writeOpenAiError(
             services,
             502,
@@ -836,6 +847,13 @@ async function handleChat(
             "invalid_simulated_payload",
           );
         }
+      }
+      const strictToolError = await tryWriteStrictToolOutputError(
+        services,
+        assistantResponse,
+      );
+      if (strictToolError) {
+        return strictToolError;
       }
       return buildAssistantStreamResponse(
         services,
@@ -973,19 +991,17 @@ async function handleChat(
     parsedRequest,
     assistantText,
   );
-  const strictToolError = await tryWriteStrictToolOutputError(
-    services,
-    assistantResponse,
-  );
-  if (strictToolError) {
-    return strictToolError;
-  }
   if (
     parsedRequest.tooling.tools.length > 0 &&
     assistantResponse.toolCalls.length === 0
   ) {
     const classification = classifyToolAttempt(assistantText, parsedRequest.tooling);
     if (classification.kind === "invalid_attempt") {
+      services.observability?.record("tool_call_recovery_exhausted", {
+        reason: classification.reason,
+        toolChoiceMode: parsedRequest.tooling.toolChoiceMode,
+        preview: assistantText.slice(0, 200),
+      });
       return writeOpenAiError(
         services,
         502,
@@ -994,6 +1010,13 @@ async function handleChat(
         "invalid_simulated_payload",
       );
     }
+  }
+  const strictToolError = await tryWriteStrictToolOutputError(
+    services,
+    assistantResponse,
+  );
+  if (strictToolError) {
+    return strictToolError;
   }
   const body = JSON.stringify(
     buildChatCompletion(
@@ -1576,19 +1599,17 @@ async function handleResponsesCreateOnce(
       }
 
       const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
-      const strictToolError = await tryWriteStrictToolOutputError(
-        services,
-        assistantResponse,
-      );
-      if (strictToolError) {
-        return strictToolError;
-      }
       if (
         baseRequest.tooling.tools.length > 0 &&
         assistantResponse.toolCalls.length === 0
       ) {
         const classification = classifyToolAttempt(assistantText, baseRequest.tooling);
         if (classification.kind === "invalid_attempt") {
+          services.observability?.record("tool_call_recovery_exhausted", {
+            reason: classification.reason,
+            toolChoiceMode: baseRequest.tooling.toolChoiceMode,
+            preview: assistantText.slice(0, 200),
+          });
           return writeOpenAiError(
             services,
             502,
@@ -1597,6 +1618,13 @@ async function handleResponsesCreateOnce(
             "invalid_simulated_payload",
           );
         }
+      }
+      const strictToolError = await tryWriteStrictToolOutputError(
+        services,
+        assistantResponse,
+      );
+      if (strictToolError) {
+        return strictToolError;
       }
       const responseId = createOpenAiResponseId();
       const toolLedgerFailure = issueResponsesToolCalls(
@@ -1824,19 +1852,17 @@ async function handleResponsesCreateOnce(
   }
 
   const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
-  const strictToolError = await tryWriteStrictToolOutputError(
-    services,
-    assistantResponse,
-  );
-  if (strictToolError) {
-    return strictToolError;
-  }
   if (
     baseRequest.tooling.tools.length > 0 &&
     assistantResponse.toolCalls.length === 0
   ) {
     const classification = classifyToolAttempt(assistantText, baseRequest.tooling);
     if (classification.kind === "invalid_attempt") {
+      services.observability?.record("tool_call_recovery_exhausted", {
+        reason: classification.reason,
+        toolChoiceMode: baseRequest.tooling.toolChoiceMode,
+        preview: assistantText.slice(0, 200),
+      });
       return writeOpenAiError(
         services,
         502,
@@ -1845,6 +1871,13 @@ async function handleResponsesCreateOnce(
         "invalid_simulated_payload",
       );
     }
+  }
+  const strictToolError = await tryWriteStrictToolOutputError(
+    services,
+    assistantResponse,
+  );
+  if (strictToolError) {
+    return strictToolError;
   }
   const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
