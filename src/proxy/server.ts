@@ -14,6 +14,7 @@ import {
   buildChatCompletion,
   buildChatCompletionChunk,
   buildToolCallsDelta,
+  classifyToolAttempt,
   computeTrailingDelta,
   extractCopilotAssistantText,
   extractCopilotAssistantTextFromStreamData,
@@ -821,6 +822,21 @@ async function handleChat(
       if (strictToolError) {
         return strictToolError;
       }
+      if (
+        parsedRequest.tooling.tools.length > 0 &&
+        assistantResponse.toolCalls.length === 0
+      ) {
+        const classification = classifyToolAttempt(assistantText, parsedRequest.tooling);
+        if (classification.kind === "invalid_attempt") {
+          return writeOpenAiError(
+            services,
+            502,
+            "Simulated mode response contained a malformed tool call that could not be recovered after retry.",
+            "api_error",
+            "invalid_simulated_payload",
+          );
+        }
+      }
       return buildAssistantStreamResponse(
         services,
         parsedRequest.model,
@@ -963,6 +979,21 @@ async function handleChat(
   );
   if (strictToolError) {
     return strictToolError;
+  }
+  if (
+    parsedRequest.tooling.tools.length > 0 &&
+    assistantResponse.toolCalls.length === 0
+  ) {
+    const classification = classifyToolAttempt(assistantText, parsedRequest.tooling);
+    if (classification.kind === "invalid_attempt") {
+      return writeOpenAiError(
+        services,
+        502,
+        "Simulated mode response contained a malformed tool call that could not be recovered after retry.",
+        "api_error",
+        "invalid_simulated_payload",
+      );
+    }
   }
   const body = JSON.stringify(
     buildChatCompletion(
@@ -1552,6 +1583,21 @@ async function handleResponsesCreateOnce(
       if (strictToolError) {
         return strictToolError;
       }
+      if (
+        baseRequest.tooling.tools.length > 0 &&
+        assistantResponse.toolCalls.length === 0
+      ) {
+        const classification = classifyToolAttempt(assistantText, baseRequest.tooling);
+        if (classification.kind === "invalid_attempt") {
+          return writeOpenAiError(
+            services,
+            502,
+            "Simulated mode response contained a malformed tool call that could not be recovered after retry.",
+            "api_error",
+            "invalid_simulated_payload",
+          );
+        }
+      }
       const responseId = createOpenAiResponseId();
       const toolLedgerFailure = issueResponsesToolCalls(
         services.responseStore,
@@ -1784,6 +1830,21 @@ async function handleResponsesCreateOnce(
   );
   if (strictToolError) {
     return strictToolError;
+  }
+  if (
+    baseRequest.tooling.tools.length > 0 &&
+    assistantResponse.toolCalls.length === 0
+  ) {
+    const classification = classifyToolAttempt(assistantText, baseRequest.tooling);
+    if (classification.kind === "invalid_attempt") {
+      return writeOpenAiError(
+        services,
+        502,
+        "Simulated mode response contained a malformed tool call that could not be recovered after retry.",
+        "api_error",
+        "invalid_simulated_payload",
+      );
+    }
   }
   const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
@@ -2657,7 +2718,20 @@ function isInvalidSimulatedChatResult(
     assistantText,
     "chat.completions",
   );
-  if (!extracted) return false;
+  if (!extracted) {
+    // Bare tool-call envelopes (e.g. {"type":"function_call",...}) score 0 as
+    // simulated payloads. If the text contains a shaped tool-call attempt that
+    // was rejected, treat it as a recoverable protocol failure so the bounded
+    // retry engages — otherwise raw response JSON reaches Codex as prose and
+    // terminates the tool loop.
+    if (request.tooling.tools.length > 0) {
+      const classification = classifyToolAttempt(assistantText, request.tooling);
+      if (classification.kind === "invalid_attempt") {
+        return true;
+      }
+    }
+    return false;
+  }
   const normalized = normalizeSimulatedChatCompletionPayload(
     extracted,
     request.model,
@@ -3224,7 +3298,20 @@ function isInvalidSimulatedResponsesResult(
     assistantText,
     "responses",
   );
-  if (!extracted) return false;
+  if (!extracted) {
+    // Bare tool-call envelopes (e.g. {"type":"function_call",...}) score 0 as
+    // simulated payloads. If the text contains a shaped tool-call attempt that
+    // was rejected, treat it as a recoverable protocol failure so the bounded
+    // retry engages — otherwise raw response JSON reaches Codex as prose and
+    // terminates the tool loop.
+    if (request.base.tooling.tools.length > 0) {
+      const classification = classifyToolAttempt(assistantText, request.base.tooling);
+      if (classification.kind === "invalid_attempt") {
+        return true;
+      }
+    }
+    return false;
+  }
   const normalized = normalizeSimulatedResponsesPayload(
     extracted,
     request,
@@ -4457,6 +4544,18 @@ async function transformGraphStreamToResponses(
           );
         }
       } finally {
+        // Defense-in-depth: tool-bearing traffic should be routed to the buffered
+        // path by requiresBufferedAssistantResponse. If a tool-call envelope
+        // appears here, record it for observability — do not suppress or transform.
+        if (
+          emittedContent.includes('"type":"function_call"') ||
+          emittedContent.includes('"custom_tool_call"')
+        ) {
+          services.observability?.record("attempted_tool_call_in_unguarded_stream", {
+            transport: "graph",
+            endpoint: "responses",
+          });
+        }
         if (writer.terminalState?.kind !== "cancelled") {
           enqueueSseDoneEvent(controller, encoder);
         }
@@ -4715,6 +4814,18 @@ async function streamSubstrateAsResponses(
           );
         }
       } finally {
+        // Defense-in-depth: tool-bearing traffic should be routed to the buffered
+        // path by requiresBufferedAssistantResponse. If a tool-call envelope
+        // appears here, record it for observability — do not suppress or transform.
+        if (
+          emittedUserFacingText.includes('"type":"function_call"') ||
+          emittedUserFacingText.includes('"custom_tool_call"')
+        ) {
+          services.observability?.record("attempted_tool_call_in_unguarded_stream", {
+            transport: "substrate",
+            endpoint: "responses",
+          });
+        }
         if (writer.terminalState?.kind !== "cancelled") {
           enqueueSseDoneEvent(controller, encoder);
         }
@@ -5198,6 +5309,18 @@ async function transformGraphStreamToOpenAi(
         200,
       );
       traceComplete(services, trace, 200);
+      // Defense-in-depth: tool-bearing traffic should be routed to the buffered
+      // path by requiresBufferedAssistantResponse. If a tool-call envelope
+      // appears here, record it for observability — do not suppress or transform.
+      if (
+        emittedContent.includes('"type":"function_call"') ||
+        emittedContent.includes('"custom_tool_call"')
+      ) {
+        services.observability?.record("attempted_tool_call_in_unguarded_stream", {
+          transport: "graph",
+          endpoint: "chat",
+        });
+      }
       controller.close();
     },
   });
@@ -5865,6 +5988,18 @@ async function streamSubstrateAsOpenAi(
         200,
       );
       traceComplete(services, trace, 200);
+      // Defense-in-depth: tool-bearing traffic should be routed to the buffered
+      // path by requiresBufferedAssistantResponse. If a tool-call envelope
+      // appears here, record it for observability — do not suppress or transform.
+      if (
+        emitted.includes('"type":"function_call"') ||
+        emitted.includes('"custom_tool_call"')
+      ) {
+        services.observability?.record("attempted_tool_call_in_unguarded_stream", {
+          transport: "substrate",
+          endpoint: "chat",
+        });
+      }
       controller.close();
     },
   });

@@ -13,7 +13,8 @@ export type BridgeEventName =
   | "image_quota"
   | "cancellation"
   | "tool_ledger_recovery"
-  | "provider_drift";
+  | "provider_drift"
+  | "attempted_tool_call_in_unguarded_stream";
 
 export type BridgeEvent = {
   sequence: number;

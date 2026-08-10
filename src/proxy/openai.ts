@@ -541,6 +541,72 @@ function tryExtractToolCalls(
   return [];
 }
 
+export type ToolAttemptClassification =
+  | { kind: "valid"; calls: OpenAiAssistantToolCall[] }
+  | { kind: "invalid_attempt"; reason: string }
+  | { kind: "none" };
+
+export function classifyToolAttempt(
+  assistantText: string,
+  tooling: OpenAiTooling,
+): ToolAttemptClassification {
+  const calls = tryExtractToolCalls(assistantText, tooling);
+  if (calls.length > 0) {
+    return { kind: "valid", calls };
+  }
+  // When no tools were offered there is nothing to validate against — a
+  // tool-call-shaped envelope is just incidental JSON, not a rejected attempt.
+  if (tooling.tools.length === 0) {
+    return { kind: "none" };
+  }
+  for (const candidate of enumerateJsonCandidates(assistantText)) {
+    const node = tryParseJsonNode(candidate);
+    if (node === null) {
+      continue;
+    }
+    if (looksLikeToolCallAttempt(node)) {
+      return { kind: "invalid_attempt", reason: "tool_call_attempt_rejected" };
+    }
+  }
+  return { kind: "none" };
+}
+
+function looksLikeToolCallAttempt(node: JsonValue): boolean {
+  if (!isJsonObject(node)) {
+    return false;
+  }
+  const type = (pickString(node.type) ?? "").toLowerCase();
+  const name = pickString(node.name, node.tool_name, node.recipient_name);
+  const hasArguments =
+    node.arguments !== undefined ||
+    node.args !== undefined ||
+    node.input !== undefined ||
+    node.parameters !== undefined ||
+    node.input_json !== undefined;
+
+  // Responses-API style: {"type":"function_call","name":"..."} or
+  // {"type":"custom_tool_call","name":"...","input":...}
+  if (
+    (type === "function_call" || type === "custom_tool_call") &&
+    name !== null
+  ) {
+    return true;
+  }
+
+  // Chat-completion style: {"name":"...","arguments":"..."} or aliases
+  if (name !== null && hasArguments) {
+    return true;
+  }
+
+  // Nested function object: {"function":{"name":"...","arguments":"..."}}
+  const functionNode = isJsonObject(node.function) ? node.function : null;
+  if (functionNode !== null && pickString(functionNode.name) !== null) {
+    return true;
+  }
+
+  return false;
+}
+
 function extractToolCallsFromNode(node: JsonValue, tooling: OpenAiTooling): OpenAiAssistantToolCall[] {
   if (Array.isArray(node)) {
     return extractToolCallsFromArray(node, tooling);
@@ -672,22 +738,37 @@ function tryBuildToolCall(
     return null;
   }
 
+  // De-qualify legacy "functions." namespace prefix (e.g. "functions.exec" → "exec")
+  // and re-check against offered tools. Deterministic normalization, not fuzzy
+  // matching — only accepts the stripped name if it exactly matches an offered tool.
+  let resolvedName = name;
+  if (
+    tooling.tools.length > 0 &&
+    !tooling.tools.some((tool) => tool.name === resolvedName) &&
+    resolvedName.startsWith("functions.")
+  ) {
+    const stripped = resolvedName.slice("functions.".length);
+    if (tooling.tools.some((tool) => tool.name === stripped)) {
+      resolvedName = stripped;
+    }
+  }
+
   if (
     tooling.toolChoiceMode === ToolChoiceModes.Function &&
     tooling.toolChoiceFunctionName &&
-    name !== tooling.toolChoiceFunctionName
+    resolvedName !== tooling.toolChoiceFunctionName
   ) {
     return null;
   }
 
   if (
     tooling.tools.length > 0 &&
-    !tooling.tools.some((tool) => tool.name === name)
+    !tooling.tools.some((tool) => tool.name === resolvedName)
   ) {
     return null;
   }
 
-  const offeredTool = tooling.tools.find((tool) => tool.name === name);
+  const offeredTool = tooling.tools.find((tool) => tool.name === resolvedName);
   const rawArguments =
     callObject.arguments ??
       functionObject?.arguments ??
@@ -704,14 +785,14 @@ function tryBuildToolCall(
     ? normalizeCustomToolInput(rawArguments)
     : normalizeArgumentsJson(rawArguments);
   const validation = validateOpenAiToolCall(
-    { id: "", name, type: offeredTool?.type ?? "function", argumentsJson },
+    { id: "", name: resolvedName, type: offeredTool?.type ?? "function", argumentsJson },
     tooling,
   );
   if (!validation.valid) {
     return null;
   }
   const id = pickString(callObject.id) ?? `call_${randomUUID().replaceAll("-", "")}`;
-  return { id, name, type: offeredTool?.type ?? "function", argumentsJson };
+  return { id, name: resolvedName, type: offeredTool?.type ?? "function", argumentsJson };
 }
 
 export type OpenAiToolCallValidation =

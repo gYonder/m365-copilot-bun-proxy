@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  classifyToolAttempt,
   tryExtractIncrementalSimulatedChatContent,
   tryExtractSimulatedResponsePayload,
 } from "../src/proxy/openai";
+import { ToolChoiceModes, type OpenAiTooling } from "../src/proxy/types";
 
 describe("tryExtractSimulatedResponsePayload", () => {
   test("extracts a markdown-wrapped Responses function call instead of exposing JSON as assistant text", () => {
@@ -224,5 +226,96 @@ describe("tryExtractIncrementalSimulatedChatContent", () => {
     const extracted = tryExtractIncrementalSimulatedChatContent(partial);
     expect(extracted.hasToolCalls).toBeTrue();
     expect(extracted.content).toBeNull();
+  });
+});
+
+describe("classifyToolAttempt", () => {
+  const reportedEnvelope = JSON.stringify({
+    type: "function_call",
+    name: "functions.exec",
+    call_id: "call_resume_catalog_implementation",
+    arguments:
+      'const r = await tools.exec_command({cmd:"sed -n \'80,340p\' src/observed-model-catalog.ts"}); text(r);',
+  });
+
+  function createTooling(toolName: string | null): OpenAiTooling {
+    return {
+      tools: toolName
+        ? [
+            {
+              name: toolName,
+              type: "custom",
+              description: "Execute a tool",
+              parameters: {},
+              format: null,
+            },
+          ]
+        : [],
+      toolChoiceMode: ToolChoiceModes.Auto,
+      toolChoiceFunctionName: null,
+      parallelToolCalls: true,
+    };
+  }
+
+  test("classifies functions.exec envelope as valid when exec tool is offered (prefix-strip)", () => {
+    const classification = classifyToolAttempt(
+      reportedEnvelope,
+      createTooling("exec"),
+    );
+    expect(classification.kind).toBe("valid");
+    if (classification.kind === "valid") {
+      expect(classification.calls).toHaveLength(1);
+      expect(classification.calls[0]?.name).toBe("exec");
+      expect(classification.calls[0]?.type).toBe("custom");
+      // JS expression preserved verbatim
+      expect(classification.calls[0]?.argumentsJson).toContain(
+        "tools.exec_command",
+      );
+    }
+  });
+
+  test("classifies functions.exec envelope as invalid_attempt when only exec_command is offered", () => {
+    const classification = classifyToolAttempt(
+      reportedEnvelope,
+      createTooling("exec_command"),
+    );
+    expect(classification.kind).toBe("invalid_attempt");
+    if (classification.kind === "invalid_attempt") {
+      expect(classification.reason).toBe("tool_call_attempt_rejected");
+    }
+  });
+
+  test("classifies as none when no tools are offered", () => {
+    const classification = classifyToolAttempt(
+      reportedEnvelope,
+      createTooling(null),
+    );
+    expect(classification.kind).toBe("none");
+  });
+
+  test("classifies pure prose as none when tools are offered", () => {
+    const classification = classifyToolAttempt(
+      "I will now read the catalog file to understand the model layout.",
+      createTooling("exec"),
+    );
+    expect(classification.kind).toBe("none");
+  });
+
+  test("classifies a matching tool call envelope as valid", () => {
+    const validEnvelope = JSON.stringify({
+      type: "function_call",
+      name: "exec",
+      call_id: "call_direct",
+      arguments: 'const r = await tools.exec_command({cmd:"ls"}); text(r);',
+    });
+    const classification = classifyToolAttempt(
+      validEnvelope,
+      createTooling("exec"),
+    );
+    expect(classification.kind).toBe("valid");
+    if (classification.kind === "valid") {
+      expect(classification.calls).toHaveLength(1);
+      expect(classification.calls[0]?.name).toBe("exec");
+    }
   });
 });
