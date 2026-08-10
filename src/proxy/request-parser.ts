@@ -1294,25 +1294,43 @@ function extractToolCallsFromResponsesOutputNode(node: JsonObject): JsonObject[]
       continue;
     }
     const type = (tryGetString(item, "type") ?? "").toLowerCase();
-    if (type !== "function_call") {
+    if (type !== "function_call" && type !== "custom_tool_call") {
       continue;
     }
     const name = tryGetString(item, "name");
     if (!name) {
       continue;
     }
-    toolCalls.push({
-      id:
-        tryGetString(item, "call_id") ??
-        tryGetString(item, "tool_call_id") ??
-        tryGetString(item, "id") ??
-        `call_${toolCalls.length + 1}`,
-      type: "function",
-      function: {
-        name,
-        arguments: normalizeFunctionArguments(item.arguments) ?? "{}",
-      },
-    });
+    if (type === "custom_tool_call") {
+      toolCalls.push({
+        id:
+          tryGetString(item, "call_id") ??
+          tryGetString(item, "tool_call_id") ??
+          tryGetString(item, "id") ??
+          `call_${toolCalls.length + 1}`,
+        type: "custom",
+        function: {
+          name,
+          arguments:
+            normalizeFunctionArguments(item.input) ??
+            normalizeFunctionArguments(item.arguments) ??
+            "{}",
+        },
+      });
+    } else {
+      toolCalls.push({
+        id:
+          tryGetString(item, "call_id") ??
+          tryGetString(item, "tool_call_id") ??
+          tryGetString(item, "id") ??
+          `call_${toolCalls.length + 1}`,
+        type: "function",
+        function: {
+          name,
+          arguments: normalizeFunctionArguments(item.arguments) ?? "{}",
+        },
+      });
+    }
   }
   return toolCalls;
 }

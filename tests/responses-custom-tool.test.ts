@@ -1,6 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { buildFunctionCallOutputItem } from "../src/proxy/responses-api";
-import { tryParseResponsesRequest } from "../src/proxy/request-parser";
+import {
+  tryParseOpenAiRequest,
+  tryParseResponsesRequest,
+} from "../src/proxy/request-parser";
 import {
   LogLevels,
   OpenAiTransformModes,
@@ -69,8 +72,106 @@ describe("Responses custom tool support", () => {
   });
 });
 
+describe("Responses tool call extraction from assistant history", () => {
+  test("extracts a custom_tool_call embedded in an assistant content JSON blob", () => {
+    const assistantBlob = {
+      id: "resp_custom_history",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-sol",
+      output: [
+        {
+          type: "custom_tool_call",
+          call_id: "call_abc",
+          name: "exec",
+          input: 'const r = await tools.exec_command({cmd:"ls"}); text(r);',
+        },
+      ],
+    };
+
+    const parsed = tryParseOpenAiRequest(
+      {
+        model: "gpt-5.6-sol",
+        messages: [
+          { role: "assistant", content: JSON.stringify(assistantBlob) },
+          { role: "user", content: "What was the result?" },
+        ],
+      },
+      mappedOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    const toolCalls = extractAssistantToolCallsContext(
+      parsed.request.additionalContext,
+    );
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].id).toBe("call_abc");
+    expect(toolCalls[0].type).toBe("custom");
+    expect(toolCalls[0].function.name).toBe("exec");
+    expect(toolCalls[0].function.arguments).toBe(
+      'const r = await tools.exec_command({cmd:"ls"}); text(r);',
+    );
+  });
+
+  test("still extracts a function_call embedded in an assistant content JSON blob", () => {
+    const assistantBlob = {
+      id: "resp_function_history",
+      object: "response",
+      status: "completed",
+      model: "gpt-5.6-sol",
+      output: [
+        {
+          type: "function_call",
+          call_id: "call_xyz",
+          name: "exec",
+          arguments: JSON.stringify({ cmd: "git status --short" }),
+        },
+      ],
+    };
+
+    const parsed = tryParseOpenAiRequest(
+      {
+        model: "gpt-5.6-sol",
+        messages: [
+          { role: "assistant", content: JSON.stringify(assistantBlob) },
+          { role: "user", content: "Continue." },
+        ],
+      },
+      mappedOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    const toolCalls = extractAssistantToolCallsContext(
+      parsed.request.additionalContext,
+    );
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls[0].id).toBe("call_xyz");
+    expect(toolCalls[0].type).toBe("function");
+    expect(toolCalls[0].function.name).toBe("exec");
+    expect(toolCalls[0].function.arguments).toBe(
+      JSON.stringify({ cmd: "git status --short" }),
+    );
+  });
+});
+
+function extractAssistantToolCallsContext(
+  additionalContext: { text: string; description: string | null }[],
+): Array<{ id: string; type: string; function: { name: string; arguments: string } }> {
+  const prefix = "assistant tool_calls: ";
+  const entry = additionalContext.find((item) => item.text.includes(prefix));
+  expect(entry).toBeDefined();
+  const startIndex = (entry?.text ?? "").indexOf(prefix) + prefix.length;
+  return JSON.parse((entry?.text ?? "").slice(startIndex));
+}
+
 function options(): WrapperOptions {
   return {
     host: "127.0.0.1", port: 4000, tokenPath: "/tmp/test-token", browser: "chromium", browserChannel: null, headless: true, loginTimeoutMs: 1, tokenTimeoutMs: 1, graphBaseUrl: "https://example.invalid", createConversationPath: "/conversations", chatPathTemplate: "/conversations/{conversationId}/chat", chatOverStreamPathTemplate: "/conversations/{conversationId}/stream", defaultModel: "gpt-5.6-sol", defaultSystemMessage: null, includeConversationIdInResponseBody: true, conversationTtlMinutes: 1, openAiTransformMode: OpenAiTransformModes.Simulated, transport: TransportNames.Substrate, logLevel: LogLevels.Error, logDirectory: "/tmp", logRequestBodies: false, logResponseBodies: false, retrySimulatedToollessResponses: true, substrate: { hubUrl: "ws://example.invalid", handshakeTimeoutMs: 1, turnTimeoutMs: 1, invocationTarget: "update", invocationType: 1 }, temporaryChat: true,
   };
+}
+
+function mappedOptions(): WrapperOptions {
+  return { ...options(), openAiTransformMode: OpenAiTransformModes.Mapped };
 }
