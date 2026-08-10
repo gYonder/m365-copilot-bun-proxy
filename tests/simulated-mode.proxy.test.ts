@@ -3791,6 +3791,123 @@ describe("simulated transform mode proxy flow", () => {
     const body = (await response.json()) as JsonObject;
     expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
+
+  test("chat/completions returns 502 for a bare tool-call envelope emitted as text after retry", async () => {
+    // The model emits a Responses-API-shaped tool call as prose instead of a
+    // structured tool call. classifyToolAttempt should detect it as an
+    // invalid_attempt, trigger one protocol retry, and if the retry also fails,
+    // return 502 instead of passing the envelope through as text content.
+    const bareEnvelope = `{"type":"function_call","name":"functions.exec","call_id":"call_bare_1","arguments":"const r = await tools.exec_command({cmd:\\"ls\\"}); text(r);"}`;
+
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        return buildGraphChatResult(conversationId, payload, bareEnvelope);
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          messages: [
+            { role: "user", content: "Run pwd using the local shell tool." },
+          ],
+          tools: [
+            {
+              type: "function",
+              function: {
+                name: "exec_command",
+                description: "Run a shell command.",
+                parameters: {
+                  type: "object",
+                  properties: {
+                    cmd: { type: "string" },
+                  },
+                  required: ["cmd"],
+                },
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    // Should have retried once (initial + 1 protocol retry)
+    expect(callCount).toBe(2);
+    // Should return 502, not 200 with the envelope as content
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as JsonObject;
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
+  });
+
+  test("chat/completions extracts a bare functions.exec envelope when exec is offered as a custom tool", async () => {
+    // The model emits functions.exec as text, but the offered tool is named
+    // "exec" (custom type). The functions. prefix should be stripped and the
+    // call extracted as a valid custom tool call. Uses Mapped mode so the
+    // buildAssistantResponse path (where tryBuildToolCall runs) is reached
+    // directly, without the simulated-payload extraction gate.
+    const bareEnvelope = `{"type":"function_call","name":"functions.exec","call_id":"call_exec_1","arguments":"const r = await tools.exec_command({cmd:\\"pwd\\"}); text(r);"}`;
+
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices(
+        (conversationId, payload) => {
+          callCount += 1;
+          return buildGraphChatResult(conversationId, payload, bareEnvelope);
+        },
+        (options) => {
+          options.openAiTransformMode = OpenAiTransformModes.Mapped;
+        },
+      ),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          messages: [{ role: "user", content: "Run pwd." }],
+          tools: [
+            {
+              type: "custom",
+              name: "exec",
+              description: "Execute a tool expression.",
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    // Should succeed on first attempt (no retry needed in Mapped mode)
+    expect(callCount).toBe(1);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as JsonObject;
+    const choices = body.choices as JsonObject[];
+    expect(choices).toHaveLength(1);
+    const toolCalls = (choices[0].message as JsonObject).tool_calls as JsonObject[];
+    expect(toolCalls).toHaveLength(1);
+    expect((toolCalls[0].function as JsonObject).name).toBe("exec");
+    // The JS expression should be preserved in arguments
+    const args = (toolCalls[0].function as JsonObject).arguments as string;
+    expect(args).toContain("exec_command");
+    expect(args).toContain("pwd");
+    expect(choices[0].finish_reason).toBe("tool_calls");
+  });
 });
 
 function createServices(
