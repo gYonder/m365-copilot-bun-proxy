@@ -568,7 +568,21 @@ export function classifyToolAttempt(
       return { kind: "invalid_attempt", reason: "tool_call_attempt_rejected" };
     }
   }
+  if (looksLikeMalformedToolCallEnvelope(assistantText)) {
+    return { kind: "invalid_attempt", reason: "malformed_tool_call_envelope" };
+  }
   return { kind: "none" };
+}
+
+function looksLikeMalformedToolCallEnvelope(assistantText: string): boolean {
+  const hasCallContainer =
+    /"type"\s*:\s*"(?:function_call|custom_tool_call)"/i.test(assistantText) ||
+    /"tool_calls"\s*:/i.test(assistantText);
+  const hasNamedCall =
+    /"(?:name|tool_name|recipient_name)"\s*:\s*"[^"\r\n]+"/i.test(
+      assistantText,
+    );
+  return hasCallContainer && hasNamedCall;
 }
 
 function looksLikeToolCallAttempt(node: JsonValue): boolean {

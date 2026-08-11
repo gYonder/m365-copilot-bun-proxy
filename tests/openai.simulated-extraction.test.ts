@@ -301,6 +301,30 @@ describe("classifyToolAttempt", () => {
     expect(classification.kind).toBe("none");
   });
 
+  test("classifies a malformed Responses tool envelope as an invalid attempt", () => {
+    const malformedEnvelope = `{
+      "object": "response",
+      "output": [{
+        "type": "function_call",
+        "name": "exec",
+        "arguments": "const result = await tools.exec_command({
+          cmd: "pwd"
+        });
+        text(result);"
+      }]
+    }`;
+
+    expect(
+      tryExtractSimulatedResponsePayload(malformedEnvelope, "responses"),
+    ).toBeNull();
+    expect(
+      classifyToolAttempt(malformedEnvelope, createTooling("exec")),
+    ).toEqual({
+      kind: "invalid_attempt",
+      reason: "malformed_tool_call_envelope",
+    });
+  });
+
   test("classifies a matching tool call envelope as valid", () => {
     const validEnvelope = JSON.stringify({
       type: "function_call",

@@ -156,6 +156,48 @@ describe("simulated transform mode proxy flow", () => {
     ]);
   });
 
+  test("responses reads Codex 0.147 namespace-grouped additional_tools", () => {
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        input: [
+          {
+            type: "additional_tools",
+            role: "developer",
+            tools: [
+              {
+                type: "namespace",
+                name: "functions",
+                tools: [
+                  {
+                    type: "custom",
+                    name: "exec",
+                    description: "Execute a tool expression.",
+                    format: { type: "grammar", syntax: "lark" },
+                  },
+                ],
+              },
+            ],
+          },
+          { type: "message", role: "user", content: "inspect the workspace" },
+        ],
+      },
+      createOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.base.tooling.tools).toEqual([
+      {
+        name: "exec",
+        type: "custom",
+        description: "Execute a tool expression.",
+        parameters: {},
+        format: { type: "grammar", syntax: "lark" },
+      },
+    ]);
+  });
+
   test("responses derives native search only from the latest user message", () => {
     const search = tryParseResponsesRequest(
       {
@@ -3049,6 +3091,278 @@ describe("simulated transform mode proxy flow", () => {
     );
   });
 
+  test("responses repairs a malformed full tool envelope instead of exposing it as text", async () => {
+    const malformedEnvelope = `{
+      "object": "response",
+      "status": "completed",
+      "output": [{
+        "type": "function_call",
+        "call_id": "call_malformed_exec",
+        "name": "exec",
+        "arguments": "const result = await tools.exec_command({
+          cmd: "pwd"
+        });
+        text(result);"
+      }]
+    }`;
+    const capturedPrompts: string[] = [];
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        capturedPrompts.push(readPrompt(payload));
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          callCount === 1
+            ? malformedEnvelope
+            : toMarkdownJson({
+                id: "resp_repaired_exec",
+                object: "response",
+                status: "completed",
+                output: [
+                  {
+                    type: "custom_tool_call",
+                    call_id: "call_repaired_exec",
+                    name: "exec",
+                    input:
+                      'const result = await tools.exec_command({cmd:"pwd"}); text(result);',
+                  },
+                ],
+              }),
+        );
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Use the local shell to run pwd.",
+          tools: [
+            {
+              type: "custom",
+              name: "exec",
+              description: "Execute a tool expression.",
+              format: {
+                type: "grammar",
+                syntax: "lark",
+                definition: "start: /[\\s\\S]+/",
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(2);
+    expect(capturedPrompts[1]).toContain("PROTOCOL RETRY 1:");
+    const body = (await response.json()) as JsonObject;
+    const output = Array.isArray(body.output) ? body.output : [];
+    expect(output).toHaveLength(1);
+    expect(output[0]).toMatchObject({
+      type: "custom_tool_call",
+      call_id: "call_repaired_exec",
+      name: "exec",
+    });
+    expect(tryGetString(output[0], "input")).toContain("tools.exec_command");
+  });
+
+  test("responses resumes a preceding leaked tool envelope on explicit request", async () => {
+    const malformedEnvelope = `{
+      "object": "response",
+      "output": [{
+        "type": "function_call",
+        "name": "exec",
+        "arguments": "const result = await tools.exec_command({
+          cmd: "pwd"
+        }); text(result);"
+      }]
+    }`;
+    const capturedPrompts: string[] = [];
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        const prompt = readPrompt(payload);
+        capturedPrompts.push(prompt);
+        const assistantText = callCount === 1
+          ? malformedEnvelope
+          : prompt.includes("RECOVERY TURN")
+            ? toMarkdownJson({
+                id: "resp_resumed_exec",
+                object: "response",
+                status: "completed",
+                output: [
+                  {
+                    type: "custom_tool_call",
+                    call_id: "call_resumed_exec",
+                    name: "exec",
+                    input:
+                      'const result = await tools.exec_command({cmd:"pwd"}); text(result);',
+                  },
+                ],
+              })
+            : "I will continue from where I stopped.";
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          assistantText,
+        );
+      }),
+    );
+
+    const leaked = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Begin the implementation.",
+        }),
+      }),
+    );
+    expect(leaked.status).toBe(200);
+    const leakedBody = (await leaked.json()) as JsonObject;
+
+    const resumed = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          previous_response_id: leakedBody.id,
+          input: [
+            {
+              type: "additional_tools",
+              role: "developer",
+              tools: [
+                {
+                  type: "namespace",
+                  name: "functions",
+                  tools: [
+                    {
+                      type: "custom",
+                      name: "exec",
+                      description: "Execute a tool expression.",
+                      format: {
+                        type: "grammar",
+                        syntax: "lark",
+                        definition: "start: /[\\s\\S]+/",
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "resume work" }],
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(resumed.status).toBe(200);
+    expect(callCount).toBe(2);
+    expect(capturedPrompts[1]).toContain("RECOVERY TURN");
+    expect(resumed.headers.get("x-m365-tool-call-recovery")).toBe("true");
+    const resumedBody = (await resumed.json()) as JsonObject;
+    const output = Array.isArray(resumedBody.output) ? resumedBody.output : [];
+    expect(output[0]).toMatchObject({
+      type: "custom_tool_call",
+      call_id: "call_resumed_exec",
+      name: "exec",
+    });
+  });
+
+  test("responses does not force recovery after ordinary assistant text", async () => {
+    const capturedPrompts: string[] = [];
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        capturedPrompts.push(readPrompt(payload));
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          callCount === 1
+            ? "The requested analysis is complete."
+            : "Continuing with the next explanation.",
+        );
+      }),
+    );
+
+    const first = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Explain the current design.",
+        }),
+      }),
+    );
+    const firstBody = (await first.json()) as JsonObject;
+
+    const resumed = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          previous_response_id: firstBody.id,
+          input: "resume work",
+          tools: [
+            {
+              type: "function",
+              name: "exec_command",
+              description: "Run a command.",
+              parameters: {
+                type: "object",
+                properties: { cmd: { type: "string" } },
+                required: ["cmd"],
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(resumed.status).toBe(200);
+    expect(callCount).toBe(2);
+    expect(capturedPrompts[1]).not.toContain("RECOVERY TURN");
+    expect(resumed.headers.get("x-m365-tool-call-recovery")).toBeNull();
+  });
+
   test("responses bounds buffered simulated recovery to one correction turn", async () => {
     let callCount = 0;
     const services = createSubstrateStreamingServices(
@@ -3574,10 +3888,12 @@ describe("simulated transform mode proxy flow", () => {
       ],
     };
 
+    const capturedPrompts: string[] = [];
     let callCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
         callCount += 1;
+        capturedPrompts.push(readPrompt(payload));
         return buildGraphChatResult(
           conversationId,
           payload,
@@ -3638,6 +3954,7 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(callCount).toBe(2);
+    expect(capturedPrompts[1]).toContain("PROTOCOL RETRY 1:");
     const body = (await response.json()) as JsonObject;
     const choices = body.choices as JsonObject[];
     const message = choices[0]?.message as JsonObject;

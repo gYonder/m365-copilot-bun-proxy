@@ -645,9 +645,6 @@ async function handleChat(
   }
 
   const graphPayload = buildCopilotRequestPayload(parsedRequest);
-  if (selectedTransport === TransportNames.Graph) {
-    tracePane3(services, trace, graphPayload);
-  }
   const shouldBufferAssistant =
     requiresBufferedAssistantResponse(parsedRequest);
   const taskDeadlineMs = resolveTaskDeadlineMs(options);
@@ -678,10 +675,12 @@ async function handleChat(
       );
       return result;
     }
+    const turnGraphPayload = buildCopilotRequestPayload(turnRequest);
+    tracePane3(services, trace, turnGraphPayload);
     const result = await graphClient.chat(
       authorizationHeader,
-      conversationId!,
-      graphPayload,
+      turnConversationId,
+      turnGraphPayload,
     );
     tracePane4(
       services,
@@ -716,8 +715,12 @@ async function handleChat(
         reason: "simulated_protocol_correction",
         retryCount: 1,
       });
-      const retryConversationId =
-        services.substrateClient.createConversation().conversationId;
+      const retryConversationId = await createProtocolRetryConversationId(
+        selectedTransport,
+        substrateClient,
+        graphClient,
+        authorizationHeader,
+      );
       if (retryConversationId) {
         result = await executeChatTurn(
           retryConversationId,
@@ -1205,6 +1208,25 @@ async function handleResponsesCreateOnce(
     );
   }
 
+  const isToolCallRecovery = shouldRecoverLeakedToolCall(
+    payload.json,
+    parsedRequest,
+    responseStore,
+  );
+  if (isToolCallRecovery) {
+    baseRequest.tooling = {
+      ...baseRequest.tooling,
+      toolChoiceMode: ToolChoiceModes.Required,
+      toolChoiceFunctionName: null,
+      requiredByLocalAction: true,
+    };
+    baseRequest.promptText = buildLeakedToolCallRecoveryPrompt(baseRequest);
+    services.observability?.record("retry", {
+      reason: "leaked_tool_call_resume",
+      retryCount: 1,
+    });
+  }
+
   const requestProfile = deriveRequestProfile({
     requestJson: payload.json,
     request: baseRequest,
@@ -1215,6 +1237,9 @@ async function handleResponsesCreateOnce(
   const responseHeaders = new Headers({
     "x-m365-transport": selectedTransport,
   });
+  if (isToolCallRecovery) {
+    responseHeaders.set("x-m365-tool-call-recovery", "true");
+  }
   const taskDeadlineMs = resolveResponsesTaskDeadlineMs(
     payload.json,
     responseStore,
@@ -1416,9 +1441,6 @@ async function handleResponsesCreateOnce(
   }
 
   const graphPayload = buildCopilotRequestPayload(baseRequest);
-  if (selectedTransport === TransportNames.Graph) {
-    tracePane3(services, trace, graphPayload);
-  }
   const shouldBufferAssistant = requiresBufferedAssistantResponse(baseRequest);
 
   const executeChatTurn = async (
@@ -1447,10 +1469,12 @@ async function handleResponsesCreateOnce(
       );
       return result;
     }
+    const turnGraphPayload = buildCopilotRequestPayload(turnRequest);
+    tracePane3(services, trace, turnGraphPayload);
     const result = await graphClient.chat(
       authorizationHeader,
-      conversationId!,
-      graphPayload,
+      turnConversationId,
+      turnGraphPayload,
     );
     tracePane4(
       services,
@@ -1489,8 +1513,12 @@ async function handleResponsesCreateOnce(
         reason: "simulated_protocol_correction",
         retryCount: 1,
       });
-      const retryConversationId =
-        services.substrateClient.createConversation().conversationId;
+      const retryConversationId = await createProtocolRetryConversationId(
+        selectedTransport,
+        substrateClient,
+        graphClient,
+        authorizationHeader,
+      );
       if (retryConversationId) {
         result = await executeChatTurn(
           retryConversationId,
@@ -2597,6 +2625,23 @@ function buildSimulatedProtocolRetryRequest(
       "Do not answer the user request in prose. Return only the minified JSON tool-call object required above.",
     ].join("\n"),
   };
+}
+
+async function createProtocolRetryConversationId(
+  transport: string,
+  substrateClient: CopilotSubstrateClient,
+  graphClient: CopilotGraphClient,
+  authorizationHeader: string,
+): Promise<string | null> {
+  if (transport === TransportNames.Substrate) {
+    return substrateClient.createConversation().conversationId;
+  }
+  const retryConversation = await graphClient.createConversation(
+    authorizationHeader,
+  );
+  return retryConversation.isSuccess
+    ? retryConversation.conversationId
+    : null;
 }
 
 // Re-issue a buffered (non-streaming) Substrate turn when the model returns a
@@ -4094,6 +4139,116 @@ function resolveSuppressedResponsesConversationId(
   return conversationStore.tryGet(scopedConversationKey);
 }
 
+const EXPLICIT_TOOL_RECOVERY_REQUEST =
+  /^(?:please\s+)?(?:resume|continue|retry)(?:\s+(?:the\s+)?(?:work|task|execution|tool(?:\s+call)?|chain))?[.!]?$/i;
+
+function shouldRecoverLeakedToolCall(
+  requestJson: JsonObject,
+  parsedRequest: ParsedResponsesRequest,
+  responseStore: ResponseStore,
+): boolean {
+  const request = parsedRequest.base;
+  if (
+    request.transformMode !== OpenAiTransformModes.Simulated ||
+    request.tooling.tools.length === 0 ||
+    request.tooling.toolChoiceMode === ToolChoiceModes.None
+  ) {
+    return false;
+  }
+
+  const userText = extractLatestUserInputText(requestJson);
+  if (!userText || !EXPLICIT_TOOL_RECOVERY_REQUEST.test(userText.trim())) {
+    return false;
+  }
+
+  const previousText =
+    extractStoredPreviousResponseText(parsedRequest, responseStore) ??
+    extractPreviousAssistantInputText(requestJson);
+  return previousText
+    ? classifyToolAttempt(previousText, request.tooling).kind !== "none"
+    : false;
+}
+
+function buildLeakedToolCallRecoveryPrompt(
+  request: ParsedOpenAiRequest,
+): string {
+  const availableTools = request.tooling.tools
+    .map((tool) => `${tool.name} (${tool.type})`)
+    .join(", ");
+  return [
+    request.promptText,
+    "",
+    "RECOVERY TURN: The immediately preceding assistant response attempted a local tool call, but it was delivered as JSON text and was not executed.",
+    "Re-emit that same next call before continuing the task. Do not assume the call ran and do not advance past it.",
+    "Return exactly one markdown JSON code block containing one valid Responses object and no prose.",
+    'For a function tool, use output item shape {"type":"function_call","call_id":"call_1","name":"TOOL_NAME","arguments":"{\\"key\\":\\"value\\"}"}.',
+    "For a custom tool, use type custom_tool_call and input instead of arguments.",
+    `Available local tools: ${availableTools}`,
+  ].join("\n");
+}
+
+function extractStoredPreviousResponseText(
+  parsedRequest: ParsedResponsesRequest,
+  responseStore: ResponseStore,
+): string | null {
+  const previousResponse = parsedRequest.previousResponseId
+    ? responseStore.tryGet(parsedRequest.previousResponseId)
+    : null;
+  if (!previousResponse) {
+    return null;
+  }
+  const outputText = tryGetString(previousResponse, "output_text");
+  if (outputText?.trim()) {
+    return outputText;
+  }
+  const output = previousResponse.output;
+  if (!Array.isArray(output)) {
+    return null;
+  }
+  for (let index = output.length - 1; index >= 0; index -= 1) {
+    const item = output[index];
+    if (!isJsonObject(item)) {
+      continue;
+    }
+    const text = extractMessageOutputText(item).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return null;
+}
+
+function extractLatestUserInputText(requestJson: JsonObject): string | null {
+  if (typeof requestJson.input === "string") {
+    return requestJson.input.trim() || null;
+  }
+  if (!Array.isArray(requestJson.input)) {
+    return null;
+  }
+  for (let index = requestJson.input.length - 1; index >= 0; index -= 1) {
+    const text = extractInputItemText(requestJson.input[index], "user");
+    if (text) {
+      return text;
+    }
+  }
+  return null;
+}
+
+function extractPreviousAssistantInputText(
+  requestJson: JsonObject,
+): string | null {
+  if (!Array.isArray(requestJson.input)) {
+    return null;
+  }
+  for (let index = requestJson.input.length - 1; index >= 0; index -= 1) {
+    const text = extractAssistantInputItemText(requestJson.input[index]);
+    if (text) {
+      return text;
+    }
+  }
+  return null;
+}
+
 function detectAssistantTailReplayWithoutNewUserTurn(
   inputItems: unknown[],
 ): string | null {
@@ -4122,12 +4277,19 @@ function detectAssistantTailReplayWithoutNewUserTurn(
 }
 
 function extractAssistantInputItemText(inputItem: unknown): string | null {
+  return extractInputItemText(inputItem, "assistant");
+}
+
+function extractInputItemText(
+  inputItem: unknown,
+  expectedRole: string,
+): string | null {
   if (!isJsonObject(inputItem)) {
     return null;
   }
 
   const role = (tryGetString(inputItem, "role") ?? "").toLowerCase();
-  if (role !== "assistant") {
+  if (role !== expectedRole) {
     return null;
   }
 
