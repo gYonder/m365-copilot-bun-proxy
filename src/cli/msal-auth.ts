@@ -1,8 +1,13 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import * as msal from "@azure/msal-node";
+import {
+  PersistenceCachePlugin,
+  PersistenceCreator,
+} from "@azure/msal-node-extensions";
 import type { BrowserContextOptions } from "playwright";
 import {
+  getBrowserProfilePath,
   getBrowserStatePath,
   getTokenPath,
   loadToken,
@@ -17,10 +22,11 @@ const CLIENT_ID = "c0ab8ce9-e9a0-42e7-b064-33d422df41f1";
 const AUTHORITY = "https://login.microsoftonline.com/common";
 const REDIRECT_URI =
   "https://login.microsoftonline.com/common/oauth2/nativeclient";
-const SCOPES = [
+const RESOURCE_SCOPES = [
   "https://substrate.office.com/sydney/M365Chat.Read",
   "https://substrate.office.com/sydney/sydney.readwrite",
 ];
+const SCOPES = ["openid", "profile", "offline_access", ...RESOURCE_SCOPES];
 const DESIGNER_SCOPES = ["https://designer.microsoft.com/.default"];
 const DESIGNER_AUDIENCES = new Set([
   "https://designer.microsoft.com",
@@ -48,6 +54,21 @@ export type MsalAcquireOptions = {
   appFactory?: () => MsalPublicClient;
 };
 
+export type MsalAuthStatus =
+  | "silent_success"
+  | "interactive_required"
+  | "interactive_success"
+  | "cache_unavailable"
+  | "account_unavailable"
+  | "invalid_token"
+  | "interaction_failed";
+
+export type MsalAcquireResult = {
+  token: MsalTokenResult | null;
+  status: MsalAuthStatus;
+  message?: string;
+};
+
 export type DesignerAcquireOptions = Omit<MsalAcquireOptions, "tokenPath">;
 
 type MsalTokenCache = {
@@ -66,6 +87,47 @@ type MsalPublicClient = Pick<
 async function getMsalCachePath(): Promise<string> {
   const tokenPath = await getTokenPath();
   return path.join(path.dirname(tokenPath), "msal-cache.json");
+}
+
+const CACHE_SERVICE = "com.gyonder.m365-copilot-bun-proxy";
+
+async function createMsalApp(
+  cachePath: string,
+  cacheName: "sydney" | "designer",
+  appFactory?: () => MsalPublicClient,
+): Promise<{ app: MsalPublicClient; manualCache: boolean; legacyCache: string | null }> {
+  if (appFactory) {
+    return { app: appFactory(), manualCache: true, legacyCache: null };
+  }
+
+  // The extension stores the MSAL cache in the macOS Keychain and leaves only
+  // a harmless marker at cachePath. Read an older plaintext cache before the
+  // extension gets a chance to replace that marker so it can be migrated once.
+  let legacyCache: string | null = null;
+  try {
+    const old = await fs.readFile(cachePath, "utf8");
+    if (old.trim() && old.trim() !== "{}") legacyCache = old;
+  } catch {
+    // First run.
+  }
+
+  const persistence = await PersistenceCreator.createPersistence({
+    cachePath,
+    serviceName: `${CACHE_SERVICE}.${cacheName}`,
+    accountName: "default",
+  });
+  const app = new msal.PublicClientApplication({
+    auth: { clientId: CLIENT_ID, authority: AUTHORITY },
+    cache: { cachePlugin: new PersistenceCachePlugin(persistence) },
+  });
+  if (legacyCache) {
+    try {
+      app.getTokenCache().deserialize(legacyCache);
+    } catch {
+      legacyCache = null;
+    }
+  }
+  return { app, manualCache: false, legacyCache };
 }
 
 async function writeOwnerOnlyAtomic(filePath: string, value: string): Promise<void> {
@@ -146,7 +208,7 @@ export function isValidSubstrateToken(
     (!requiredTenantId || tid === requiredTenantId) &&
     (!result.tid || result.tid === tid) &&
     (!result.oid || result.oid === claimOid) &&
-    SCOPES.every((scope) => scopes.has(scope.split("/").at(-1) ?? scope));
+    RESOURCE_SCOPES.every((scope) => scopes.has(scope.split("/").at(-1) ?? scope));
 }
 
 export function isValidDesignerToken(result: MsalTokenResult): boolean {
@@ -170,13 +232,15 @@ export async function acquireDesignerToken(
   const cachePath =
     options.cachePath ??
     path.join(path.dirname(substrateCachePath), "msal-designer-cache.json");
-  const app =
-    options.appFactory?.() ??
-    new msal.PublicClientApplication({
-      auth: { clientId: CLIENT_ID, authority: AUTHORITY },
-    });
+  let created: Awaited<ReturnType<typeof createMsalApp>>;
+  try {
+    created = await createMsalApp(cachePath, "designer", options.appFactory);
+  } catch {
+    return null;
+  }
+  const { app, manualCache } = created;
 
-  if (await fileExists(cachePath)) {
+  if (manualCache && (await fileExists(cachePath))) {
     try {
       await fs.chmod(cachePath, 0o600);
       app.getTokenCache().deserialize(await fs.readFile(cachePath, "utf8"));
@@ -200,7 +264,9 @@ export async function acquireDesignerToken(
     });
     const result = buildResult(acquired.accessToken, acquired.expiresOn ?? null);
     if (!result || !isValidDesignerToken(result)) return null;
-    await writeOwnerOnlyAtomic(cachePath, app.getTokenCache().serialize());
+    if (manualCache) {
+      await writeOwnerOnlyAtomic(cachePath, app.getTokenCache().serialize());
+    }
     return result;
   } catch {
     return null;
@@ -218,13 +284,24 @@ export async function acquireDesignerToken(
 export async function acquireSubstrateToken(
   options: MsalAcquireOptions = {},
 ): Promise<MsalTokenResult | null> {
+  const result = await acquireSubstrateTokenDetailed(options);
+  return result.token;
+}
+
+export async function acquireSubstrateTokenDetailed(
+  options: MsalAcquireOptions = {},
+): Promise<MsalAcquireResult> {
   const cachePath = options.cachePath ?? (await getMsalCachePath());
   const tokenPath = options.tokenPath ?? (await getTokenPath());
   const priorToken = await loadToken(tokenPath);
-  const app = options.appFactory?.() ?? new msal.PublicClientApplication({
-    auth: { clientId: CLIENT_ID, authority: AUTHORITY },
-  });
-  if (await fileExists(cachePath)) {
+  let created: Awaited<ReturnType<typeof createMsalApp>>;
+  try {
+    created = await createMsalApp(cachePath, "sydney", options.appFactory);
+  } catch {
+    return { token: null, status: "cache_unavailable" };
+  }
+  const { app, manualCache } = created;
+  if (manualCache && (await fileExists(cachePath))) {
     try {
       await fs.chmod(cachePath, 0o600);
       app.getTokenCache().deserialize(await fs.readFile(cachePath, "utf8"));
@@ -234,6 +311,7 @@ export async function acquireSubstrateToken(
   }
 
   const persistCache = async (): Promise<boolean> => {
+    if (!manualCache) return true;
     try {
       await writeOwnerOnlyAtomic(cachePath, app.getTokenCache().serialize());
       return true;
@@ -244,19 +322,29 @@ export async function acquireSubstrateToken(
 
   const silent = await acquireSilently(app, priorToken, options.quiet);
   if (silent) {
-    if (!(await persistCache())) return null;
-    return isValidSubstrateToken(silent, priorToken?.tid) ? silent : null;
+    if (!(await persistCache())) return { token: null, status: "cache_unavailable" };
+    return isValidSubstrateToken(silent, priorToken?.tid)
+      ? { token: silent, status: "silent_success" }
+      : { token: null, status: "invalid_token" };
   }
 
   if (options.allowInteractive !== false) {
     const interactive = await acquireInteractively(app, options);
     if (interactive) {
-      if (!(await persistCache())) return null;
-      return isValidSubstrateToken(interactive) ? interactive : null;
+      if (!(await persistCache())) return { token: null, status: "cache_unavailable" };
+      return isValidSubstrateToken(interactive)
+        ? { token: interactive, status: "interactive_success" }
+        : { token: null, status: "invalid_token" };
     }
+    return { token: null, status: "interaction_failed" };
   }
 
-  return null;
+  return {
+    token: null,
+    status: (await app.getTokenCache().getAllAccounts().catch(() => [])).length
+      ? "interactive_required"
+      : "account_unavailable",
+  };
 }
 
 async function acquireSilently(
@@ -289,13 +377,9 @@ async function acquireSilently(
       account,
     });
     return buildResult(result.accessToken, result.expiresOn ?? null);
-  } catch (error) {
+  } catch {
     if (!quiet) {
-      console.error(
-        `[msal] Silent token refresh failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      console.error("[msal] Silent token refresh failed; interactive sign-in may be required.");
     }
     return null;
   }
@@ -312,19 +396,27 @@ async function acquireInteractively(
     return null;
   }
 
-  const cryptoProvider = new msal.CryptoProvider();
-  const { verifier, challenge } = await cryptoProvider.generatePkceCodes();
-  const authUrl = await app.getAuthCodeUrl({
-    scopes: SCOPES,
-    redirectUri: REDIRECT_URI,
-    codeChallenge: challenge,
-    codeChallengeMethod: "S256",
-  });
+  let verifier: string;
+  let authUrl: string;
+  try {
+    const cryptoProvider = new msal.CryptoProvider();
+    const generated = await cryptoProvider.generatePkceCodes();
+    verifier = generated.verifier;
+    authUrl = await app.getAuthCodeUrl({
+      scopes: SCOPES,
+      redirectUri: REDIRECT_URI,
+      codeChallenge: generated.challenge,
+      codeChallengeMethod: "S256",
+    });
+  } catch {
+    return null;
+  }
 
   const statePath =
     options.browserStatePath ?? (await getBrowserStatePath());
+  const profilePath = await getBrowserProfilePath();
   const storageState = await loadSanitizedStorageState(statePath);
-  const headless = options.headless ?? true;
+  const headless = options.headless ?? false;
   const launchArgs = [
     "--no-first-run",
     "--no-default-browser-check",
@@ -332,22 +424,26 @@ async function acquireInteractively(
   ];
   const channel = resolveBrowserChannel(options.browser);
 
-  let browser: import("playwright").Browser;
+  let context: import("playwright").BrowserContext;
   try {
-    browser = channel
-      ? await chromium.launch({ headless, channel, args: launchArgs })
-      : await chromium.launch({ headless, args: launchArgs });
+    context = await chromium.launchPersistentContext(profilePath, {
+      headless,
+      ...(channel ? { channel } : {}),
+      args: launchArgs,
+    });
   } catch {
     try {
-      browser = await chromium.launch({ headless, args: launchArgs });
+      context = await chromium.launchPersistentContext(profilePath, {
+        headless,
+        args: launchArgs,
+      });
     } catch {
       return null;
     }
   }
-
-  const context = await browser.newContext(
-    storageState ? { storageState } : {},
-  );
+  if (storageState?.cookies?.length) {
+    await context.addCookies(storageState.cookies).catch(() => {});
+  }
   const page = await context.newPage();
   let resolveCode: (code: string) => void = () => {};
   const codePromise = new Promise<string>((resolve) => {
@@ -384,16 +480,12 @@ async function acquireInteractively(
     return buildResult(result.accessToken, result.expiresOn ?? null);
   } catch (error) {
     if (!options.quiet) {
-      console.error(
-        `[msal] Interactive token acquisition failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
+      console.error("[msal] Interactive token acquisition did not complete.");
     }
     return null;
   } finally {
     await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    await context.close().catch(() => {});
   }
 }
 

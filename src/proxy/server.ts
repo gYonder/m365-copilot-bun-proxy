@@ -81,6 +81,7 @@ import {
 } from "./types";
 import { ProxyTokenProvider } from "./token-provider";
 import { ProxyVizTraceStore } from "./viz-trace-store";
+import { RateCircuitBreaker } from "./rate-circuit-breaker";
 import { ImageGenerationService } from "./image-generation";
 import { BridgeObservability } from "./observability";
 import {
@@ -116,6 +117,7 @@ type Services = {
   vizTraceStore?: ProxyVizTraceStore;
   imageGenerationService?: ImageGenerationService;
   observability?: BridgeObservability;
+  rateCircuitBreaker?: RateCircuitBreaker;
 };
 
 type TraceContext = {
@@ -131,6 +133,57 @@ const TransformModeHeaderName = "x-m365-openai-transform-mode";
 
 export function createProxyApp(services: Services): Hono {
   const app = new Hono();
+
+  app.use("/v1/*", async (c, next) => {
+    const breaker = services.rateCircuitBreaker;
+    if (breaker && !breaker.allow()) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "M365 upstream rate limit is cooling down; retry later.",
+            type: "rate_limit_error",
+            code: "upstream_rate_limit_circuit_open",
+          },
+        }),
+        {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": String(breaker.retryAfterSeconds()),
+          },
+        },
+      );
+    }
+    await next();
+    const response = c.res;
+    breaker?.record(response.status);
+    return response;
+  });
+  app.use("/openai/v1/*", async (c, next) => {
+    const breaker = services.rateCircuitBreaker;
+    if (breaker && !breaker.allow()) {
+      return new Response(
+        JSON.stringify({
+          error: {
+            message: "M365 upstream rate limit is cooling down; retry later.",
+            type: "rate_limit_error",
+            code: "upstream_rate_limit_circuit_open",
+          },
+        }),
+        {
+          status: 429,
+          headers: {
+            "content-type": "application/json",
+            "retry-after": String(breaker.retryAfterSeconds()),
+          },
+        },
+      );
+    }
+    await next();
+    const response = c.res;
+    breaker?.record(response.status);
+    return response;
+  });
 
   app.use("/v1/*", async (c, next) => {
     const failure = await rejectUnauthorizedGatewayRequest(c.req.raw, services);
@@ -249,6 +302,9 @@ function buildHealthResponse(
       last_quarantine_at_unix:
         durableState?.quarantineStatus.lastOccurredAtUnix ?? null,
     },
+    rate_limit: durableState
+      ? new RateCircuitBreaker(durableState).status()
+      : { open: false, openUntilUtc: 0, consecutive: 0, lastStatusCode: null },
   };
 }
 

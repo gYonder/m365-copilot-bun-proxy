@@ -31,6 +31,21 @@ export async function getBrowserStatePath(): Promise<string> {
   return path.join(directory, "browser-state.json");
 }
 
+/** Dedicated persistent Edge profile used only for the visible MFA fallback. */
+export async function getBrowserProfilePath(): Promise<string> {
+  const localAppData =
+    process.env.LOCALAPPDATA ?? path.join(os.homedir(), ".local", "share");
+  const directory = path.join(
+    localAppData,
+    "M365 Copilot Bun Proxy",
+    "Cli",
+    "edge-profile",
+  );
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  await fs.chmod(directory, 0o700).catch(() => {});
+  return directory;
+}
+
 export async function loadToken(filePath: string): Promise<TokenState | null> {
   try {
     await fs.chmod(filePath, 0o600);

@@ -180,9 +180,9 @@ export class ProxyTokenProvider {
       this.browserStatePathPromise,
     ]);
 
-    // Primary path: MSAL OAuth2 auth-code + PKCE. A silent refresh-token
-    // exchange renews the substrate token without any browser or cookie replay,
-    // which is what previously overflowed request headers on renewal.
+    // The proxy is a background service. Only MSAL's persisted refresh-token
+    // path is allowed here; interactive browser work belongs to the explicit
+    // CLI/launcher login command and must never happen during an API request.
     if (this.msalAuthEnabled) {
       const msalHeader = await this.tryAcquireViaMsal(
         tokenPath,
@@ -194,25 +194,8 @@ export class ProxyTokenProvider {
       }
       this.recordAuthPath("msal", false);
     }
-
-    // Fallback: legacy Playwright cookie capture.
-    try {
-      await this.dependencies.fetchTokenWithPlaywright(tokenPath, browserStatePath, {
-        quiet: true,
-        browser: this.playwrightBrowser,
-      });
-    } catch {
-      this.recordAuthPath("playwright", false);
-      return null;
-    }
-
-    const fetched = await this.dependencies.loadToken(tokenPath);
-    const playwrightHeader =
-      isTokenStateValid(fetched) && isValidPersistedSubstrateToken(fetched)
-        ? this.rememberAuthorizationHeader(fetched)
-        : null;
-    this.recordAuthPath("playwright", playwrightHeader !== null);
-    return playwrightHeader;
+    this.recordAuthPath("interactive_required", false);
+    return null;
   }
 
   private async tryAcquireViaMsal(
@@ -224,7 +207,7 @@ export class ProxyTokenProvider {
         tokenPath,
         browserStatePath,
         browser: this.playwrightBrowser,
-        allowInteractive: true,
+        allowInteractive: false,
         headless: true,
         quiet: true,
       });

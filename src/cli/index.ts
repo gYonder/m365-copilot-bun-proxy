@@ -7,12 +7,11 @@ import {
   TextRenderable,
 } from "@opentui/core";
 import { readSseEvents, tryParseJsonObject } from "../proxy/utils";
-import { fetchTokenWithPlaywright } from "./playwright-token";
+import { acquireSubstrateTokenDetailed, type MsalAuthStatus } from "./msal-auth";
 import {
   type TokenSummary,
   buildTokenSummary,
   deleteToken,
-  getBrowserStatePath,
   getTokenPath,
   loadToken,
   parseTokenOrThrow,
@@ -60,9 +59,11 @@ function showUsage(): number {
   console.log('       bun src/cli/index.ts token set [--token "..."]');
   console.log("       bun src/cli/index.ts token clear");
   console.log("       bun src/cli/index.ts token status");
+  console.log("       bun src/cli/index.ts token auth-status");
   console.log(
-    "       bun src/cli/index.ts token fetch [--quiet] [--headless] [--login-timeout-ms <ms>] [--token-timeout-ms <ms>] [--print-token]",
+    "       bun src/cli/index.ts token fetch [--quiet] [--headless] [--print-token]",
   );
+  console.log("       bun src/cli/index.ts token login");
   return 0;
 }
 
@@ -106,6 +107,16 @@ async function runTokenCommand(parsedArgs: ParsedArgs): Promise<number> {
     return 0;
   }
 
+  if (sub === "auth-status") {
+    const result = await acquireSubstrateTokenDetailed({
+      tokenPath,
+      allowInteractive: false,
+      quiet: true,
+    });
+    console.log(`MSAL: ${result.status}`);
+    return result.token ? 0 : 2;
+  }
+
   if (
     (sub === "fetch" && hasHelpFlag(parsedArgs.options)) ||
     (sub === "help" && parsedArgs.positionals[2]?.toLowerCase() === "fetch")
@@ -113,7 +124,7 @@ async function runTokenCommand(parsedArgs: ParsedArgs): Promise<number> {
     return showTokenFetchUsage();
   }
 
-  if (sub === "fetch") {
+  if (sub === "fetch" || sub === "login") {
     const quiet =
       parsedArgs.options.quiet !== undefined ||
       parsedArgs.options.q !== undefined;
@@ -121,57 +132,37 @@ async function runTokenCommand(parsedArgs: ParsedArgs): Promise<number> {
       parsedArgs.options["print-token"] !== undefined ||
       parsedArgs.options["show-token"] !== undefined;
     const headless = parsedArgs.options.headless !== undefined;
-    let loginTimeoutMs: number | undefined;
-    let tokenTimeoutMs: number | undefined;
-    try {
-      loginTimeoutMs = parseOptionalPositiveIntegerOption(
-        parsedArgs.options["login-timeout-ms"],
-        "--login-timeout-ms",
-      );
-      tokenTimeoutMs = parseOptionalPositiveIntegerOption(
-        parsedArgs.options["token-timeout-ms"],
-        "--token-timeout-ms",
-      );
-    } catch (error) {
-      console.error(formatError(error));
-      return 1;
-    }
-
     if (!quiet) {
-      console.log("[token fetch] Starting Playwright token capture...");
+      console.log(
+        sub === "login"
+          ? "[token login] Opening the persistent Microsoft Edge profile..."
+          : "[token fetch] Trying the persisted MSAL session...",
+      );
     }
-    const storageStatePath = await getBrowserStatePath();
     if (!quiet) {
       console.log(`[token fetch] Token path: ${tokenPath}`);
-      console.log(`[token fetch] Browser state path: ${storageStatePath}`);
     }
     try {
-      await fetchTokenWithPlaywright(tokenPath, storageStatePath, {
+      const result = await acquireSubstrateTokenDetailed({
+        tokenPath,
+        allowInteractive:
+          sub === "login" && parsedArgs.options["no-interactive"] === undefined,
+        headless: sub === "login" ? false : headless,
         quiet,
-        headless,
-        loginTimeoutMs,
-        tokenTimeoutMs,
+      });
+      if (!result.token) {
+        console.error(`[token ${sub}] ${formatMsalStatus(result.status)}`);
+        return result.status === "interactive_required" ? 2 : 1;
+      }
+      await saveToken(tokenPath, result.token.token, result.token.expiresAtUtc, {
+        oid: result.token.oid,
+        tid: result.token.tid,
       });
       if (shouldPrintToken) {
-        const tokenState = await loadToken(tokenPath);
-        if (!tokenState?.token?.trim()) {
-          console.error("[token fetch] No token found after fetch.");
-          return 1;
-        }
-        console.log(tokenState.token);
+        console.log(result.token.token);
       }
     } catch (error) {
-      const msg = String(
-        error instanceof Error ? (error.message ?? error) : error,
-      )
-        .replace(/\x1b\[[0-9;]*[mGKHFABCDJ]/g, "") // strip ANSI
-        .trim();
-      const stack =
-        error instanceof Error && error.stack
-          ? error.stack.replace(/\x1b\[[0-9;]*[mGKHFABCDJ]/g, "").trim()
-          : "";
-      console.error(`\n[token fetch] FAILED: ${msg}`);
-      if (stack) console.error(stack);
+      console.error(`[token ${sub}] FAILED: ${formatError(error)}`);
       return 1;
     }
     return 0;
@@ -187,16 +178,32 @@ function hasHelpFlag(options: Record<string, string | null>): boolean {
 function showTokenFetchUsage(): number {
   console.log("Fetch and cache a Microsoft 365 Copilot Substrate token.");
   console.log(
-    "Usage: bun src/cli/index.ts token fetch [--quiet] [--headless] [--login-timeout-ms <ms>] [--token-timeout-ms <ms>] [--print-token]",
+    "Usage: bun src/cli/index.ts token fetch [--quiet] [--headless] [--print-token]",
   );
   console.log("");
   console.log("Options:");
-  console.log("  --headless             Try saved browser state without showing a browser window.");
-  console.log("  --login-timeout-ms     Time to wait for interactive login in headed mode.");
-  console.log("  --token-timeout-ms     Time to wait for the Substrate WebSocket token.");
-  console.log("  --quiet                Suppress Playwright progress output.");
+  console.log("  --headless             Use a hidden browser only when explicitly requested.");
+  console.log("  --no-interactive       Never open a browser; report silent-auth status.");
+  console.log("  --quiet                Suppress progress output.");
   console.log("  --print-token          Print the raw token after capture. Avoid unless debugging.");
   return 0;
+}
+
+function formatMsalStatus(status: MsalAuthStatus): string {
+  switch (status) {
+    case "interactive_required":
+      return "No silent M365 session is available. Run `token login` to sign in once.";
+    case "account_unavailable":
+      return "No persisted M365 account is available. Run `token login`.";
+    case "cache_unavailable":
+      return "The secure MSAL cache could not be opened.";
+    case "interaction_failed":
+      return "M365 sign-in did not complete. Keep Edge open through the redirect and try again.";
+    case "invalid_token":
+      return "M365 returned a token that failed the Substrate audience and scope checks.";
+    default:
+      return "M365 authentication is unavailable.";
+  }
 }
 
 async function runStatusCommand(
@@ -980,20 +987,6 @@ function parseArgs(args: string[]): ParsedArgs {
   }
 
   return { positionals, options };
-}
-
-function parseOptionalPositiveIntegerOption(
-  raw: string | null | undefined,
-  name: string,
-): number | undefined {
-  if (raw === undefined || raw === null || !raw.trim()) {
-    return undefined;
-  }
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer.`);
-  }
-  return value;
 }
 
 function resolveApiMode(options: Record<string, string | null>): ApiMode {

@@ -94,20 +94,18 @@ describe("ProxyTokenProvider", () => {
     expect(await provider.resolveAuthorizationHeader(null)).toBe("Bearer " + value);
   });
 
-  test("rejects an invalid cached token and falls back to Playwright", async () => {
+  test("rejects an invalid cached token without opening a browser", async () => {
     const invalid = token({ aud: "https://graph.microsoft.com" });
-    const fallback = token();
-    let loads = 0;
     let playwrightCalls = 0;
     const provider = new ProxyTokenProvider({ dependencies: {
       getTokenPath: async () => "/token.json",
       getBrowserStatePath: async () => "/browser.json",
-      loadToken: async () => state(++loads === 1 ? invalid : fallback),
+      loadToken: async () => state(invalid),
       acquireSubstrateToken: async () => null,
       fetchTokenWithPlaywright: async () => { playwrightCalls += 1; },
     }});
-    expect(await provider.resolveAuthorizationHeader(null)).toBe(`Bearer ${fallback}`);
-    expect(playwrightCalls).toBe(1);
+    expect(await provider.resolveAuthorizationHeader(null)).toBeNull();
+    expect(playwrightCalls).toBe(0);
   });
 
   test("persists a valid MSAL result and skips Playwright", async () => {
@@ -130,20 +128,19 @@ describe("ProxyTokenProvider", () => {
     expect(playwrightCalls).toBe(0);
   });
 
-  test("falls back when MSAL persistence fails", async () => {
+  test("surfaces MSAL persistence failure without a browser fallback", async () => {
     const msal = token();
-    const fallback = token({ oid: "object-b" });
-    let loads = 0;
+    let playwrightCalls = 0;
     const provider = new ProxyTokenProvider({ dependencies: {
       getTokenPath: async () => "/token.json",
       getBrowserStatePath: async () => "/browser.json",
-      loadToken: async () =>
-        ++loads === 1 ? null : state(fallback, { oid: "object-b" }),
+      loadToken: async () => null,
       acquireSubstrateToken: async () => ({ token: msal, expiresAtUtc: new Date(Date.now() + 3_600_000), oid: "object-a", tid: "tenant-a" }),
       saveToken: async () => { throw new Error("persistence failed"); },
-      fetchTokenWithPlaywright: async () => {},
+      fetchTokenWithPlaywright: async () => { playwrightCalls += 1; },
     }});
-    expect(await provider.resolveAuthorizationHeader(null)).toBe(`Bearer ${fallback}`);
+    expect(await provider.resolveAuthorizationHeader(null)).toBeNull();
+    expect(playwrightCalls).toBe(0);
   });
 
   test("shares one in-flight acquisition across concurrent callers", async () => {

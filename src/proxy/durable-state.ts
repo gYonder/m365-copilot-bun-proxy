@@ -43,6 +43,12 @@ export type DurableToolLedgerEntry = {
   expiresAtUtc: number;
 };
 
+export type DurableRateLimitState = {
+  openUntilUtc: number;
+  consecutive: number;
+  lastStatusCode: number | null;
+};
+
 export type DurableState = {
   schema_version: typeof StateSchemaVersion;
   contract_version: typeof BridgeContractVersion;
@@ -53,6 +59,7 @@ export type DurableState = {
   sessions: Record<string, DurableSessionEntry>;
   replays: Record<string, DurableReplayEntry>;
   toolLedgers: Record<string, DurableToolLedgerEntry>;
+  rateLimit: DurableRateLimitState;
 };
 
 type QuarantineStatus = {
@@ -79,6 +86,7 @@ const emptyState = (): DurableState => ({
   sessions: {},
   replays: {},
   toolLedgers: {},
+  rateLimit: { openUntilUtc: 0, consecutive: 0, lastStatusCode: null },
 });
 
 export function durableStatePath(): string | null {
@@ -229,7 +237,24 @@ function parseState(value: unknown): DurableState {
     sessions: parseSessionEntries(value.sessions),
     replays: parseReplayEntries(value.replays),
     toolLedgers: parseToolLedgerEntries(value.toolLedgers),
+    rateLimit: parseRateLimitState(value.rateLimit),
   };
+}
+
+function parseRateLimitState(value: unknown): DurableRateLimitState {
+  // This field was added without a schema bump so existing continuation state
+  // remains usable and simply starts with a closed circuit.
+  if (value === undefined) {
+    return { openUntilUtc: 0, consecutive: 0, lastStatusCode: null };
+  }
+  const item = requireRecord(value, "rate_limit_state");
+  const openUntilUtc = requirePositiveNumber(item.openUntilUtc, "rate_limit_open_until");
+  const consecutive = requirePositiveNumber(item.consecutive, "rate_limit_consecutive");
+  const lastStatusCode =
+    item.lastStatusCode === null || item.lastStatusCode === undefined
+      ? null
+      : requirePositiveNumber(item.lastStatusCode, "rate_limit_status");
+  return { openUntilUtc, consecutive, lastStatusCode };
 }
 
 function parseToolLedgerEntries(

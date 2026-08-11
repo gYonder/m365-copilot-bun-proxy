@@ -18,6 +18,7 @@ import {
   ImageGenerationService,
 } from "./image-generation";
 import { BridgeObservability } from "./observability";
+import { RateCircuitBreaker } from "./rate-circuit-breaker";
 
 const loadedOptions = await loadWrapperOptions(process.cwd());
 const debugEnabled = parseDebugFlag();
@@ -29,6 +30,7 @@ const debugLogger = new DebugMarkdownLogger(options, debugEnabled);
 const observability = new BridgeObservability();
 const graphClient = new CopilotGraphClient(options, debugLogger);
 const durableState = new DurableStateStore();
+const rateCircuitBreaker = new RateCircuitBreaker(durableState);
 const substrateSessionStore = new SubstrateSessionStore(
   options.conversationTtlMinutes,
   undefined,
@@ -72,6 +74,7 @@ const app = createProxyApp({
   vizTraceStore,
   imageGenerationService,
   observability,
+  rateCircuitBreaker,
 });
 
 const listen = parseListenUrl(options.listenUrl);
