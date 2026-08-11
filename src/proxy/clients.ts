@@ -201,7 +201,7 @@ const AllowlistedSubstrateFrameTypes = new Set<number>([
   SignalRPingType,
   SignalRCloseType,
 ]);
-const KnownSubstrateMessageTypes = new Set(["chat", "disengaged"]);
+const AlwaysKnownSubstrateMessageTypes = new Set(["chat", "disengaged"]);
 const MaxSubstrateDriftObservations = 8;
 type SubstrateDriftReason =
   | "unknown_frame_type"
@@ -494,6 +494,13 @@ export class CopilotSubstrateClient {
     let receiverDisposed = false;
     const receiver = this.createReceiver(ws);
     let providerDriftObserved = false;
+    const knownMessageTypes = new Set(AlwaysKnownSubstrateMessageTypes);
+    for (const messageType of this.options.substrate.allowedMessageTypes) {
+      const normalized = messageType.trim().toLowerCase();
+      if (normalized) {
+        knownMessageTypes.add(normalized);
+      }
+    }
     const driftObservationKeys = new Set<string>();
     const recordDrift = (
       reason: SubstrateDriftReason,
@@ -844,7 +851,10 @@ export class CopilotSubstrateClient {
             frameType === SignalRInvocationType ||
             frameType === SignalRStreamItemType
           ) {
-            for (const issue of inspectSubstrateSemanticPayload(json)) {
+            for (const issue of inspectSubstrateSemanticPayload(
+              json,
+              knownMessageTypes,
+            )) {
               recordDrift(
                 issue.reason,
                 frameType,
@@ -1136,6 +1146,7 @@ type SubstrateSemanticIssue = {
 
 function inspectSubstrateSemanticPayload(
   envelope: JsonObject,
+  knownMessageTypes: ReadonlySet<string>,
 ): SubstrateSemanticIssue[] {
   const issues: SubstrateSemanticIssue[] = [];
   const addIssue = (
@@ -1175,7 +1186,7 @@ function inspectSubstrateSemanticPayload(
       } else if (
         typeof messageType === "string" &&
         messageType.trim() &&
-        !KnownSubstrateMessageTypes.has(messageType.trim().toLowerCase())
+        !knownMessageTypes.has(messageType.trim().toLowerCase())
       ) {
         addIssue("unknown_message_type", null, messageType.trim());
       }

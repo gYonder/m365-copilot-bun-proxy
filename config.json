@@ -28,7 +28,7 @@
   "chatOverStreamPathTemplate": "/beta/copilot/conversations/{conversationId}/chatOverStream",
   "substrate": {
     "hubPath": "wss://substrate.office.com/m365Copilot/Chathub",
-    "earlyCompleteOnSimulatedPayload": true,
+    "earlyCompleteOnSimulatedPayload": false,
     "incrementalSimulatedContentStreaming": true,
     "concurrencyLimit": 2,
     "acquireTimeoutMs": 0,

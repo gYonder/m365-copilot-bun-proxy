@@ -2787,7 +2787,10 @@ function shouldRetrySimulatedToollessChatPayload(
   if (request.tooling.tools.length === 0) {
     return false;
   }
-  if (request.tooling.toolChoiceMode === ToolChoiceModes.None) {
+  if (
+    request.tooling.toolChoiceMode !== ToolChoiceModes.Required &&
+    request.tooling.toolChoiceMode !== ToolChoiceModes.Function
+  ) {
     return false;
   }
 

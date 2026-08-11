@@ -589,6 +589,57 @@ describe("Substrate client lifecycle hardening", () => {
     expect(JSON.stringify(driftEvents[0])).toContain("FutureMessageType");
   });
 
+  test("accepts configured control message types without using their text", async () => {
+    const observability = new BridgeObservability();
+    const options = createOptions();
+    options.substrate.allowedMessageTypes = [
+      "Chat",
+      "Progress",
+      "ReferencesListComplete",
+    ];
+    const client = makeObservedClient(
+      [
+        "{}",
+        JSON.stringify({
+          type: 1,
+          target: "update",
+          arguments: [{
+            messages: [{
+              author: "bot",
+              messageType: "Progress",
+              text: "control metadata",
+            }],
+          }],
+        }) + "\u001e",
+        JSON.stringify({
+          type: 1,
+          target: "update",
+          arguments: [{
+            messages: [{
+              author: "bot",
+              messageType: "ReferencesListComplete",
+            }],
+          }],
+        }) + "\u001e",
+        makeChatUpdateFrame("done"),
+        makeCompletionFrame(),
+      ],
+      observability,
+      options,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-configured-control-message-types",
+      makeRequest(),
+      true,
+    );
+
+    expect(result.isSuccess).toBeTrue();
+    expect(result.assistantText).toBe("done");
+    expect(getProviderDriftEvents(observability)).toHaveLength(0);
+  });
+
   test("maps a type-7 close without usable error information to provider drift", async () => {
     const observability = new BridgeObservability();
     const client = makeObservedClient(
@@ -1030,10 +1081,11 @@ function makeFrameTransport(
 function makeObservedClient(
   frames: string[],
   observability: BridgeObservability,
+  options = createOptions(),
 ): CopilotSubstrateClient {
   const { connect, createReceiver } = makeFrameTransport(frames);
   return new CopilotSubstrateClient(
-    createOptions(),
+    options,
     stubLogger,
     undefined,
     connect,

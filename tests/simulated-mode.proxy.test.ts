@@ -956,7 +956,12 @@ describe("simulated transform mode proxy flow", () => {
 
     let streamedText = "";
     let sawDone = false;
+    let sawError = false;
+    let finishReason: string | null = null;
     for await (const event of readSseEvents(response.body!)) {
+      if (event.event === "error") {
+        sawError = true;
+      }
       const data = event.data.trim();
       if (!data) {
         continue;
@@ -974,6 +979,11 @@ describe("simulated transform mode proxy flow", () => {
       if (!first || typeof first !== "object" || Array.isArray(first)) {
         continue;
       }
+      const candidateFinishReason = (first as Record<string, unknown>)
+        .finish_reason;
+      if (typeof candidateFinishReason === "string") {
+        finishReason = candidateFinishReason;
+      }
       const delta = (first as Record<string, unknown>).delta;
       if (!delta || typeof delta !== "object" || Array.isArray(delta)) {
         continue;
@@ -986,6 +996,8 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(streamedText).toContain("streamed text without forced tool call");
     expect(sawDone).toBeTrue();
+    expect(sawError).toBeFalse();
+    expect(finishReason).toBe("stop");
   });
 
   test("responses non-stream returns simulated response payload object", async () => {
@@ -3782,7 +3794,7 @@ describe("simulated transform mode proxy flow", () => {
     expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
-  test("chat/completions rejects a toolless payload without resending", async () => {
+  test("chat/completions accepts a toolless auto-tool payload without resending", async () => {
     const plainTextStopPayload: JsonObject = {
       id: "chatcmpl-plain-stop",
       object: "chat.completion",
@@ -3798,33 +3810,6 @@ describe("simulated transform mode proxy flow", () => {
         },
       ],
     };
-    const usablePayload: JsonObject = {
-      id: "chatcmpl-usable-tool",
-      object: "chat.completion",
-      model: "simulated-model",
-      choices: [
-        {
-          index: 0,
-          finish_reason: "tool_calls",
-          message: {
-            role: "assistant",
-            content: null,
-            tool_calls: [
-              {
-                id: "call_retry_toolless",
-                type: "function",
-                function: {
-                  name: "write_to_file",
-                  arguments:
-                    "{\"path\":\"tests/agent-tests/fizz-buzz.ts\",\"content\":\"export const ok = true;\"}",
-                },
-              },
-            ],
-          },
-        },
-      ],
-    };
-
     let callCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) => {
@@ -3832,7 +3817,7 @@ describe("simulated transform mode proxy flow", () => {
         return buildGraphChatResult(
           conversationId,
           payload,
-          toMarkdownJson(callCount === 1 ? plainTextStopPayload : usablePayload),
+          toMarkdownJson(plainTextStopPayload),
         );
       }),
     );
@@ -3870,10 +3855,13 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(200);
     expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
+    const choices = body.choices as JsonObject[];
+    expect(choices[0]?.finish_reason).toBe("stop");
+    const message = choices[0]?.message as JsonObject;
+    expect(message.content).toBe("I wrote the file.");
   });
 
   test("chat/completions corrects invalid apply_diff once before delivery", async () => {
@@ -4005,7 +3993,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(((calls[0]?.function as JsonObject).name)).toBe("write_to_file");
   });
 
-  test("chat/completions stream rejects toolless auto-tool payload without resending", async () => {
+  test("chat/completions stream accepts toolless auto-tool payload without resending", async () => {
     const plainTextStopPayload: JsonObject = {
       id: "chatcmpl-plain-stop-stream",
       object: "chat.completion",
@@ -4066,10 +4054,43 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(200);
+    expect(response.body).not.toBeNull();
     expect(callCount).toBe(1);
-    const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
+
+    let streamedText = "";
+    let finishReason: string | null = null;
+    let sawDone = false;
+    let sawError = false;
+    for await (const event of readSseEvents(response.body!)) {
+      if (event.event === "error") {
+        sawError = true;
+      }
+      const data = event.data.trim();
+      if (data.toLowerCase() === "[done]") {
+        sawDone = true;
+        break;
+      }
+      const chunk = tryParseJsonObject(data);
+      const choices = chunk?.choices;
+      if (!Array.isArray(choices) || !isJsonObject(choices[0])) {
+        continue;
+      }
+      const choice = choices[0];
+      const candidateFinishReason = tryGetString(choice, "finish_reason");
+      if (candidateFinishReason) {
+        finishReason = candidateFinishReason;
+      }
+      const delta = choice.delta;
+      if (isJsonObject(delta)) {
+        streamedText += tryGetString(delta, "content") ?? "";
+      }
+    }
+
+    expect(streamedText).toContain("High-level summary");
+    expect(finishReason).toBe("stop");
+    expect(sawDone).toBeTrue();
+    expect(sawError).toBeFalse();
   });
 
   test("chat/completions exhausts one invalid apply_diff correction", async () => {
