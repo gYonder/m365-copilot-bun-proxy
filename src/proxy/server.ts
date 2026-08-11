@@ -4240,7 +4240,28 @@ function extractPreviousAssistantInputText(
   if (!Array.isArray(requestJson.input)) {
     return null;
   }
+  let latestUserIndex = -1;
   for (let index = requestJson.input.length - 1; index >= 0; index -= 1) {
+    if (extractInputItemText(requestJson.input[index], "user")) {
+      latestUserIndex = index;
+      break;
+    }
+  }
+  if (latestUserIndex < 0) {
+    return null;
+  }
+
+  for (let index = latestUserIndex - 1; index >= 0; index -= 1) {
+    const item = requestJson.input[index];
+    if (isJsonObject(item)) {
+      const type = (tryGetString(item, "type") ?? "").toLowerCase();
+      if (
+        type === "function_call_output" ||
+        type === "custom_tool_call_output"
+      ) {
+        return null;
+      }
+    }
     const text = extractAssistantInputItemText(requestJson.input[index]);
     if (text) {
       return text;

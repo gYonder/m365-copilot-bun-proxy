@@ -3293,6 +3293,48 @@ describe("simulated transform mode proxy flow", () => {
       call_id: "call_resumed_exec",
       name: "exec",
     });
+
+    const fullHistoryResume = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: [
+            {
+              type: "message",
+              role: "assistant",
+              content: [{ type: "output_text", text: malformedEnvelope }],
+            },
+            {
+              type: "message",
+              role: "user",
+              content: [{ type: "input_text", text: "continue task" }],
+            },
+          ],
+          tools: [
+            {
+              type: "custom",
+              name: "exec",
+              description: "Execute a tool expression.",
+              format: { type: "grammar", syntax: "lark" },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(fullHistoryResume.status).toBe(200);
+    expect(callCount).toBe(3);
+    expect(capturedPrompts[2]).toContain("RECOVERY TURN");
+    expect(fullHistoryResume.headers.get("x-m365-tool-call-recovery")).toBe(
+      "true",
+    );
   });
 
   test("responses does not force recovery after ordinary assistant text", async () => {
