@@ -30,7 +30,7 @@
     "hubPath": "wss://substrate.office.com/m365Copilot/Chathub",
     "earlyCompleteOnSimulatedPayload": false,
     "incrementalSimulatedContentStreaming": true,
-    "concurrencyLimit": 2,
+    "concurrencyLimit": 1,
     "acquireTimeoutMs": 0,
     "maxSendChars": 500000,
     "truncateBeforeSending": true,
