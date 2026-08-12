@@ -381,41 +381,83 @@ export async function* readSseEvents(
   let eventName = "message";
   let dataBuffer: string[] = [];
 
+  const processLine = (
+    line: string,
+  ): { event: string; data: string } | null => {
+    if (line.length === 0) {
+      const event = dataBuffer.length > 0
+        ? { event: eventName, data: dataBuffer.join("\n") }
+        : null;
+      dataBuffer = [];
+      eventName = "message";
+      return event;
+    }
+    if (line.startsWith("event:")) {
+      eventName = readSseFieldValue(line, "event:");
+    } else if (line.startsWith("data:")) {
+      dataBuffer.push(readSseFieldValue(line, "data:"));
+    }
+    return null;
+  };
+
+  const consumeLines = function* (
+    final: boolean,
+  ): Generator<{ event: string; data: string }> {
+    while (true) {
+      const boundary = findSseLineBoundary(buffer, final);
+      if (!boundary) break;
+      const line = buffer.slice(0, boundary.index);
+      buffer = buffer.slice(boundary.index + boundary.length);
+      const event = processLine(line);
+      if (event) yield event;
+    }
+  };
+
   while (true) {
     const { done, value } = await reader.read();
     if (done) {
       break;
     }
     buffer += decoder.decode(value, { stream: true });
-
-    while (true) {
-      const nl = buffer.indexOf("\n");
-      if (nl < 0) {
-        break;
-      }
-      const rawLine = buffer.slice(0, nl);
-      buffer = buffer.slice(nl + 1);
-      const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-
-      if (line.length === 0) {
-        if (dataBuffer.length > 0) {
-          yield { event: eventName, data: dataBuffer.join("\n") };
-          dataBuffer = [];
-        }
-        eventName = "message";
-        continue;
-      }
-      if (line.startsWith("event:")) {
-        eventName = line.slice("event:".length).trim();
-        continue;
-      }
-      if (line.startsWith("data:")) {
-        dataBuffer.push(line.slice("data:".length).trimStart());
-      }
-    }
+    yield* consumeLines(false);
   }
 
+  buffer += decoder.decode();
+  yield* consumeLines(true);
+  if (buffer.length > 0) {
+    const event = processLine(buffer);
+    buffer = "";
+    if (event) yield event;
+  }
   if (dataBuffer.length > 0) {
     yield { event: eventName, data: dataBuffer.join("\n") };
   }
+}
+
+function readSseFieldValue(line: string, prefix: string): string {
+  const value = line.slice(prefix.length);
+  return value.startsWith(" ") ? value.slice(1) : value;
+}
+
+function findSseLineBoundary(
+  buffer: string,
+  final: boolean,
+): { index: number; length: number } | null {
+  for (let index = 0; index < buffer.length; index++) {
+    const char = buffer[index];
+    if (char === "\n") {
+      return { index, length: 1 };
+    }
+    if (char !== "\r") {
+      continue;
+    }
+    if (index + 1 === buffer.length && !final) {
+      return null;
+    }
+    return {
+      index,
+      length: buffer[index + 1] === "\n" ? 2 : 1,
+    };
+  }
+  return null;
 }
