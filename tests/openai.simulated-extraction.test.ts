@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   classifyToolAttempt,
+  tryBuildAssistantResponseFromChatCompletionPayload,
   tryExtractIncrementalSimulatedChatContent,
   tryExtractSimulatedResponsePayload,
 } from "../src/proxy/openai";
@@ -226,6 +227,28 @@ describe("tryExtractIncrementalSimulatedChatContent", () => {
     const extracted = tryExtractIncrementalSimulatedChatContent(partial);
     expect(extracted.hasToolCalls).toBeTrue();
     expect(extracted.content).toBeNull();
+  });
+});
+
+describe("simulated Chat Completions text fidelity", () => {
+  test("preserves whitespace across assistant content-part boundaries", () => {
+    const response = tryBuildAssistantResponseFromChatCompletionPayload({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Repository" },
+            { type: "text", text: " reconnaissance " },
+            { type: "text", text: "is reconciled." },
+          ],
+        },
+      }],
+    });
+
+    expect(response?.content).toBe(
+      "Repository reconnaissance is reconciled.",
+    );
   });
 });
 

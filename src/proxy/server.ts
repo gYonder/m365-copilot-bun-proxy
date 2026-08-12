@@ -95,6 +95,7 @@ import {
   isJsonObject,
   nowUnix,
   readSseEvents,
+  tryGetRawString,
   tryGetString,
   tryParseJsonObject,
   tryReadJsonPayload,
@@ -2493,7 +2494,7 @@ async function buildBufferedResponsesStreamResponse(
               { type: "output_text", text: content, annotations },
             );
           } else if (item.type === "custom_tool_call") {
-            const input = tryGetString(item, "input") ?? "";
+            const input = tryGetRawString(item, "input") ?? "";
             writer.customToolInputDelta(
               responseId,
               index,
@@ -2909,7 +2910,10 @@ function normalizeSimulatedChatChoices(payload: JsonObject): JsonObject[] {
       finish_reason: "stop",
       message: {
         role: "assistant",
-        content: tryGetString(payload, "output_text") ?? tryGetString(payload, "text") ?? "",
+        content:
+          tryGetRawString(payload, "output_text") ??
+          tryGetRawString(payload, "text") ??
+          "",
       },
     }),
   ];
@@ -2984,8 +2988,8 @@ function buildChoiceFromResponsesShape(payload: JsonObject): JsonObject | null {
       role: "assistant",
       content:
         messageText ??
-        tryGetString(payload, "output_text") ??
-        tryGetString(payload, "text") ??
+        tryGetRawString(payload, "output_text") ??
+        tryGetRawString(payload, "text") ??
         "",
     },
   });
@@ -3224,8 +3228,8 @@ function normalizeSimulatedResponsesPayload(
   const rawOutputItems = getSimulatedResponsesOutputItems(responseBody);
   if (!Array.isArray(rawOutputItems)) {
     const outputText =
-      tryGetString(responseBody, "output_text") ??
-      tryGetString(responseBody, "text") ??
+      tryGetRawString(responseBody, "output_text") ??
+      tryGetRawString(responseBody, "text") ??
       extractTextFromSimulatedChoices(responseBody) ??
       "";
     responseBody.output = [
@@ -3678,7 +3682,7 @@ async function buildSimulatedResponsesStreamResponse(
 
           writer.outputItemAdded(responseId, index, item);
           if (itemType === "custom_tool_call") {
-            const input = tryGetString(item, "input") ?? "";
+            const input = tryGetRawString(item, "input") ?? "";
             writer.customToolInputDelta(
               responseId,
               index,
@@ -4047,7 +4051,7 @@ function outputItemsForLedger(
       type: type === "custom_tool_call" ? "custom" : "function",
       arguments:
         type === "custom_tool_call"
-          ? JSON.stringify(tryGetString(item, "input") ?? "")
+          ? JSON.stringify(tryGetRawString(item, "input") ?? "")
           : (item.arguments ?? "{}"),
     });
   }
@@ -4256,7 +4260,7 @@ function extractStoredPreviousResponseText(
   if (!previousResponse) {
     return null;
   }
-  const outputText = tryGetString(previousResponse, "output_text");
+  const outputText = tryGetRawString(previousResponse, "output_text");
   if (outputText?.trim()) {
     return outputText;
   }
@@ -4269,8 +4273,8 @@ function extractStoredPreviousResponseText(
     if (!isJsonObject(item)) {
       continue;
     }
-    const text = extractMessageOutputText(item).trim();
-    if (text) {
+    const text = extractMessageOutputText(item);
+    if (text.trim()) {
       return text;
     }
   }
@@ -4375,8 +4379,7 @@ function extractInputItemText(
 
   const content = inputItem.content;
   if (typeof content === "string") {
-    const text = content.trim();
-    return text ? text : null;
+    return content.trim() ? content : null;
   }
 
   if (Array.isArray(content)) {
@@ -4401,24 +4404,24 @@ function extractInputItemText(
         continue;
       }
       const text =
-        tryGetString(part, "text") ??
-        tryGetString(part, "output_text") ??
-        tryGetString(part, "input_text");
+        tryGetRawString(part, "text") ??
+        tryGetRawString(part, "output_text") ??
+        tryGetRawString(part, "input_text");
       if (text?.trim()) {
         textParts.push(text);
       }
     }
-    const combined = textParts.join("").trim();
-    return combined ? combined : null;
+    const combined = textParts.join("");
+    return combined.trim() ? combined : null;
   }
 
   const fallback =
-    tryGetString(inputItem, "output_text") ?? tryGetString(inputItem, "text");
+    tryGetRawString(inputItem, "output_text") ??
+    tryGetRawString(inputItem, "text");
   if (!fallback) {
     return null;
   }
-  const normalized = fallback.trim();
-  return normalized ? normalized : null;
+  return fallback.trim() ? fallback : null;
 }
 
 function normalizeSimulatedResponseOutputItems(
@@ -4429,12 +4432,11 @@ function normalizeSimulatedResponseOutputItems(
 
   for (const item of outputItems) {
     if (typeof item === "string") {
-      const text = item.trim();
-      if (!text) {
+      if (!item.trim()) {
         continue;
       }
       normalized.push(
-        buildMessageOutputItem(createOpenAiOutputItemId("msg"), text, "completed"),
+        buildMessageOutputItem(createOpenAiOutputItemId("msg"), item, "completed"),
       );
       continue;
     }
@@ -4450,8 +4452,8 @@ function normalizeSimulatedResponseOutputItems(
       continue;
     }
 
-    const text = extractMessageOutputText(item).trim();
-    if (!text) {
+    const text = extractMessageOutputText(item);
+    if (!text.trim()) {
       normalized.push(item);
       continue;
     }
@@ -4524,7 +4526,12 @@ function normalizeSimulatedResponsesFunctionCallItem(
       itemId,
     name,
     ...(isCustom
-      ? { input: tryGetString(item, "input") ?? tryGetString(item, "arguments") ?? "" }
+      ? {
+          input:
+            tryGetRawString(item, "input") ??
+            tryGetRawString(item, "arguments") ??
+            "",
+        }
       : {
           arguments: normalizeSimulatedToolArguments(
             firstDefined(
@@ -4552,8 +4559,8 @@ function extractTextFromSimulatedChoices(payload: JsonObject): string | null {
     if (!isJsonObject(messageNode)) {
       continue;
     }
-    const text = extractMessageOutputText(messageNode).trim();
-    if (text) {
+    const text = extractMessageOutputText(messageNode);
+    if (text.trim()) {
       return text;
     }
   }
@@ -4569,11 +4576,13 @@ function extractMessageOutputText(outputItem: JsonObject): string {
 
   if (type === "output_text" || type === "text") {
     return (
-      tryGetString(outputItem, "text") ?? tryGetString(outputItem, "output_text") ?? ""
+      tryGetRawString(outputItem, "text") ??
+      tryGetRawString(outputItem, "output_text") ??
+      ""
     );
   }
 
-  const directText = tryGetString(outputItem, "output_text");
+  const directText = tryGetRawString(outputItem, "output_text");
   if (directText) {
     return directText;
   }
@@ -4584,7 +4593,7 @@ function extractMessageOutputText(outputItem: JsonObject): string {
   }
 
   if (!Array.isArray(content)) {
-    return tryGetString(outputItem, "text") ?? "";
+    return tryGetRawString(outputItem, "text") ?? "";
   }
 
   const textParts: string[] = [];
@@ -4602,7 +4611,9 @@ function extractMessageOutputText(outputItem: JsonObject): string {
     if (partType && partType !== "output_text" && partType !== "text") {
       continue;
     }
-    const text = tryGetString(part, "text") ?? tryGetString(part, "output_text");
+    const text =
+      tryGetRawString(part, "text") ??
+      tryGetRawString(part, "output_text");
     if (text) {
       textParts.push(text);
     }

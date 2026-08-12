@@ -21,6 +21,7 @@ import {
   parseBooleanString,
   tryGetBoolean,
   tryGetDouble,
+  tryGetRawString,
   tryGetString,
   isJsonObject,
   cloneJsonValue,
@@ -265,7 +266,7 @@ export function tryParseOpenAiRequest(
     if (!content.trim() && !hasImage) {
       continue;
     }
-    messages.push({ role, content: content.trim(), index, hasImage });
+    messages.push({ role, content, index, hasImage });
   }
 
   if (messages.length === 0) {
@@ -367,7 +368,7 @@ export function tryParseResponsesRequest(
         previousResponseId,
         protocolIdentity,
         inputItemsForStorage: normalizedInput.inputItemsForStorage,
-        instructions: tryGetString(requestJson, "instructions"),
+        instructions: tryGetRawString(requestJson, "instructions"),
         store,
         rawRequest: cloneJsonValue(requestJson),
         contextWindowId,
@@ -402,8 +403,8 @@ export function tryParseResponsesRequest(
     }
   }
 
-  const instructions = tryGetString(requestJson, "instructions");
-  if (instructions && !tryGetString(normalized, "m365_system_prompt")) {
+  const instructions = tryGetRawString(requestJson, "instructions");
+  if (instructions && !tryGetRawString(normalized, "m365_system_prompt")) {
     normalized.m365_system_prompt = instructions;
   }
 
@@ -950,12 +951,12 @@ function normalizeResponsesInput(inputNode: JsonValue | undefined): {
 } {
   if (typeof inputNode === "string" && inputNode.trim()) {
     return {
-      messages: [{ role: "user", content: inputNode.trim() }],
+      messages: [{ role: "user", content: inputNode }],
       inputItemsForStorage: [
         {
           type: "message",
           role: "user",
-          content: [{ type: "input_text", text: inputNode.trim() }],
+          content: [{ type: "input_text", text: inputNode }],
         },
       ],
     };
@@ -974,11 +975,11 @@ function normalizeResponsesInput(inputNode: JsonValue | undefined): {
       if (!item.trim()) {
         continue;
       }
-      messages.push({ role: "user", content: item.trim() });
+      messages.push({ role: "user", content: item });
       inputItemsForStorage.push({
         type: "message",
         role: "user",
-        content: [{ type: "input_text", text: item.trim() }],
+        content: [{ type: "input_text", text: item }],
       });
       continue;
     }
@@ -996,9 +997,9 @@ function normalizeResponsesInput(inputNode: JsonValue | undefined): {
         message.content = cloneJsonValue(item.content);
       } else {
         const text =
-          tryGetString(item, "text") ??
-          tryGetString(item, "input_text") ??
-          tryGetString(item, "output_text");
+          tryGetRawString(item, "text") ??
+          tryGetRawString(item, "input_text") ??
+          tryGetRawString(item, "output_text");
         if (text) {
           message.content = text;
         }
@@ -1031,7 +1032,7 @@ function normalizeResponsesInput(inputNode: JsonValue | undefined): {
         continue;
       }
       const functionArguments = type === "custom_tool_call"
-        ? (tryGetString(item, "input") ?? "")
+        ? stringifyCustomToolInput(item.input ?? item.arguments)
         : (normalizeFunctionArguments(item.arguments) ?? "{}");
       const toolCall: JsonObject = {
         id:
@@ -1105,14 +1106,23 @@ function mapResponsesReasoningEffort(requestJson: JsonObject): string | null {
 
 function stringifyJsonValue(value: JsonValue | undefined): string {
   if (typeof value === "string") {
-    const normalized = normalizeJsonLikeString(value);
-    return normalized ?? value;
+    return value;
   }
   if (value === undefined || value === null) {
     return "";
   }
   if (typeof value === "number" || typeof value === "boolean") {
     return String(value);
+  }
+  return JSON.stringify(value);
+}
+
+function stringifyCustomToolInput(value: JsonValue | undefined): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value === undefined || value === null) {
+    return "";
   }
   return JSON.stringify(value);
 }
@@ -1137,17 +1147,13 @@ function extractMessageContent(contentNode: JsonValue | undefined): string {
     return "";
   }
   if (typeof contentNode === "string") {
-    const normalized = normalizeJsonLikeString(contentNode);
-    return normalized ?? contentNode;
+    return contentNode;
   }
   if (isJsonObject(contentNode)) {
     const directText =
-      tryGetString(contentNode, "text") ?? tryGetString(contentNode, "value");
-    if (directText) {
-      const normalized = normalizeJsonLikeString(directText);
-      return normalized ?? directText;
-    }
-    return "";
+      tryGetRawString(contentNode, "text") ??
+      tryGetRawString(contentNode, "value");
+    return directText ?? "";
   }
 
   if (!Array.isArray(contentNode)) {
@@ -1157,8 +1163,7 @@ function extractMessageContent(contentNode: JsonValue | undefined): string {
   const textParts: string[] = [];
   for (const part of contentNode) {
     if (typeof part === "string" && part.trim()) {
-      const normalized = normalizeJsonLikeString(part.trim());
-      textParts.push(normalized ?? part.trim());
+      textParts.push(part);
       continue;
     }
     if (!isJsonObject(part)) {
@@ -1171,14 +1176,13 @@ function extractMessageContent(contentNode: JsonValue | undefined): string {
       type.toLowerCase() === "input_text";
 
     if (isTextPart) {
-      let partText = tryGetString(part, "text");
+      let partText = tryGetRawString(part, "text");
       const nestedText = part.text;
       if (!partText && isJsonObject(nestedText)) {
-        partText = tryGetString(nestedText, "value");
+        partText = tryGetRawString(nestedText, "value");
       }
-      if (partText) {
-        const normalized = normalizeJsonLikeString(partText.trim());
-        textParts.push(normalized ?? partText.trim());
+      if (partText?.trim()) {
+        textParts.push(partText);
         continue;
       }
     }
@@ -1187,7 +1191,7 @@ function extractMessageContent(contentNode: JsonValue | undefined): string {
   // Images from historical/context messages are intentionally dropped here:
   // only the current user turn is uploaded and annotated, so history must not
   // pretend that an image remains available to the model.
-  return textParts.join("\n");
+  return textParts.join("");
 }
 
 function tryExtractAssistantToolCalls(
@@ -1312,9 +1316,7 @@ function extractToolCallsFromResponsesOutputNode(node: JsonObject): JsonObject[]
         function: {
           name,
           arguments:
-            normalizeFunctionArguments(item.input) ??
-            normalizeFunctionArguments(item.arguments) ??
-            "{}",
+            stringifyCustomToolInput(item.input ?? item.arguments),
         },
       });
     } else {
@@ -1496,7 +1498,7 @@ function buildAdditionalContext(
 
   appendCustomContext(context, requestJson.m365_additional_context);
 
-  const systemPrompt = tryGetString(requestJson, "m365_system_prompt");
+  const systemPrompt = tryGetRawString(requestJson, "m365_system_prompt");
   if (systemPrompt) {
     context.push({ text: systemPrompt, description: "System prompt override" });
   }
@@ -1523,7 +1525,7 @@ function appendCustomContext(
     return;
   }
   if (typeof customNode === "string" && customNode.trim()) {
-    context.push({ text: customNode.trim(), description: null });
+    context.push({ text: customNode, description: null });
     return;
   }
   if (isJsonObject(customNode)) {
@@ -1535,7 +1537,7 @@ function appendCustomContext(
   }
   for (const item of customNode) {
     if (typeof item === "string" && item.trim()) {
-      context.push({ text: item.trim(), description: null });
+      context.push({ text: item, description: null });
       continue;
     }
     if (isJsonObject(item)) {
@@ -1549,13 +1551,13 @@ function appendCustomContextObject(
   contextObject: JsonObject,
 ): void {
   const text =
-    tryGetString(contextObject, "text") ??
-    tryGetString(contextObject, "content");
+    tryGetRawString(contextObject, "text") ??
+    tryGetRawString(contextObject, "content");
   if (!text) {
     return;
   }
   context.push({
-    text: text.trim(),
+    text,
     description: tryGetString(contextObject, "description"),
   });
 }
@@ -1651,14 +1653,6 @@ function appendOpenAiCompatibilityContext(
       description: "Generation hint",
     });
   }
-}
-
-function normalizeJsonLikeString(rawText: string): string | null {
-  const parsed = tryParseJsonValueFromText(rawText);
-  if (parsed === null) {
-    return null;
-  }
-  return JSON.stringify(parsed);
 }
 
 function tryParseJsonValueFromText(rawText: string): JsonValue | null {

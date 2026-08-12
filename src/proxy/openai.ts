@@ -16,6 +16,7 @@ import {
   computeTrailingDelta,
   isJsonObject,
   nowUnix,
+  tryGetRawString,
   tryParseJsonObject,
 } from "./utils";
 
@@ -1006,21 +1007,21 @@ function normalizeMessageContent(contentNode: JsonValue | undefined): string {
   const textParts: string[] = [];
   for (const item of contentNode) {
     if (typeof item === "string" && item.trim()) {
-      textParts.push(item.trim());
+      textParts.push(item);
       continue;
     }
     if (!isJsonObject(item)) {
       continue;
     }
     const type = (pickString(item.type) ?? "").toLowerCase();
-    if (
-      (type === "" || type === "text" || type === "output_text") &&
-      pickString(item.text)
-    ) {
-      textParts.push(pickString(item.text) ?? "");
+    if (type === "" || type === "text" || type === "output_text") {
+      const text = tryGetRawString(item, "text");
+      if (text?.trim()) {
+        textParts.push(text);
+      }
     }
   }
-  return textParts.join("\n");
+  return textParts.join("");
 }
 
 function tryExtractJsonNode(rawText: string): JsonValue | null {

@@ -70,6 +70,66 @@ describe("Responses custom tool support", () => {
       ToolChoiceModes.Auto,
     );
   });
+
+  test("preserves mapped Responses instructions and input bytes", () => {
+    const input = "  Keep this input exactly.  ";
+    const instructions = "  Keep these instructions exactly.  ";
+    const parsed = tryParseResponsesRequest(
+      { model: "gpt-5.6-sol", input, instructions },
+      mappedOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.base.promptText).toBe(input);
+    expect(parsed.request.instructions).toBe(instructions);
+  });
+});
+
+describe("mapped OpenAI text fidelity", () => {
+  test("does not replace a user request with its embedded JSON object", () => {
+    const content = [
+      "Please preserve this formatted example:",
+      "{",
+      '  "enabled": true',
+      "}",
+      "Then explain it.",
+    ].join("\n");
+    const parsed = tryParseOpenAiRequest(
+      {
+        model: "gpt-5.6-sol",
+        messages: [{ role: "user", content }],
+      },
+      mappedOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.promptText).toBe(content);
+  });
+
+  test("concatenates text parts without deleting or inventing separators", () => {
+    const parsed = tryParseOpenAiRequest(
+      {
+        model: "gpt-5.6-sol",
+        messages: [{
+          role: "user",
+          content: [
+            { type: "text", text: "  Repository" },
+            { type: "text", text: " reconnaissance " },
+            { type: "text", text: "is reconciled.  " },
+          ],
+        }],
+      },
+      mappedOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.promptText).toBe(
+      "  Repository reconnaissance is reconciled.  ",
+    );
+  });
 });
 
 describe("Responses tool call extraction from assistant history", () => {

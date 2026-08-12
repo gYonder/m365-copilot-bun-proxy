@@ -1310,6 +1310,53 @@ describe("simulated transform mode proxy flow", () => {
     expect(body.output_text).toBe("hello from role/content item");
   });
 
+  test("responses non-stream preserves whitespace across output text parts", async () => {
+    const simulatedResponse: JsonObject = {
+      id: "resp_simulated_text_parts",
+      object: "response",
+      status: "completed",
+      output: [{
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: "Repository" },
+          { type: "output_text", text: " reconnaissance " },
+          { type: "output_text", text: "is reconciled." },
+        ],
+      }],
+    };
+    const app = createProxyApp(
+      createServices((conversationId, payload) =>
+        buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson(simulatedResponse),
+        ),
+      ),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Report status.",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as JsonObject;
+    expect(body.output_text).toBe(
+      "Repository reconnaissance is reconciled.",
+    );
+  });
+
   test("responses non-stream accepts outputs alias with nested function_call payloads", async () => {
     const simulatedResponse: JsonObject = {
       id: "response-002",
@@ -2130,6 +2177,8 @@ describe("simulated transform mode proxy flow", () => {
   });
 
   test("streams the full custom tool-call input lifecycle in order with a stable item id", async () => {
+    const expectedPatch =
+      "\n*** Begin Patch\n*** Update File: probe.txt\n@@\n-hello\n+world\n*** End Patch\n";
     const app = createProxyApp(
       createServices((conversationId, payload) =>
         buildGraphChatResult(
@@ -2147,7 +2196,7 @@ describe("simulated transform mode proxy flow", () => {
                 status: "completed",
                 call_id: "call_stream_patch",
                 name: "apply_patch",
-                input: "*** Begin Patch\n*** Update File: probe.txt\n@@\n-hello\n+world\n*** End Patch",
+                input: expectedPatch,
               },
             ],
           }),
@@ -2231,11 +2280,11 @@ describe("simulated transform mode proxy flow", () => {
       }
       if (type === "response.custom_tool_call_input.delta") {
         deltaItemId = tryGetString(parsed, "item_id");
-        deltaText = tryGetString(parsed, "delta");
+        deltaText = typeof parsed.delta === "string" ? parsed.delta : null;
       }
       if (type === "response.custom_tool_call_input.done") {
         doneItemId = tryGetString(parsed, "item_id");
-        doneInput = tryGetString(parsed, "input");
+        doneInput = typeof parsed.input === "string" ? parsed.input : null;
       }
       if (type === "response.output_item.done") {
         const item = isJsonObject(parsed.item) ? (parsed.item as JsonObject) : null;
@@ -2280,8 +2329,6 @@ describe("simulated transform mode proxy flow", () => {
     expect(itemDoneId).toBe(addedItemId);
 
     // Freeform patch bytes are preserved verbatim through delta and done.
-    const expectedPatch =
-      "*** Begin Patch\n*** Update File: probe.txt\n@@\n-hello\n+world\n*** End Patch";
     expect(deltaText).toBe(expectedPatch);
     expect(doneInput).toBe(expectedPatch);
 
@@ -2291,6 +2338,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(output[0]?.type).toBe("custom_tool_call");
     expect(tryGetString(output[0], "call_id")).toBe("call_stream_patch");
     expect(tryGetString(output[0], "name")).toBe("apply_patch");
+    expect(output[0]?.input).toBe(expectedPatch);
   });
 
 
