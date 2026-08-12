@@ -160,6 +160,17 @@ export function tryGetString(
   return value.trim() ? value.trim() : null;
 }
 
+export function tryGetRawString(
+  json: JsonObject | null | undefined,
+  propertyName: string,
+): string | null {
+  if (!json || !(propertyName in json)) {
+    return null;
+  }
+  const value = json[propertyName];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
 export function tryGetBoolean(
   json: JsonObject | null | undefined,
   propertyName: string,

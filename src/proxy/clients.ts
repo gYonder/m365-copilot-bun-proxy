@@ -20,6 +20,7 @@ import {
   computeTrailingDelta,
   extractBearerToken,
   isJsonObject,
+  tryGetRawString,
   tryGetString,
   tryParseJsonObject,
   tryReadJwtPayload,
@@ -2135,9 +2136,9 @@ function extractSubstrateAssistantText(envelope: JsonObject): string | null {
     }
 
     const text =
-      tryGetString(message, "text") ??
-      tryGetString(message, "hiddenText") ??
-      tryGetString(message, "spokenText");
+      tryGetRawString(message, "text") ??
+      tryGetRawString(message, "hiddenText") ??
+      tryGetRawString(message, "spokenText");
     if (text) {
       fallback = text;
     }
@@ -2174,7 +2175,7 @@ function extractSubstrateDeltaText(envelope: JsonObject): string | null {
     if (!isJsonObject(arg)) {
       continue;
     }
-    const delta = tryGetString(arg, "writeAtCursor");
+    const delta = tryGetRawString(arg, "writeAtCursor");
     if (delta) {
       return delta;
     }

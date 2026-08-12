@@ -827,6 +827,61 @@ describe("Substrate client lifecycle hardening", () => {
     expect(deltas.join("")).toBe("once");
   });
 
+  test("preserves whitespace at streamed Substrate chunk boundaries", async () => {
+    const first = JSON.stringify({
+      type: 1,
+      target: "update",
+      arguments: [{ writeAtCursor: "Repository" }],
+    }) + "\u001e";
+    const second = JSON.stringify({
+      type: 1,
+      target: "update",
+      arguments: [{ writeAtCursor: " reconnaissance " }],
+    }) + "\u001e";
+    const third = JSON.stringify({
+      type: 1,
+      target: "update",
+      arguments: [{
+        writeAtCursor: "is reconciled.",
+        messages: [{
+          author: "bot",
+          messageType: "Chat",
+          messageId: "message-whitespace",
+          text: "Repository reconnaissance is reconciled.",
+        }],
+      }],
+    }) + "\u001e";
+    const { connect, createReceiver } = makeFrameTransport([
+      "{}",
+      first,
+      second,
+      third,
+      JSON.stringify({ type: 3, invocationId: "0" }) + "\u001e",
+    ]);
+    const deltas: string[] = [];
+    const client = new CopilotSubstrateClient(
+      createOptions(),
+      stubLogger,
+      undefined,
+      connect,
+      createReceiver,
+    );
+
+    const result = await client.chat(
+      makeJwtAuthHeader(),
+      "conv-whitespace",
+      makeRequest(),
+      true,
+      async (updateEvent) => {
+        if (updateEvent.deltaText) deltas.push(updateEvent.deltaText);
+      },
+    );
+
+    expect(result.isSuccess).toBeTrue();
+    expect(result.assistantText).toBe("Repository reconnaissance is reconciled.");
+    expect(deltas.join("")).toBe("Repository reconnaissance is reconciled.");
+  });
+
   test("rejects partial output followed by a type-7 terminal error", async () => {
     const { connect, createReceiver } = makeFrameTransport([
       "{}",

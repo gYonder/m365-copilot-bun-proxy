@@ -1,7 +1,14 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { JsonObject, LogLevel, WrapperOptions } from "./types";
-import { isJsonObject, tryGetInt, tryGetString, tryParseJsonObject, tryPrettyJson } from "./utils";
+import {
+  isJsonObject,
+  tryGetInt,
+  tryGetRawString,
+  tryGetString,
+  tryParseJsonObject,
+  tryPrettyJson,
+} from "./utils";
 
 const LogLevelPriority: Record<LogLevel, number> = {
   error: 0,
@@ -621,9 +628,9 @@ function extractBotMessage(
       continue;
     }
     const text =
-      tryGetString(message, "text") ??
-      tryGetString(message, "hiddenText") ??
-      tryGetString(message, "spokenText");
+      tryGetRawString(message, "text") ??
+      tryGetRawString(message, "hiddenText") ??
+      tryGetRawString(message, "spokenText");
     if (!text) {
       continue;
     }
@@ -643,7 +650,7 @@ function extractWriteAtCursor(json: JsonObject): string | null {
     if (!isJsonObject(arg)) {
       continue;
     }
-    const delta = tryGetString(arg, "writeAtCursor");
+    const delta = tryGetRawString(arg, "writeAtCursor");
     if (delta) {
       return delta;
     }
