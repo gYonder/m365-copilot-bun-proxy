@@ -352,7 +352,9 @@ describe("conversation reuse", () => {
       }
       expect(firstText).toContain('"delta":"reply-1"');
       firstAbort.abort();
-      await firstReader?.cancel();
+      // Aborting the fetch already rejected the stream; Bun 1.4 surfaces that
+      // through cancel() as an AbortError. Teardown best-effort.
+      await firstReader?.cancel().catch(() => undefined);
 
       const retryPromise = fetch(`http://localhost:${server.port}/v1/responses`, {
         method: "POST",
