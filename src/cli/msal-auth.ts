@@ -273,6 +273,59 @@ export async function acquireDesignerToken(
   }
 }
 
+const MSAL_CACHE_LOCK_RETRY_MS = 100;
+const MSAL_CACHE_LOCK_TIMEOUT_MS = 8_000;
+const MSAL_CACHE_LOCK_STALE_MS = 30_000;
+
+/**
+ * Serializes silent refresh-token redemptions across processes. Entra rotates
+ * refresh tokens single-use on every redemption, and the CLI token login/fetch
+ * process plus the long-running proxy share one MSAL cache file: concurrent
+ * redemptions invalidate the loser's refresh token and auth stays broken until
+ * an interactive sign-in. Best-effort advisory lock; on timeout the operation
+ * proceeds unlocked rather than blocking authentication entirely.
+ */
+export async function withMsalCacheLock<T>(
+  cachePath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const lockPath = `${cachePath}.lock`;
+  const deadline = Date.now() + MSAL_CACHE_LOCK_TIMEOUT_MS;
+  let acquired = false;
+  while (!acquired) {
+    try {
+      const handle = await fs.open(lockPath, "wx");
+      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`);
+      await handle.close();
+      acquired = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "EEXIST") throw error;
+      const lockAgeMs = await fs
+        .stat(lockPath)
+        .then((stats) => Date.now() - stats.mtimeMs, () => 0);
+      if (lockAgeMs > MSAL_CACHE_LOCK_STALE_MS) {
+        // Atomic steal: rename succeeds for exactly one contender, so a stale
+        // lock left by a crashed owner is reclaimed without a thundering herd.
+        const stolenPath = `${lockPath}.${process.pid}.stale`;
+        await fs
+          .rename(lockPath, stolenPath)
+          .then(() => fs.rm(stolenPath, { force: true }))
+          .catch(() => undefined);
+        continue;
+      }
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve) => setTimeout(resolve, MSAL_CACHE_LOCK_RETRY_MS));
+    }
+  }
+  try {
+    return await operation();
+  } finally {
+    if (acquired) {
+      await fs.rm(lockPath, { force: true }).catch(() => undefined);
+    }
+  }
+}
+
 /**
  * Acquires a Substrate access token through MSAL. Prefers a silent
  * refresh-token exchange from the persisted cache (no browser); only when that
@@ -301,14 +354,6 @@ export async function acquireSubstrateTokenDetailed(
     return { token: null, status: "cache_unavailable" };
   }
   const { app, manualCache } = created;
-  if (manualCache && (await fileExists(cachePath))) {
-    try {
-      await fs.chmod(cachePath, 0o600);
-      app.getTokenCache().deserialize(await fs.readFile(cachePath, "utf8"));
-    } catch {
-      // Corrupt cache; a fresh interactive flow will reseed it.
-    }
-  }
 
   const persistCache = async (): Promise<boolean> => {
     if (!manualCache) return true;
@@ -320,13 +365,30 @@ export async function acquireSubstrateTokenDetailed(
     }
   };
 
-  const silent = await acquireSilently(app, priorToken, options.quiet);
-  if (silent) {
+  // The silent path reads the shared cache, redeems the single-use refresh
+  // token, and writes the rotated state back. That sequence must not interleave
+  // with another process doing the same thing.
+  const attemptSilent = async (): Promise<MsalAcquireResult | null> => {
+    if (manualCache && (await fileExists(cachePath))) {
+      try {
+        await fs.chmod(cachePath, 0o600);
+        app.getTokenCache().deserialize(await fs.readFile(cachePath, "utf8"));
+      } catch {
+        // Corrupt cache; a fresh interactive flow will reseed it.
+      }
+    }
+    const silent = await acquireSilently(app, priorToken, options.quiet);
+    if (!silent) return null;
     if (!(await persistCache())) return { token: null, status: "cache_unavailable" };
     return isValidSubstrateToken(silent, priorToken?.tid)
       ? { token: silent, status: "silent_success" }
       : { token: null, status: "invalid_token" };
-  }
+  };
+
+  const silentResult = manualCache
+    ? await withMsalCacheLock(cachePath, attemptSilent)
+    : await attemptSilent();
+  if (silentResult) return silentResult;
 
   if (options.allowInteractive !== false) {
     const interactive = await acquireInteractively(app, options);

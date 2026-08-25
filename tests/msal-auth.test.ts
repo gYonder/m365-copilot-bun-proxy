@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  rmSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { acquireSubstrateToken } from "../src/cli/msal-auth";
+import { acquireSubstrateToken, withMsalCacheLock } from "../src/cli/msal-auth";
 import { saveToken } from "../src/cli/token-helpers";
 
 const future = () => Math.floor(Date.now() / 1000) + 3_600;
@@ -181,6 +188,72 @@ describe("MSAL token acquisition", () => {
         allowInteractive: false, quiet: true,
         appFactory: () => fake.app as never,
       })).toBeNull();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("MSAL cache lock", () => {
+  test("serializes concurrent operations so redemptions never interleave", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "m365-msal-lock-"));
+    try {
+      const cachePath = path.join(directory, "msal-cache.json");
+      let inFlight = 0;
+      let maxInFlight = 0;
+      await Promise.all(
+        Array.from({ length: 6 }, () =>
+          withMsalCacheLock(cachePath, async () => {
+            inFlight += 1;
+            maxInFlight = Math.max(maxInFlight, inFlight);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            inFlight -= 1;
+          }),
+        ),
+      );
+      expect(maxInFlight).toBe(1);
+      expect(() => statSync(`${cachePath}.lock`)).toThrow();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("steals a stale lock left by a crashed owner", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "m365-msal-lock-"));
+    try {
+      const cachePath = path.join(directory, "msal-cache.json");
+      const lockPath = `${cachePath}.lock`;
+      writeFileSync(lockPath, "999999 dead\n");
+      const stale = new Date(Date.now() - 60_000);
+      utimesSync(lockPath, stale, stale);
+      let ran = false;
+      await withMsalCacheLock(cachePath, async () => {
+        ran = true;
+      });
+      expect(ran).toBe(true);
+      expect(() => statSync(lockPath)).toThrow();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("releases the lock when the operation throws", async () => {
+    const directory = mkdtempSync(path.join(tmpdir(), "m365-msal-lock-"));
+    try {
+      const cachePath = path.join(directory, "msal-cache.json");
+      const lockPath = `${cachePath}.lock`;
+      await expect(
+        withMsalCacheLock(cachePath, async () => {
+          throw new Error("redemption failed");
+        }),
+      ).rejects.toThrow("redemption failed");
+      expect(() => statSync(lockPath)).toThrow();
+      // A following operation must not be blocked by the released lock.
+      let ran = false;
+      await withMsalCacheLock(cachePath, async () => {
+        ran = true;
+      });
+      expect(ran).toBe(true);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
