@@ -348,6 +348,26 @@ describe("classifyToolAttempt", () => {
     });
   });
 
+  test.each([
+    {
+      label: "fenced",
+      text: "```json\n{\n  \"id\": \"resp_retry1\",\n  \"object\": \"response\",\n  \"status\": \"in_progress\",\n  \"model\": \"gpt-5.6-sol\",\n  \"output\": const applied = await tools.apply_patch(patch); text(applied);\n}\n```",
+    },
+    {
+      label: "unfenced",
+      text: "{\"id\":\"resp_retry2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5.6-sol\",\"output\":const result = await tools.exec_command({cmd:\"pwd\"});text(JSON.stringify(result));}",
+    },
+  ])(
+    "classifies a $label malformed Responses wrapper containing local tool code as an invalid attempt",
+    ({ text }) => {
+      expect(tryExtractSimulatedResponsePayload(text, "responses")).toBeNull();
+      expect(classifyToolAttempt(text, createTooling("exec"))).toEqual({
+        kind: "invalid_attempt",
+        reason: "malformed_simulated_response_envelope",
+      });
+    },
+  );
+
   test("classifies a matching tool call envelope as valid", () => {
     const validEnvelope = JSON.stringify({
       type: "function_call",

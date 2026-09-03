@@ -3236,6 +3236,100 @@ describe("simulated transform mode proxy flow", () => {
     expect(tryGetString(output[0], "input")).toContain("tools.exec_command");
   });
 
+  test.each([
+    {
+      label: "fenced",
+      malformed: "```json\n{\n  \"id\": \"resp_retry1\",\n  \"object\": \"response\",\n  \"status\": \"in_progress\",\n  \"model\": \"gpt-5.6-sol\",\n  \"output\": const applied = await tools.apply_patch(patch); text(applied);\n}\n```",
+    },
+    {
+      label: "unfenced",
+      malformed: "{\"id\":\"resp_retry2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5.6-sol\",\"output\":const result = await tools.exec_command({cmd:\"pwd\"});text(JSON.stringify(result));}",
+    },
+  ])("responses repairs a $label malformed in-progress Responses wrapper", async ({ malformed }) => {
+    const capturedPrompts: string[] = [];
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        capturedPrompts.push(readPrompt(payload));
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          callCount === 1
+            ? malformed
+            : toMarkdownJson({
+                id: "resp_repaired_wrapper",
+                object: "response",
+                status: "completed",
+                output: [{
+                  type: "custom_tool_call",
+                  call_id: "call_repaired_wrapper",
+                  name: "exec",
+                  input: 'const result = await tools.exec_command({cmd:"pwd"}); text(result);',
+                }],
+              }),
+        );
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Use the local shell to run pwd.",
+          tools: [{
+            type: "custom",
+            name: "exec",
+            description: "Execute a tool expression.",
+            format: { type: "grammar", syntax: "lark", definition: "start: /[\\s\\S]+/" },
+          }],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(2);
+    expect(capturedPrompts[1]).toContain("PROTOCOL RETRY 1:");
+    const body = (await response.json()) as JsonObject;
+    const output = Array.isArray(body.output) ? body.output : [];
+    expect(output[0]).toMatchObject({
+      type: "custom_tool_call",
+      call_id: "call_repaired_wrapper",
+      name: "exec",
+    });
+  });
+
+  test("responses rejects a repeated malformed in-progress wrapper after one correction", async () => {
+    const malformed = "{\"id\":\"resp_retry_exhausted\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":const result = await tools.exec_command({cmd:\"pwd\"});text(result);}";
+    let callCount = 0;
+    const app = createProxyApp(createServices((conversationId, payload) => {
+      callCount += 1;
+      return buildGraphChatResult(conversationId, payload, malformed);
+    }));
+    const response = await app.fetch(new Request("http://localhost/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-m365-transport": TransportNames.Graph },
+      body: JSON.stringify({
+        model: "m365-copilot",
+        stream: false,
+        input: "Use the local shell to run pwd.",
+        tools: [{ type: "custom", name: "exec", description: "Execute a tool expression.", format: { type: "grammar", syntax: "lark" } }],
+        tool_choice: "auto",
+      }),
+    }));
+    expect(callCount).toBe(2);
+    expect(response.status).toBe(502);
+    const body = (await response.json()) as JsonObject;
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
+  });
+
   test("responses resumes a preceding leaked tool envelope on explicit request", async () => {
     const malformedEnvelope = `{
       "object": "response",

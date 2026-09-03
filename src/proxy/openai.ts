@@ -572,7 +572,31 @@ export function classifyToolAttempt(
   if (looksLikeMalformedToolCallEnvelope(assistantText)) {
     return { kind: "invalid_attempt", reason: "malformed_tool_call_envelope" };
   }
+  if (looksLikeMalformedSimulatedResponseEnvelope(assistantText)) {
+    return {
+      kind: "invalid_attempt",
+      reason: "malformed_simulated_response_envelope",
+    };
+  }
   return { kind: "none" };
+}
+
+function looksLikeMalformedSimulatedResponseEnvelope(
+  assistantText: string,
+): boolean {
+  const looksLikeResponsesWrapper =
+    /"object"\s*:\s*"response"/i.test(assistantText) &&
+    /"status"\s*:\s*"in_progress"/i.test(assistantText) &&
+    /"output"\s*:/i.test(assistantText);
+  if (!looksLikeResponsesWrapper) {
+    return false;
+  }
+
+  return (
+    /tools\.(?:apply_patch|exec_command)\s*\(/i.test(assistantText) ||
+    /await\s+tools\.[A-Za-z_][A-Za-z0-9_]*\s*\(/i.test(assistantText) ||
+    /text\s*\(\s*(?:JSON\.stringify\s*\()?/i.test(assistantText)
+  );
 }
 
 function looksLikeMalformedToolCallEnvelope(assistantText: string): boolean {
