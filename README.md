@@ -252,12 +252,23 @@ Example tool-call response shape:
 
 Strictness behavior:
 
-- If `tool_choice` is `required` or a specific `function`, the proxy returns `400 invalid_tool_output` when no valid tool-call JSON can be extracted from assistant output.
-- If `tool_choice` is `auto` (or tools are not strictly required), the proxy falls back to a normal assistant text completion when tool-call JSON is not found.
+- Simulated mode accepts only a complete, endpoint-correct JSON envelope. This
+  applies to final assistant messages as well as function and custom-tool calls;
+  arbitrary unwrapped text is never converted into a successful response.
+- A malformed or invalid envelope receives one bounded protocol-correction turn.
+  When safe and within the prompt budget, the rejected candidate is supplied as
+  escaped data so the model can repair its serialization instead of regenerating
+  the response independently. A second rejection becomes a structured
+  `provider_drift` failure.
+- Tool choice, offered name and namespace, function/custom kind, argument schema,
+  call IDs, and parallel-call policy are validated before any output is emitted.
+  Mixed valid/invalid call batches are rejected atomically.
 
 Input normalization notes:
 
-- JSON-stringified `message.content`, tool payloads, and function arguments are parsed best-effort and re-serialized to canonical minified JSON when valid.
+- Validated function argument and custom-tool input bytes are preserved for
+  downstream delivery; malformed input is rejected rather than repaired or
+  evaluated.
 - Assistant message content containing serialized `tool_calls` structures is preserved as tool-call context for downstream Copilot prompt construction.
 
 ## Responses API usage

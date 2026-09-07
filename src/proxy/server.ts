@@ -2763,6 +2763,7 @@ function buildSimulatedProtocolRetryRequest(
   request: ParsedOpenAiRequest,
   attempt: number,
   rejectedReason: string,
+  rejectedAssistantText: string,
   maxChars = 0,
 ): ParsedOpenAiRequest {
   return {
@@ -2772,6 +2773,7 @@ function buildSimulatedProtocolRetryRequest(
       attempt,
       rejectedReason,
       maxChars,
+      rejectedAssistantText,
     ),
   };
 }
@@ -2879,6 +2881,7 @@ async function resolveSimulatedOutput(
     request,
     1,
     firstRejection.reason,
+    firstText,
     maxPromptChars,
   );
   const retryResult = await executeRetry(retryConversationId, retryRequest);
@@ -2964,7 +2967,7 @@ function recordSimulatedCorrection(
     rejectionReason: rejection.reason,
     offeredToolCount: request.tooling.tools.length,
     assistantTextSize,
-    promptSize: request.promptText.length,
+    requestChars: request.promptText.length,
   });
 }
 

@@ -347,6 +347,7 @@ describe("simulated transform mode proxy flow", () => {
       1,
       "duplicate_call_id",
       options.substrate.maxSendChars,
+      '{"object":"response","status":"completed","output":[]}',
     );
     expect(initial.length).toBeLessThanOrEqual(
       options.substrate.maxSendChars - SIMULATED_CORRECTION_RESERVE_CHARS,
@@ -359,6 +360,28 @@ describe("simulated transform mode proxy flow", () => {
     );
     expect(fenced).not.toBeNull();
     expect(JSON.parse(fenced?.[1] ?? "")).toBeObject();
+    expect(correction).toEndWith(
+      "follow the strict output contract above.",
+    );
+    expect(correction).not.toContain("REJECTED CANDIDATE JSON STRING:");
+  });
+
+  test("includes a bounded malformed candidate in the correction prompt", () => {
+    const malformed = `{"object":"response","status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"${"updated\n".repeat(1_700)}"}]}]}`;
+    const correction = appendSimulatedProtocolCorrection(
+      "ORIGINAL REQUEST\nSTRICT OUTPUT CONTRACT:",
+      1,
+      "malformed_json",
+      100_000,
+      malformed,
+    );
+
+    expect(malformed.length).toBeGreaterThan(10_000);
+    expect(correction).toContain("REJECTED CANDIDATE JSON STRING:");
+    expect(correction).toContain(JSON.stringify(malformed));
+    expect(correction).toContain(
+      "Repair the candidate's JSON serialization instead of independently regenerating the response.",
+    );
     expect(correction).toEndWith(
       "follow the strict output contract above.",
     );
@@ -3580,6 +3603,9 @@ describe("simulated transform mode proxy flow", () => {
       "STRICT OUTPUT CONTRACT:",
     );
     expect(capturedPrompt).toContain(
+      "escape line breaks, quotes, backslashes, and control characters",
+    );
+    expect(capturedPrompt).toContain(
       '"type":"function_call","status":"completed"',
     );
     expect(capturedPrompt.lastIndexOf("STRICT OUTPUT CONTRACT")).toBeGreaterThan(
@@ -3745,6 +3771,9 @@ describe("simulated transform mode proxy flow", () => {
     expect(response.status).toBe(200);
     expect(callCount).toBe(2);
     expect(capturedPrompts[1]).toContain("PROTOCOL CORRECTION 1:");
+    expect(capturedPrompts[1]).toContain(
+      JSON.stringify(malformedEnvelope).replaceAll("`", "\\u0060"),
+    );
     const body = (await response.json()) as JsonObject;
     const output = Array.isArray(body.output) ? body.output : [];
     expect(output).toHaveLength(1);

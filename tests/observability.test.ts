@@ -50,6 +50,22 @@ describe("sanitized bridge observability", () => {
     expect((recent[2].fields as JsonObject).success).toBeTrue();
   });
 
+  test("retains sanitized protocol sizes without retaining prompt content", () => {
+    const metrics = new BridgeObservability();
+    const event = metrics.record("retry", {
+      reason: "simulated_protocol_correction",
+      rejectionReason: "malformed_json",
+      requestChars: 83_838,
+      assistantTextSize: 13_776,
+      prompt: "private prompt",
+    });
+
+    expect(event.fields.requestChars).toBe(83_838);
+    expect(event.fields.assistantTextSize).toBe(13_776);
+    expect(event.fields.prompt).toBe("[redacted]");
+    expect(JSON.stringify(event)).not.toContain("private prompt");
+  });
+
   test("hashes supplied correlation material and never returns it verbatim", () => {
     const metrics = new BridgeObservability();
     const event = metrics.record("dedup_hit", { kind: "protocol_replay" }, "private-turn-id");
