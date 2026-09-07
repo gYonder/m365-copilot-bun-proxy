@@ -50,7 +50,7 @@ describe("ResponsesEventWriter", () => {
 
     const failed = new ResponsesEventWriter(() => {});
     failed.failed(
-      baseResponse("in_progress"),
+      baseResponse("failed"),
       classifyBridgeFailure("upstream_timeout"),
     );
     expect(() => failed.completed(baseResponse("completed"))).toThrow();
@@ -78,7 +78,7 @@ describe("ResponsesEventWriter", () => {
     const failedEvents: JsonObject[] = [];
     const failed = new ResponsesEventWriter((event) => failedEvents.push(event));
     const timeout = classifyBridgeFailure("upstream_timeout");
-    failed.failed(baseResponse("in_progress"), timeout);
+    failed.failed(baseResponse("failed"), timeout);
     expect(failedEvents[0]).toMatchObject({
       type: "response.failed",
       response: {
@@ -110,7 +110,7 @@ describe("ResponsesEventWriter", () => {
       incompleteEvents.push(event),
     );
     incomplete.incomplete(
-      baseResponse("in_progress"),
+      baseResponse("incomplete"),
       classifyBridgeFailure("partial_or_unprovable_completion"),
     );
     expect(incompleteEvents[0]).toMatchObject({
@@ -170,7 +170,7 @@ function baseResponse(status: string): JsonObject {
     error: null,
     incomplete_details: null,
     model: "gpt-5.6-sol",
-    usage: { total_tokens: 3 },
+    usage: status === "in_progress" ? null : { total_tokens: 3 },
     output: [],
     output_text: "",
     parallel_tool_calls: false,

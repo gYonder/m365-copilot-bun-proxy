@@ -102,32 +102,14 @@ Headless token fetch uses the saved Playwright browser state, opens M365 Copilot
 
 `openAiTransformMode` controls how requests are translated for M365 Copilot:
 
-- `simulated` (default): sends the full incoming OpenAI JSON payload as a markdown JSON block and asks Copilot to respond in the same endpoint format; proxy extracts JSON from the response block and returns it.
+- `simulated` (default): sends the full incoming OpenAI JSON payload with a strict endpoint-specific output contract. The proxy buffers the complete upstream turn, validates one whole JSON envelope, performs at most one protocol correction, and locally builds the OpenAI response or terminal failure.
 - `mapped`: uses the legacy request/response mapping logic.
 
-`substrate.earlyCompleteOnSimulatedPayload` (default `false`) controls early websocket completion in simulated mode. It is evaluated in `src/proxy/clients.ts`, and only triggers once a fully parseable simulated payload is detected. By design, tool-call payloads are excluded from early completion.
-
-`substrate.incrementalSimulatedContentStreaming` (default `false`) enables a guarded incremental extractor in the simulated SSE bridge (`src/proxy/server.ts`) that can emit partial `choices[0].message.content` before full JSON parse completes.
-
-### Simulated Streaming Flag Interaction
-
-These are independent flags at different layers with partial overlap:
-
-- `earlyCompleteOnSimulatedPayload` is in the Substrate client loop (`src/proxy/clients.ts`). It stops reading websocket frames once a fully parseable simulated payload is detected (`hasCompleteSimulatedPayload`).
-- `incrementalSimulatedContentStreaming` is in the proxy SSE bridge (`src/proxy/server.ts`). It can emit partial `message.content` before full payload parse by using the incremental extractor (`src/proxy/openai.ts`).
-
-How they combine:
-
-- `earlyComplete=false`, `incremental=false`: parse-then-emit behavior.
-- `earlyComplete=true`, `incremental=false`: still parse-then-emit, but upstream websocket may end earlier for plain text simulated payloads.
-- `earlyComplete=false`, `incremental=true`: partial content can stream early; websocket still runs normally.
-- `earlyComplete=true`, `incremental=true`: fastest plain-text path; incremental emits early text, then websocket can stop early once payload is complete.
-
-Important caveats:
-
-- Incremental mode is auto-disabled for strict tool-validation flows and structured response format (`src/proxy/server.ts`).
-- Incremental mode suppresses itself if `tool_calls` is detected mid-stream (`src/proxy/server.ts`).
-- `earlyCompleteOnSimulatedPayload` does not early-complete tool-call payloads by design (`src/proxy/clients.ts`).
+The legacy `substrate.earlyCompleteOnSimulatedPayload` and
+`substrate.incrementalSimulatedContentStreaming` settings remain accepted for
+configuration compatibility but are ignored. Simulated output is never emitted
+incrementally or before whole-response validation; mapped streaming behavior is
+unchanged.
 
 Use `CONFIG__openAiTransformMode=mapped` if you need to revert to the legacy behavior.
 

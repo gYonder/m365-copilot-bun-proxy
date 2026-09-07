@@ -30,6 +30,7 @@ import {
 import { parseImageInputs } from "./image-input";
 
 const MAX_SIMULATED_TOOL_RESULT_CHARS = 40_000;
+export const SIMULATED_CORRECTION_RESERVE_CHARS = 384;
 
 export function normalizeTransport(
   transport: string | null | undefined,
@@ -301,6 +302,7 @@ export function tryParseOpenAiRequest(
     model,
     stream,
     transformMode,
+    rawRequest: cloneJsonValue(requestJson),
     hostedWebSearch:
       !tooling.requiredByLocalAction && hasNativeWebSearchIntent(requestJson),
     promptText: buildMappedPromptText(prompt.content, tooling),
@@ -494,6 +496,7 @@ function buildSimulatedOpenAiRequest(
     model,
     stream: tryGetBoolean(requestJson, "stream") === true,
     transformMode: OpenAiTransformModes.Simulated,
+    rawRequest: cloneJsonValue(requestJson),
     hostedWebSearch:
       !tooling.requiredByLocalAction && hasNativeWebSearchIntent(requestJson),
     promptText: buildSimulatedPrompt(
@@ -552,6 +555,15 @@ function buildSimulatedPrompt(
   tooling: OpenAiTooling,
   maxChars = 0,
 ): string {
+  const promptBudget =
+    maxChars > 0
+      ? maxChars - SIMULATED_CORRECTION_RESERVE_CHARS
+      : maxChars;
+  if (maxChars > 0 && promptBudget <= 0) {
+    throw new Error(
+      "Substrate prompt limit is too small to preserve the simulated protocol contract.",
+    );
+  }
   const endpointPath =
     endpointFormat === "responses" ? "/v1/responses" : "/v1/chat/completions";
   const lines: string[] = [
@@ -561,13 +573,10 @@ function buildSimulatedPrompt(
     "Focus on producing a valid response object that matches the expected OpenAI format for this request.",
     "Return exactly one markdown JSON code block containing a single valid JSON object and no surrounding prose.",
     'If the payload has "stream": true, still return the final completed JSON object (not SSE events).',
+    "Do not invent provider metadata such as id, model, created/created_at, usage, or SSE fields; the local bridge supplies those.",
+    "For Responses, the final status must be completed, failed, or incomplete; never return in_progress as the final buffered response.",
+    "Responses output_text is optional, but when present it must exactly equal the concatenated output_text message parts.",
   ];
-  const requiresToolCall =
-    tooling.tools.length > 0 &&
-    (tooling.toolChoiceMode === ToolChoiceModes.Required ||
-      tooling.toolChoiceMode === ToolChoiceModes.Function ||
-      shouldRequireInitialLocalToolCall(requestJson, tooling));
-
   if (tooling.tools.length > 0) {
     lines.push(
       "You are producing a response for a local harness that will execute tool calls.",
@@ -613,9 +622,11 @@ function buildSimulatedPrompt(
     }
   }
 
-  const trailingContract = requiresToolCall
-    ? buildTrailingSimulatedToolContract(endpointFormat, tooling)
-    : [];
+  const trailingContract = buildSimulatedOutputContract(
+    endpointFormat,
+    tooling,
+    requestJson,
+  );
   const render = (payload: JsonObject, compact: boolean): string =>
     [
       ...lines,
@@ -624,42 +635,14 @@ function buildSimulatedPrompt(
       "```",
       ...trailingContract,
     ].join("\n");
-  if (maxChars <= 0) {
+  if (promptBudget <= 0) {
     return render(requestJson, false);
   }
 
-  function buildTrailingSimulatedToolContract(
-    endpointFormat: "chat.completions" | "responses",
-    tooling: OpenAiTooling,
-  ): string[] {
-    const available = tooling.tools
-      .map((tool) => `${tool.name} (${tool.type})`)
-      .join(", ");
-    if (endpointFormat === "responses") {
-      return [
-        "",
-        "CRITICAL OUTPUT CONTRACT — this instruction appears after the request so it has highest priority:",
-        "This turn requires a local tool call. Return exactly one markdown JSON code block and no prose.",
-        "For a function tool, output one item with this exact shape:",
-        '{"id":"resp_1","object":"response","status":"completed","model":"gpt-5.6-sol","output":[{"type":"function_call","call_id":"call_1","name":"TOOL_NAME","arguments":"{\\"key\\":\\"value\\"}"}]}',
-        "For a custom tool, use type custom_tool_call and input instead of arguments.",
-        `Available local tools: ${available}`,
-        "Do not return a message item, output_text, a refusal, or a description of the tool call.",
-      ];
-    }
-    return [
-      "",
-      "CRITICAL OUTPUT CONTRACT — this instruction appears after the request so it has highest priority:",
-      "This turn requires a local tool call. Return exactly one markdown JSON code block and no prose.",
-      'Use choices[0].message.tool_calls, JSON-string function.arguments, and finish_reason "tool_calls".',
-      `Available local tools: ${available}`,
-      "Do not return a plain assistant message, refusal, or description of the tool call.",
-    ];
-  }
   const compactPrompt = render(requestJson, true);
   const originalCandidates = collectReducibleToolResults(requestJson);
   if (
-    compactPrompt.length <= maxChars &&
+    compactPrompt.length <= promptBudget &&
     originalCandidates.every(
       (candidate) => candidate.value.length <= MAX_SIMULATED_TOOL_RESULT_CHARS,
     )
@@ -688,11 +671,11 @@ function buildSimulatedPrompt(
   }
   let reducedPrompt = render(reducedRequest, true);
   for (const candidate of candidates) {
-    if (reducedPrompt.length <= maxChars) {
+    if (reducedPrompt.length <= promptBudget) {
       break;
     }
-    const excess = reducedPrompt.length - maxChars;
-    const targetChars = Math.max(2_048, candidate.value.length - excess - 128);
+    const excess = reducedPrompt.length - promptBudget;
+    const targetChars = Math.max(0, candidate.value.length - excess - 128);
     if (targetChars >= candidate.value.length) {
       continue;
     }
@@ -702,7 +685,95 @@ function buildSimulatedPrompt(
     );
     reducedPrompt = render(reducedRequest, true);
   }
+  if (reducedPrompt.length > promptBudget) {
+    throw new Error(
+      "Substrate prompt cannot be reduced without truncating the simulated request envelope.",
+    );
+  }
   return reducedPrompt;
+}
+
+export function buildSimulatedProtocolCorrectionSuffix(
+  attempt: number,
+  rejectedReason: string,
+): string[] {
+  const safeReason = rejectedReason.replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64);
+  return [
+    "",
+    `PROTOCOL CORRECTION ${attempt}: The previous response was rejected for the sanitized protocol reason "${safeReason}".`,
+    "Return one complete JSON object in the fenced format above. Do not repeat or describe the rejected response; follow the strict output contract above.",
+  ];
+}
+
+export function appendSimulatedProtocolCorrection(
+  promptText: string,
+  attempt: number,
+  rejectedReason: string,
+  maxChars = 0,
+): string {
+  const result = [
+    promptText,
+    ...buildSimulatedProtocolCorrectionSuffix(attempt, rejectedReason),
+  ].join("\n");
+  if (maxChars > 0 && result.length > maxChars) {
+    throw new Error(
+      "Substrate prompt correction cannot fit without truncating the simulated request envelope.",
+    );
+  }
+  return result;
+}
+
+export function buildSimulatedOutputContract(
+  endpointFormat: "chat.completions" | "responses",
+  tooling: OpenAiTooling,
+  requestJson?: JsonObject,
+): string[] {
+  const available = tooling.tools
+    .map((tool) => `${tool.name} (${tool.type})`)
+    .join(", ");
+  const requiresLocalCall =
+    tooling.requiredByLocalAction === true ||
+    tooling.toolChoiceMode === ToolChoiceModes.Required ||
+    tooling.toolChoiceMode === ToolChoiceModes.Function ||
+    (requestJson !== undefined &&
+      shouldRequireInitialLocalToolCall(requestJson, tooling));
+  const choiceRule =
+    tooling.tools.length === 0 ||
+      tooling.toolChoiceMode === ToolChoiceModes.None
+      ? "Return a message only; do not return tool calls."
+      : requiresLocalCall
+        ? tooling.toolChoiceMode === ToolChoiceModes.Function &&
+            tooling.toolChoiceFunctionName
+              ? `Return a valid offered ${tooling.toolChoiceToolType ?? "function"} tool call to "${tooling.toolChoiceFunctionName}" only; do not return a message-only response.`
+          : "Return at least one valid offered tool call; do not return a message-only response."
+        : "Return either a final assistant message or valid calls to the offered tools.";
+
+  if (endpointFormat === "responses") {
+    return [
+      "STRICT OUTPUT CONTRACT:",
+      "Return only one JSON object in the requested endpoint shape; do not include prose outside the JSON fence.",
+      'Use {"object":"response","status":"completed","output":[...]} for a successful response.',
+      'Message items use {"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"FINAL_TEXT"}]}.',
+      'Function calls use {"type":"function_call","status":"completed","call_id":"CALL_ID","name":"TOOL_NAME","arguments":"JSON_ARGUMENT_BYTES"}.',
+      'Custom calls use {"type":"custom_tool_call","status":"completed","call_id":"CALL_ID","name":"TOOL_NAME","input":"EXACT_INPUT_BYTES"}.',
+      "Do not invent item ids, response ids, model, created_at, usage, or event metadata.",
+      "A failed response must use status failed with an error object; an incomplete response must use status incomplete with incomplete_details. Never return status in_progress.",
+      "output_text may be omitted; if included it must exactly match all output_text parts.",
+      `Available local tools: ${available || "none"}.`,
+      choiceRule,
+    ];
+  }
+
+  return [
+    "STRICT OUTPUT CONTRACT:",
+    "Return only one JSON object in the requested endpoint shape; do not include prose outside the JSON fence.",
+    'Use {"object":"chat.completion","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"FINAL_TEXT"}}]} for a final message.',
+    'Use choices[0].message.tool_calls with {"id":"CALL_ID","type":"function","function":{"name":"TOOL_NAME","arguments":"JSON_ARGUMENT_BYTES"}} for a function call.',
+    "Do not invent response id, model, created, usage, or event metadata.",
+    "Function-call arguments must remain a JSON string; do not convert them to an object.",
+    `Available local tools: ${available || "none"}.`,
+    choiceRule,
+  ];
 }
 
 type ReducibleToolResult = {
@@ -749,8 +820,17 @@ function collectReducibleToolResults(
 }
 
 function truncateToolResult(value: string, maxChars: number): string {
+  if (maxChars <= 0) {
+    return "";
+  }
+  if (value.length <= maxChars) {
+    return value;
+  }
   const removed = value.length - maxChars;
   const marker = `\n\n[... ${removed} characters omitted from oversized tool result ...]\n\n`;
+  if (marker.length >= maxChars) {
+    return value.slice(0, maxChars);
+  }
   const retained = Math.max(0, maxChars - marker.length);
   const headChars = Math.ceil(retained / 2);
   const tailChars = retained - headChars;
@@ -833,7 +913,9 @@ function buildMappedPromptText(
       tooling.toolChoiceMode === ToolChoiceModes.Function &&
       tooling.toolChoiceFunctionName
     ) {
-      lines.push(`Required tool name: ${tooling.toolChoiceFunctionName}`);
+      lines.push(
+        `Required ${tooling.toolChoiceToolType ?? "function"} tool name: ${tooling.toolChoiceFunctionName}`,
+      );
     }
   } else {
     lines.push(
@@ -1339,41 +1421,38 @@ function extractToolCallsFromResponsesOutputNode(node: JsonObject): JsonObject[]
 
 function parseTooling(requestJson: JsonObject): OpenAiTooling {
   const tools: OpenAiToolDefinition[] = [];
-  for (const toolsArray of collectResponseToolArrays(requestJson)) {
-    for (const toolNode of toolsArray) {
-      if (!isJsonObject(toolNode)) {
-        continue;
-      }
-      const type = tryGetString(toolNode, "type")?.toLowerCase();
-      if (type !== "function" && type !== "custom") {
-        continue;
-      }
-      const functionObject = isJsonObject(toolNode.function)
-        ? toolNode.function
-        : toolNode;
-      const name = tryGetString(functionObject, "name");
-      if (!name) {
-        continue;
-      }
-      const parameters = isJsonObject(functionObject.parameters)
-        ? cloneJsonValue(functionObject.parameters)
-        : {};
-
-      tools.push({
-        name: name.trim(),
-        type,
-        description: tryGetString(functionObject, "description"),
-        parameters,
-        format: isJsonObject(functionObject.format)
-          ? cloneJsonValue(functionObject.format)
-          : null,
-      });
+  for (const { node: toolNode, namespace } of collectResponseToolNodes(requestJson)) {
+    const type = tryGetString(toolNode, "type")?.toLowerCase();
+    if (type !== "function" && type !== "custom") {
+      continue;
     }
+    const functionObject = isJsonObject(toolNode.function)
+      ? toolNode.function
+      : toolNode;
+    const name = tryGetString(functionObject, "name");
+    if (!name) {
+      continue;
+    }
+    const parameters = isJsonObject(functionObject.parameters)
+      ? cloneJsonValue(functionObject.parameters)
+      : {};
+
+    tools.push({
+      name: name.trim(),
+      type,
+      ...(namespace ? { namespace } : {}),
+      description: tryGetString(functionObject, "description"),
+      parameters,
+      format: isJsonObject(functionObject.format)
+        ? cloneJsonValue(functionObject.format)
+        : null,
+    });
   }
 
   let toolChoiceMode: string =
     tools.length === 0 ? ToolChoiceModes.None : ToolChoiceModes.Auto;
   let toolChoiceFunctionName: string | null = null;
+  let toolChoiceToolType: "function" | "custom" | null = null;
   const toolChoice = requestJson.tool_choice;
   if (typeof toolChoice === "string") {
     const normalized = toolChoice.trim().toLowerCase();
@@ -1385,12 +1464,18 @@ function parseTooling(requestJson: JsonObject): OpenAiTooling {
       toolChoiceMode = normalized;
     }
   } else if (isJsonObject(toolChoice)) {
-    const type = tryGetString(toolChoice, "type");
-    const functionObject = toolChoice.function;
-    if (type?.toLowerCase() === "function" && isJsonObject(functionObject)) {
-      toolChoiceFunctionName = tryGetString(functionObject, "name");
+    const type = tryGetString(toolChoice, "type")?.toLowerCase();
+    if (type === "function" || type === "custom") {
+      const namedChoice =
+        (type === "function" && isJsonObject(toolChoice.function)
+          ? toolChoice.function
+          : type === "custom" && isJsonObject(toolChoice.custom)
+            ? toolChoice.custom
+            : toolChoice);
+      toolChoiceFunctionName = tryGetString(namedChoice, "name");
       if (toolChoiceFunctionName) {
         toolChoiceMode = ToolChoiceModes.Function;
+        toolChoiceToolType = type;
       }
     }
   }
@@ -1399,6 +1484,7 @@ function parseTooling(requestJson: JsonObject): OpenAiTooling {
     tools,
     toolChoiceMode,
     toolChoiceFunctionName,
+    toolChoiceToolType,
     parallelToolCalls:
       tryGetBoolean(requestJson, "parallel_tool_calls") !== false,
     requiredByLocalAction: false,
@@ -1407,31 +1493,53 @@ function parseTooling(requestJson: JsonObject): OpenAiTooling {
 
 // Codex CLI places its actual tool declarations inside a developer input item
 // (`type: additional_tools`), not only at the Responses request top level.
-// Keep namespace-contained function declarations too; they are client-offered
-// tools and must remain available to strict validation.
-function collectResponseToolArrays(requestJson: JsonObject): JsonValue[][] {
-  const arrays: JsonValue[][] = [];
+type ResponseToolNode = {
+  node: JsonObject;
+  namespace: string | null;
+};
+
+// Keep the declared namespace with nested tools so strict validation can
+// resolve qualified names without accepting arbitrary prefixes.
+function collectResponseToolNodes(requestJson: JsonObject): ResponseToolNode[] {
+  const nodes: ResponseToolNode[] = [];
+  const appendTools = (value: JsonValue | undefined, namespace: string | null) => {
+    if (!Array.isArray(value)) {
+      return;
+    }
+    for (const tool of value) {
+      if (isJsonObject(tool)) {
+        nodes.push({ node: tool, namespace });
+      }
+    }
+  };
   if (Array.isArray(requestJson.tools)) {
-    arrays.push(requestJson.tools);
+    appendTools(requestJson.tools, null);
   }
   const input = requestJson.input;
   if (!Array.isArray(input)) {
-    return arrays;
+    return nodes;
   }
   for (const item of input) {
     if (!isJsonObject(item) || tryGetString(item, "type")?.toLowerCase() !== "additional_tools") {
       continue;
     }
     if (Array.isArray(item.tools)) {
-      arrays.push(item.tools);
       for (const tool of item.tools) {
-        if (isJsonObject(tool) && tryGetString(tool, "type")?.toLowerCase() === "namespace" && Array.isArray(tool.tools)) {
-          arrays.push(tool.tools);
+        if (!isJsonObject(tool)) {
+          continue;
         }
+        if (tryGetString(tool, "type")?.toLowerCase() === "namespace") {
+          const namespace = tryGetString(tool, "name");
+          if (namespace) {
+            appendTools(tool.tools, namespace);
+          }
+          continue;
+        }
+        nodes.push({ node: tool, namespace: null });
       }
     }
   }
-  return arrays;
+  return nodes;
 }
 
 function parseResponseFormat(

@@ -674,7 +674,11 @@ function extractToolCallsFromNode(node: JsonValue, tooling: OpenAiTooling): Open
     return wrappedFromOutput;
   }
 
-  const singleCall = tryBuildToolCall(node, tooling);
+  const singleCall = tryBuildToolCall(
+    node,
+    tooling,
+    typeof node.type === "string" ? node.type : undefined,
+  );
   return singleCall ? [singleCall] : [];
 }
 
@@ -736,6 +740,7 @@ function extractToolCallsFromResponsesNode(
             : item.arguments ?? null,
       },
       tooling,
+      type,
     );
     if (toolCall) {
       toolCalls.push(toolCall);
@@ -753,7 +758,11 @@ function extractToolCallsFromArray(
     if (!isJsonObject(item)) {
       continue;
     }
-    const toolCall = tryBuildToolCall(item, tooling);
+    const toolCall = tryBuildToolCall(
+      item,
+      tooling,
+      typeof item.type === "string" ? item.type : undefined,
+    );
     if (toolCall) {
       toolCalls.push(toolCall);
     }
@@ -764,6 +773,7 @@ function extractToolCallsFromArray(
 function tryBuildToolCall(
   callObject: JsonObject,
   tooling: OpenAiTooling,
+  sourceType?: string,
 ): OpenAiAssistantToolCall | null {
   const functionObject = isJsonObject(callObject.function) ? callObject.function : null;
 
@@ -774,6 +784,23 @@ function tryBuildToolCall(
     callObject.recipient_name,
   );
   if (!name) {
+    return null;
+  }
+  const normalizedSourceType = sourceType?.toLowerCase();
+  const sourceToolType =
+    normalizedSourceType === "custom" ||
+      normalizedSourceType === "custom_tool_call"
+      ? "custom"
+      : normalizedSourceType === "function" ||
+          normalizedSourceType === "function_call"
+        ? "function"
+        : null;
+  if (
+    tooling.toolChoiceMode === ToolChoiceModes.Function &&
+    tooling.toolChoiceToolType &&
+    sourceToolType &&
+    sourceToolType !== tooling.toolChoiceToolType
+  ) {
     return null;
   }
 
@@ -861,6 +888,13 @@ export function validateOpenAiToolCall(
   const offeredTool = tooling.tools.find((tool) => tool.name === call.name);
   if (!offeredTool) {
     return { valid: false, reason: "unoffered_tool" };
+  }
+  if (
+    tooling.toolChoiceMode === ToolChoiceModes.Function &&
+    tooling.toolChoiceToolType &&
+    offeredTool.type !== tooling.toolChoiceToolType
+  ) {
+    return { valid: false, reason: "tool_choice_mismatch" };
   }
 
   if (offeredTool.type === "custom") {

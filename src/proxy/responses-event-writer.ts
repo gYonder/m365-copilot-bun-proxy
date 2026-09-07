@@ -14,11 +14,14 @@ import {
   buildResponseOutputItemDoneEvent,
   buildResponseOutputTextDeltaEvent,
   buildResponseOutputTextDoneEvent,
+  buildResponseRefusalDeltaEvent,
+  buildResponseRefusalDoneEvent,
   buildResponseWebSearchCallCompletedEvent,
   buildResponseWebSearchCallInProgressEvent,
   buildResponseWebSearchCallSearchingEvent,
 } from "./responses-api";
 import {
+  classifyBridgeFailure,
   type BridgeFailure,
 } from "./failure-classifier";
 import type { JsonObject } from "./types";
@@ -163,6 +166,42 @@ export class ResponsesEventWriter {
         outputIndex,
         itemId,
         text,
+        contentIndex,
+      ),
+    );
+  }
+
+  refusalDelta(
+    responseId: string,
+    outputIndex: number,
+    itemId: string,
+    delta: string,
+    contentIndex = 0,
+  ): JsonObject {
+    return this.emit(
+      buildResponseRefusalDeltaEvent(
+        responseId,
+        outputIndex,
+        itemId,
+        delta,
+        contentIndex,
+      ),
+    );
+  }
+
+  refusalDone(
+    responseId: string,
+    outputIndex: number,
+    itemId: string,
+    refusal: string,
+    contentIndex = 0,
+  ): JsonObject {
+    return this.emit(
+      buildResponseRefusalDoneEvent(
+        responseId,
+        outputIndex,
+        itemId,
+        refusal,
         contentIndex,
       ),
     );
@@ -323,6 +362,38 @@ export class ResponsesEventWriter {
       failure,
     };
     return event;
+  }
+
+  replayTerminal(response: JsonObject): JsonObject {
+    this.assertOpen();
+    const status = response.status;
+    if (status === "completed") {
+      const event = this.emitEvent(buildResponseCompletedEvent(response));
+      this.terminal = {
+        kind: "completed",
+        response: cloneJsonValue(response),
+      };
+      return event;
+    }
+    if (status === "failed") {
+      const event = this.emitEvent(buildResponseFailedEvent(response));
+      this.terminal = {
+        kind: "failed",
+        response: cloneJsonValue(response),
+        failure: classifyBridgeFailure("provider_drift"),
+      };
+      return event;
+    }
+    if (status === "incomplete") {
+      const event = this.emitEvent(buildResponseIncompleteEvent(response));
+      this.terminal = {
+        kind: "incomplete",
+        response: cloneJsonValue(response),
+        failure: classifyBridgeFailure("provider_drift"),
+      };
+      return event;
+    }
+    throw new Error(`Cannot replay non-terminal response status "${String(status)}"`);
   }
 
   clientAbort(): void {

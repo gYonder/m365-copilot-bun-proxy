@@ -25,6 +25,29 @@ describe("ToolLedger", () => {
     });
   });
 
+  test("rejects duplicate call IDs atomically with a sanitized reason", () => {
+    const ledger = new ToolLedger({ now: () => 1_000 });
+    const result = ledger.issueCalls({
+      taskId: "task-1",
+      responseId: "response-1",
+      requestProfileKey: "profile-1",
+      calls: [
+        call("call-same", { first: true }),
+        call("call-same", { second: true }),
+      ],
+      round: 1,
+    });
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error.kind).toBe("duplicate_call_id");
+      expect(result.error.reason).toBe("invalid_request");
+      expect(result.error.code).toBe("schema_invalid");
+    }
+    expect(ledger.size).toBe(0);
+    expect(ledger.hasTask("task-1")).toBe(false);
+  });
+
   test("accepts exactly one result and rejects the duplicate", () => {
     const ledger = new ToolLedger({ now: () => 1_000 });
     issue(ledger, "call-1");

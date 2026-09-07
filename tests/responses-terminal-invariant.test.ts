@@ -38,6 +38,11 @@ describe("Responses terminal invariant", () => {
     );
 
     expect(terminals.map((event) => event.type)).toEqual(["response.completed"]);
+    const inProgress = semanticEvents.find(
+      (event) => event.type === "response.in_progress",
+    );
+    expect((inProgress?.response as JsonObject).usage).toBeNull();
+    expect((terminals[0]?.response as JsonObject).usage).toBeObject();
     expect(semanticEvents.map((event) => event.sequence_number)).toEqual(
       semanticEvents.map((_, index) => index),
     );
@@ -64,6 +69,9 @@ describe("Responses terminal invariant", () => {
         error: { code: "transport_failed" },
       },
     });
+    expect(
+      (stream.events.at(-1)?.response as JsonObject).usage,
+    ).toBeObject();
     expect(stream.sawDone).toBeTrue();
   });
 

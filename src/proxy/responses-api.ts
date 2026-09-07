@@ -11,7 +11,6 @@ import {
   ContextEstimatorVersion,
   estimateResponsesContext,
 } from "./context-accounting";
-import { stripPrivateCitationMarkers } from "./responses-provenance";
 
 export function createOpenAiResponseId(): string {
   return `resp_${randomUUID().replaceAll("-", "")}`;
@@ -68,12 +67,15 @@ export function buildOpenAiResponseObject(
   contextInputTokens?: number,
   terminal?: ResponseTerminal,
 ): JsonObject {
-  const usage = buildResponseUsage(parsedRequest, output, contextInputTokens);
+  const effectiveStatus = terminal?.status ?? status;
+  const usage = effectiveStatus === "in_progress"
+    ? null
+    : buildResponseUsage(parsedRequest, output, contextInputTokens);
   const response: JsonObject = {
     id: responseId,
     object: "response",
     created_at: createdAt,
-    status: terminal?.status ?? status,
+    status: effectiveStatus,
     error: terminal ? cloneJsonValue(terminal.error) : null,
     incomplete_details: terminal
       ? cloneJsonValue(terminal.incomplete_details)
@@ -114,7 +116,7 @@ export function buildMessageOutputItem(
     content: [
       {
         type: "output_text",
-        text: stripPrivateCitationMarkers(text),
+        text,
         annotations: cloneJsonValue(annotations),
       },
     ],
@@ -185,7 +187,7 @@ export function buildResponseContentPartAddedEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    part: sanitizeOutputTextPart(part),
+    part: cloneJsonValue(part),
   };
 }
 
@@ -202,7 +204,7 @@ export function buildResponseOutputTextDeltaEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    delta: stripPrivateCitationMarkers(delta),
+    delta,
   };
 }
 
@@ -219,7 +221,41 @@ export function buildResponseOutputTextDoneEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    text: stripPrivateCitationMarkers(text),
+    text,
+  };
+}
+
+export function buildResponseRefusalDeltaEvent(
+  responseId: string,
+  outputIndex: number,
+  itemId: string,
+  delta: string,
+  contentIndex = 0,
+): JsonObject {
+  return {
+    type: "response.refusal.delta",
+    response_id: responseId,
+    output_index: outputIndex,
+    item_id: itemId,
+    content_index: contentIndex,
+    delta,
+  };
+}
+
+export function buildResponseRefusalDoneEvent(
+  responseId: string,
+  outputIndex: number,
+  itemId: string,
+  refusal: string,
+  contentIndex = 0,
+): JsonObject {
+  return {
+    type: "response.refusal.done",
+    response_id: responseId,
+    output_index: outputIndex,
+    item_id: itemId,
+    content_index: contentIndex,
+    refusal,
   };
 }
 
@@ -236,7 +272,7 @@ export function buildResponseContentPartDoneEvent(
     output_index: outputIndex,
     item_id: itemId,
     content_index: contentIndex,
-    part: sanitizeOutputTextPart(part),
+    part: cloneJsonValue(part),
   };
 }
 
@@ -406,19 +442,6 @@ function buildResponseWebSearchCallEvent(
     output_index: outputIndex,
     ...(itemId ? { item_id: itemId } : {}),
     ...(item ? { item: cloneJsonValue(item) } : {}),
-  };
-}
-
-function sanitizeOutputTextPart(part: JsonObject): JsonObject {
-  if (
-    part.type !== "output_text" ||
-    typeof part.text !== "string"
-  ) {
-    return cloneJsonValue(part);
-  }
-  return {
-    ...cloneJsonValue(part),
-    text: stripPrivateCitationMarkers(part.text),
   };
 }
 

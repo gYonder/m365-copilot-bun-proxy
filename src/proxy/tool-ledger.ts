@@ -56,6 +56,7 @@ export type ToolLedgerRejectionKind =
   | "round_cap_exceeded"
   | "repetition_bound_exhausted"
   | "ledger_capacity_exceeded"
+  | "duplicate_call_id"
   | "unknown_call_id"
   | "duplicate_result"
   | "cross_profile"
@@ -229,11 +230,12 @@ export class ToolLedger {
         !isRecord(input) ||
         !nonEmpty(input.call_id) ||
         !nonEmpty(input.name) ||
-        !nonEmpty(input.type) ||
-        callIds.has(input.call_id) ||
-        this.entries.has(input.call_id)
+        !nonEmpty(input.type)
       ) {
         return this.reject("invalid_call", "invalid_request");
+      }
+      if (callIds.has(input.call_id) || this.entries.has(input.call_id)) {
+        return this.reject("duplicate_call_id", "invalid_request");
       }
 
       const canonical = canonicalArgumentDigest(input.arguments);

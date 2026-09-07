@@ -68,6 +68,7 @@ export type ParsedImageInput = {
 export type OpenAiToolDefinition = {
   name: string;
   type: "function" | "custom";
+  namespace?: string | null;
   description: string | null;
   parameters: JsonObject;
   format: JsonObject | null;
@@ -77,6 +78,7 @@ export type OpenAiTooling = {
   tools: OpenAiToolDefinition[];
   toolChoiceMode: string;
   toolChoiceFunctionName: string | null;
+  toolChoiceToolType?: "function" | "custom" | null;
   parallelToolCalls: boolean;
   requiredByLocalAction?: boolean;
 };
@@ -105,6 +107,7 @@ export type ParsedOpenAiRequest = {
   model: string;
   stream: boolean;
   transformMode: string;
+  rawRequest?: JsonObject;
   hostedWebSearch?: boolean;
   promptText: string;
   userKey: string | null;
