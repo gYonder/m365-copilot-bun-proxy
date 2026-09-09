@@ -212,6 +212,14 @@ const WrapperOptionsSchema = z.object({
   includeConversationIdInResponseBody: z.boolean().default(true),
   retrySimulatedToollessResponses: z.boolean().default(true),
   logStdout: z.boolean().default(false),
+  observability: z
+    .object({
+      enabled: z.boolean().default(false),
+      logPath: z.string().min(1).default("./logs/proxy-events.jsonl"),
+      maxBytes: z.number().int().min(256).default(5_242_880),
+      maxFiles: z.number().int().min(1).default(3),
+    })
+    .default({}),
   confabRetries: z.number().int().min(0).default(1),
   msalAuth: z.boolean().default(true),
   imageGeneration: z

@@ -560,25 +560,34 @@ export function classifyToolAttempt(
   if (tooling.tools.length === 0) {
     return { kind: "none" };
   }
+  const invalidReason = classifyToolAttemptShape(assistantText);
+  if (invalidReason) {
+    return { kind: "invalid_attempt", reason: invalidReason };
+  }
+  return { kind: "none" };
+}
+
+export function looksLikeToolCallAttemptText(assistantText: string): boolean {
+  return classifyToolAttemptShape(assistantText) !== null;
+}
+
+function classifyToolAttemptShape(assistantText: string): string | null {
   for (const candidate of enumerateJsonCandidates(assistantText)) {
     const node = tryParseJsonNode(candidate);
     if (node === null) {
       continue;
     }
     if (looksLikeToolCallAttempt(node)) {
-      return { kind: "invalid_attempt", reason: "tool_call_attempt_rejected" };
+      return "tool_call_attempt_rejected";
     }
   }
   if (looksLikeMalformedToolCallEnvelope(assistantText)) {
-    return { kind: "invalid_attempt", reason: "malformed_tool_call_envelope" };
+    return "malformed_tool_call_envelope";
   }
   if (looksLikeMalformedSimulatedResponseEnvelope(assistantText)) {
-    return {
-      kind: "invalid_attempt",
-      reason: "malformed_simulated_response_envelope",
-    };
+    return "malformed_simulated_response_envelope";
   }
-  return { kind: "none" };
+  return null;
 }
 
 function looksLikeMalformedSimulatedResponseEnvelope(

@@ -276,9 +276,17 @@ export type WrapperOptions = {
   includeConversationIdInResponseBody: boolean;
   retrySimulatedToollessResponses: boolean;
   logStdout: boolean;
+  observability?: ObservabilityOptions;
   confabRetries: number;
   msalAuth: boolean;
   imageGeneration: ImageGenerationOptions;
+};
+
+export type ObservabilityOptions = {
+  enabled: boolean;
+  logPath: string;
+  maxBytes: number;
+  maxFiles: number;
 };
 
 export type ImageGenerationOptions = {

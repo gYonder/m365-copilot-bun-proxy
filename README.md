@@ -103,6 +103,9 @@ Headless token fetch uses the saved Playwright browser state, opens M365 Copilot
 `openAiTransformMode` controls how requests are translated for M365 Copilot:
 
 - `simulated` (default): sends the full incoming OpenAI JSON payload with a strict endpoint-specific output contract. The proxy buffers the complete upstream turn, validates one whole JSON envelope, performs at most one protocol correction, and locally builds the OpenAI response or terminal failure.
+- Tool-free simulated requests ask for direct assistant text and project that
+  text into the requested OpenAI response shape. Strict whole-envelope
+  validation remains mandatory whenever tools are available.
 - `mapped`: uses the legacy request/response mapping logic.
 
 The legacy `substrate.earlyCompleteOnSimulatedPayload` and
@@ -130,6 +133,24 @@ To override nested values, use double underscores for each path segment, for exa
 ```bash
 CONFIG__substrate__hubPath=wss://substrate.office.com/m365Copilot/Chathub bun run start:proxy
 ```
+
+Sanitized bridge events can be persisted independently of debug request logs:
+
+```json
+{
+  "observability": {
+    "enabled": true,
+    "logPath": "./logs/proxy-events.jsonl",
+    "maxBytes": 5242880,
+    "maxFiles": 3
+  }
+}
+```
+
+The JSONL log contains event names, counters, classifications, and sizes only.
+Prompt and response bodies, authentication material, account identifiers, and
+authenticated URLs are redacted. Rotation retains the active file plus numbered
+archives up to `maxFiles`.
 
 ## API endpoints
 

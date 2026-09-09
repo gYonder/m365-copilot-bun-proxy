@@ -27,7 +27,7 @@ if (debugEnabled && options.debugPath?.trim()) {
   await fs.mkdir(options.debugPath, { recursive: true });
 }
 const debugLogger = new DebugMarkdownLogger(options, debugEnabled);
-const observability = new BridgeObservability();
+const observability = new BridgeObservability(options.observability);
 const graphClient = new CopilotGraphClient(options, debugLogger);
 const durableState = new DurableStateStore();
 const rateCircuitBreaker = new RateCircuitBreaker(durableState);

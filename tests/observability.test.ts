@@ -1,5 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
   BridgeObservability,
   sanitizeTelemetryObject,
 } from "../src/proxy/observability";
@@ -125,5 +135,75 @@ describe("sanitized bridge observability", () => {
     expect((event?.fields as JsonObject).reason).toBe("lru");
     expect(JSON.stringify(event)).not.toContain("private-key");
     expect(JSON.stringify(event)).not.toContain("private-conversation");
+  });
+
+  test("persists sanitized events to a private rotating JSONL log", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "bridge-events-"));
+    const logPath = path.join(directory, "proxy-events.jsonl");
+    try {
+      const metrics = new BridgeObservability({
+        enabled: true,
+        logPath,
+        maxBytes: 260,
+        maxFiles: 2,
+      });
+      for (let index = 0; index < 6; index += 1) {
+        metrics.record("retry", {
+          reason: "simulated_protocol_correction",
+          attempt: index,
+          prompt: `private-${index}`,
+        });
+      }
+
+      const files = (await readdir(directory)).sort();
+      expect(files).toEqual(["proxy-events.jsonl", "proxy-events.jsonl.1"]);
+      const persisted = await Promise.all(
+        files.map((file) => readFile(path.join(directory, file), "utf8")),
+      );
+      expect(persisted.join("")).not.toContain("private-");
+      expect(persisted.join("")).toContain('"prompt":"[redacted]"');
+      expect((await stat(logPath)).mode & 0o777).toBe(0o600);
+      expect((metrics.readiness().eventLog as JsonObject).healthy).toBeTrue();
+
+      await writeFile(`${logPath}.2`, "stale\n");
+      await writeFile(`${logPath}.3`, "stale\n");
+      metrics.record("retry", {
+        reason: "oversized",
+        detail: "x".repeat(2_000),
+      });
+      const rotatedFiles = (await readdir(directory)).sort();
+      expect(rotatedFiles).toEqual([
+        "proxy-events.jsonl",
+        "proxy-events.jsonl.1",
+      ]);
+      for (const file of rotatedFiles) {
+        expect((await stat(path.join(directory, file))).size).toBeLessThanOrEqual(
+          260,
+        );
+      }
+      const current = await readFile(logPath, "utf8");
+      expect(current).toContain('"truncated":true');
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  test("does not create an event log when persistence is disabled", async () => {
+    const directory = await mkdtemp(path.join(tmpdir(), "bridge-events-"));
+    const logPath = path.join(directory, "proxy-events.jsonl");
+    try {
+      const metrics = new BridgeObservability({
+        enabled: false,
+        logPath,
+        maxBytes: 1_024,
+        maxFiles: 2,
+      });
+      metrics.record("retry", { reason: "disabled" });
+
+      expect(await readdir(directory)).toEqual([]);
+      expect((metrics.readiness().eventLog as JsonObject).enabled).toBeFalse();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   });
 });

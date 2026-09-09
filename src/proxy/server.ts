@@ -19,6 +19,7 @@ import {
   extractCopilotAssistantText,
   extractCopilotAssistantTextFromStreamData,
   extractCopilotConversationIdFromStream,
+  looksLikeToolCallAttemptText,
   requiresBufferedAssistantResponse,
   tryBuildAssistantResponseFromChatCompletionPayload,
   tryExtractIncrementalSimulatedChatContent,
@@ -2850,9 +2851,31 @@ async function resolveSimulatedOutput(
       conversationId: initialResult.conversationId ?? currentConversationId,
     };
   }
+  if (
+    canAcceptToolFreeAssistantText(
+      endpoint,
+      request.tooling,
+      first,
+      firstText,
+    )
+  ) {
+    if (signal?.aborted) {
+      return { kind: "cancelled" };
+    }
+    return {
+      kind: "accepted",
+      result: initialResult,
+      output: buildToolFreeSimulatedOutput(endpoint, firstText),
+      conversationId: initialResult.conversationId ?? currentConversationId,
+    };
+  }
   const firstRejection = first.kind === "rejected"
     ? first
     : { kind: "rejected" as const, reason: "invalid_envelope" as const };
+  const canAcceptCorrectionText =
+    !hasSimulatedToolSurface(request.tooling) &&
+    !looksLikeToolCallAttemptText(firstText) &&
+    !looksLikeSimulatedEndpointEnvelope(endpoint, firstText);
 
   recordSimulatedCorrection(
     services,
@@ -2868,6 +2891,14 @@ async function resolveSimulatedOutput(
   }
   const retryConversationId = await createRetryConversation();
   if (!retryConversationId) {
+    recordSimulatedProtocolExhaustion(
+      services,
+      endpoint,
+      route,
+      request,
+      firstRejection,
+      firstText.length,
+    );
     return {
       kind: "rejected",
       reason: "simulated_protocol_correction_exhausted",
@@ -2898,6 +2929,22 @@ async function resolveSimulatedOutput(
     request.tooling,
   );
   if (
+    canAcceptCorrectionText &&
+    canAcceptToolFreeAssistantText(
+      endpoint,
+      request.tooling,
+      second,
+      retryText,
+    )
+  ) {
+    return {
+      kind: "accepted",
+      result: retryResult,
+      output: buildToolFreeSimulatedOutput(endpoint, retryText),
+      conversationId: retryConversationId,
+    };
+  }
+  if (
     second.kind === "rejected" ||
     hasKnownInvalidSimulatedOutput(second)
   ) {
@@ -2912,6 +2959,16 @@ async function resolveSimulatedOutput(
       retryText.length,
       2,
     );
+    recordSimulatedProtocolExhaustion(
+      services,
+      endpoint,
+      route,
+      request,
+      second.kind === "rejected"
+        ? second
+        : { kind: "rejected", reason: "invalid_envelope" },
+      retryText.length,
+    );
     return {
       kind: "rejected",
       reason: "simulated_protocol_correction_exhausted",
@@ -2925,6 +2982,73 @@ async function resolveSimulatedOutput(
     result: retryResult,
     output: second,
     conversationId: retryConversationId,
+  };
+}
+
+function canAcceptToolFreeAssistantText(
+  endpoint: SimulatedOutputEndpoint,
+  tooling: OpenAiTooling,
+  result: SimulatedOutputAccepted | SimulatedOutputRejected,
+  assistantText: string,
+): boolean {
+  if (hasSimulatedToolSurface(tooling)) {
+    return false;
+  }
+  if (result.kind !== "rejected" || !assistantText.trim()) {
+    return false;
+  }
+  if (looksLikeToolCallAttemptText(assistantText)) {
+    return false;
+  }
+  return !looksLikeSimulatedEndpointEnvelope(endpoint, assistantText);
+}
+
+function hasSimulatedToolSurface(tooling: OpenAiTooling): boolean {
+  return (
+    tooling.tools.length > 0 &&
+    tooling.toolChoiceMode !== ToolChoiceModes.None
+  );
+}
+
+function looksLikeSimulatedEndpointEnvelope(
+  endpoint: SimulatedOutputEndpoint,
+  assistantText: string,
+): boolean {
+  const trimmed = assistantText.trim();
+  const fenced = /^```json[ \t]*\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed);
+  const candidate = fenced?.[1] ?? trimmed;
+  const parsed = tryParseJsonObject(candidate);
+  if (parsed && Object.hasOwn(parsed, "object")) {
+    return true;
+  }
+  const expectedObject =
+    endpoint === "responses" ? "response" : "chat.completion";
+  const escapedObject = expectedObject.replace(".", "\\.");
+  return new RegExp(
+    `^(?:\`\`\`json\\s*)?\\{[\\s\\S]*"object"\\s*:\\s*"${escapedObject}"`,
+    "i",
+  ).test(trimmed);
+}
+
+function buildToolFreeSimulatedOutput(
+  endpoint: SimulatedOutputEndpoint,
+  assistantText: string,
+): SimulatedOutputAccepted {
+  const text = stripPrivateCitationMarkers(assistantText);
+  return {
+    kind: "accepted",
+    endpoint,
+    status: "completed",
+    finishReason: "stop",
+    outputText: text,
+    items: [{
+      kind: "message",
+      status: "completed",
+      content: text,
+      refusal: null,
+      parts: [{ kind: "output_text", text }],
+    }],
+    terminalCause: null,
   };
 }
 
@@ -2964,6 +3088,25 @@ function recordSimulatedCorrection(
     endpoint,
     route,
     attempt,
+    rejectionReason: rejection.reason,
+    offeredToolCount: request.tooling.tools.length,
+    assistantTextSize,
+    requestChars: request.promptText.length,
+  });
+}
+
+function recordSimulatedProtocolExhaustion(
+  services: Services,
+  endpoint: SimulatedOutputEndpoint,
+  route: string,
+  request: ParsedOpenAiRequest,
+  rejection: SimulatedOutputRejected,
+  assistantTextSize: number,
+): void {
+  services.observability?.record("provider_drift", {
+    reason: "simulated_protocol_correction_exhausted",
+    endpoint,
+    route,
     rejectionReason: rejection.reason,
     offeredToolCount: request.tooling.tools.length,
     assistantTextSize,

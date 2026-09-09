@@ -11,6 +11,12 @@
   "includeConversationIdInResponseBody": true,
   "retrySimulatedToollessResponses": true,
   "logStdout": false,
+  "observability": {
+    "enabled": false,
+    "logPath": "./logs/proxy-events.jsonl",
+    "maxBytes": 5242880,
+    "maxFiles": 3
+  },
   "confabRetries": 1,
   "msalAuth": true,
   "imageGeneration": {

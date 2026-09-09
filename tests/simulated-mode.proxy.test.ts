@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { CopilotGraphClient, CopilotSubstrateClient } from "../src/proxy/clients";
 import { ConversationStore } from "../src/proxy/conversation-store";
 import { DebugMarkdownLogger } from "../src/proxy/logger";
+import { BridgeObservability } from "../src/proxy/observability";
 import {
   appendSimulatedProtocolCorrection,
   SIMULATED_CORRECTION_RESERVE_CHARS,
@@ -30,6 +31,195 @@ import {
 } from "../src/proxy/utils";
 
 describe("simulated transform mode proxy flow", () => {
+  test("tool-free Responses prompt requests direct assistant text", () => {
+    const options = createOptions();
+    options.substrate.maxSendChars = 6_000;
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        stream: true,
+        input: "Summarize the conversation for compaction.",
+      },
+      options,
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    const prompt = parsed.request.base.promptText;
+    expect(prompt).toContain("Return the complete assistant answer as plain text.");
+    expect(prompt).not.toContain(
+      "Return exactly one markdown JSON code block containing a single valid JSON object",
+    );
+    expect(prompt).not.toContain("STRICT OUTPUT CONTRACT:");
+    expect(prompt.length).toBeLessThanOrEqual(
+      options.substrate.maxSendChars - SIMULATED_CORRECTION_RESERVE_CHARS,
+    );
+  });
+
+  test("tool-free Responses stream accepts a compaction-shaped prose summary without retry", async () => {
+    const summary = [
+      "Conversation summary:",
+      "",
+      "The implementation uses this example:",
+      "```ts",
+      "const value = await loadContext();",
+      "```",
+      "",
+      "Preserve the remaining requirements.",
+      "x".repeat(5_000),
+    ].join("\n");
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        return buildGraphChatResult(conversationId, payload, summary);
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: true,
+          input: "Summarize the conversation for compaction.",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(1);
+    let completed: JsonObject | null = null;
+    for await (const event of readSseEvents(response.body!)) {
+      const parsed = tryParseJsonObject(event.data.trim());
+      if (parsed && tryGetString(parsed, "type") === "response.completed") {
+        completed = isJsonObject(parsed.response) ? parsed.response : null;
+      }
+    }
+    expect(completed?.status).toBe("completed");
+    expect(completed?.output_text).toBe(summary);
+  });
+
+  test("tool-free Responses preserves JSON-shaped assistant text", async () => {
+    const summary = '{"summary":"Keep this as assistant text."}';
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        return buildGraphChatResult(conversationId, payload, summary);
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Return a JSON summary.",
+        }),
+      }),
+    );
+
+    expect(callCount).toBe(1);
+    expect((await response.json() as JsonObject).output_text).toBe(summary);
+  });
+
+  test("tool-free Responses accepts prose containing a Responses JSON example", async () => {
+    const summary =
+      'The API can return {"object":"response","status":"completed"} as an example.';
+    const app = createProxyApp(
+      createServices((conversationId, payload) =>
+        buildGraphChatResult(conversationId, payload, summary)
+      ),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Summarize the API discussion.",
+        }),
+      }),
+    );
+
+    expect((await response.json() as JsonObject).output_text).toBe(summary);
+  });
+
+  test("tool-free Responses accepts plain text after a structural correction", async () => {
+    let callCount = 0;
+    const app = createProxyApp(
+      createServices((conversationId, payload) => {
+        callCount += 1;
+        const result = buildGraphChatResult(
+          conversationId,
+          payload,
+          callCount === 1 ? "" : "Recovered summary.",
+        );
+        return callCount === 1 ? { ...result, assistantText: " " } : result;
+      }),
+    );
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Summarize the conversation.",
+        }),
+      }),
+    );
+
+    expect(callCount).toBe(2);
+    expect((await response.json() as JsonObject).output_text).toBe(
+      "Recovered summary.",
+    );
+  });
+
+  test("tool_choice none does not advertise tool calls in the simulated prompt", () => {
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "gpt-5.6-sol",
+        input: "Answer without tools.",
+        tools: [{
+          type: "function",
+          name: "exec_command",
+          parameters: { type: "object", properties: {} },
+        }],
+        tool_choice: "none",
+      },
+      createOptions(),
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+    expect(parsed.request.base.promptText).toContain(
+      "Return the complete assistant answer as plain text.",
+    );
+    expect(parsed.request.base.promptText).not.toContain(
+      "Tool calls are supported here",
+    );
+  });
+
   test("GET /healthz reports active transform mode", async () => {
     const app = createProxyApp(
       createServices(
@@ -335,6 +525,15 @@ describe("simulated transform mode proxy flow", () => {
           },
           { type: "message", role: "user", content: "Continue." },
         ],
+        tools: [{
+          type: "function",
+          name: "exec_command",
+          parameters: {
+            type: "object",
+            properties: { cmd: { type: "string" } },
+            required: ["cmd"],
+          },
+        }],
       },
       options,
     );
@@ -485,7 +684,7 @@ describe("simulated transform mode proxy flow", () => {
       "The JSON payload below is an entire request for the OpenAI chat.completions format.",
     );
     expect(capturedPrompt).toContain(
-      "Focus on producing a valid response object that matches the expected OpenAI format for this request.",
+      "Return the complete assistant answer as plain text.",
     );
     expect(capturedPrompt).not.toContain("You are simulating");
     expect(capturedPrompt).toContain("```json");
@@ -3859,10 +4058,12 @@ describe("simulated transform mode proxy flow", () => {
   test("responses rejects a repeated malformed in-progress wrapper after one correction", async () => {
     const malformed = "{\"id\":\"resp_retry_exhausted\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":const result = await tools.exec_command({cmd:\"pwd\"});text(result);}";
     let callCount = 0;
-    const app = createProxyApp(createServices((conversationId, payload) => {
+    const services = createServices((conversationId, payload) => {
       callCount += 1;
       return buildGraphChatResult(conversationId, payload, malformed);
-    }));
+    });
+    services.observability = new BridgeObservability();
+    const app = createProxyApp(services);
     const response = await app.fetch(new Request("http://localhost/v1/responses", {
       method: "POST",
       headers: { "content-type": "application/json", "x-m365-transport": TransportNames.Graph },
@@ -3879,6 +4080,10 @@ describe("simulated transform mode proxy flow", () => {
     const body = (await response.json()) as JsonObject;
     expect(body.status).toBe("failed");
     expect((body.error as JsonObject).code).toBe("provider_drift");
+    const readiness = await app.fetch(new Request("http://localhost/readyz"));
+    const readinessBody = (await readiness.json()) as JsonObject;
+    const events = readinessBody.events as JsonObject;
+    expect((events.provider_drift as JsonObject).count).toBe(1);
   });
 
   test("responses resumes a preceding leaked tool envelope on explicit request", async () => {
@@ -4903,7 +5108,7 @@ describe("simulated transform mode proxy flow", () => {
   test("does not register a cancelled Responses correction for replay", async () => {
     const controller = new AbortController();
     let callCount = 0;
-    const invalid = "{\"not\":\"a response\"}";
+    const invalid = '{"object":"response"}';
     const valid = toMarkdownJson({
       object: "response",
       status: "completed",

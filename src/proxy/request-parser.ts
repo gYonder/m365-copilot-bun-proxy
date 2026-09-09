@@ -556,6 +556,9 @@ function buildSimulatedPrompt(
   tooling: OpenAiTooling,
   maxChars = 0,
 ): string {
+  const hasToolSurface =
+    tooling.tools.length > 0 &&
+    tooling.toolChoiceMode !== ToolChoiceModes.None;
   const promptBudget =
     maxChars > 0
       ? maxChars - SIMULATED_CORRECTION_RESERVE_CHARS
@@ -570,16 +573,27 @@ function buildSimulatedPrompt(
   const lines: string[] = [
     `The JSON payload below is an entire request for the OpenAI ${endpointFormat} format.`,
     `The JSON payload below is an entire request for POST ${endpointPath}.`,
-    `Interpret it exactly in OpenAI ${endpointFormat} format and produce the corresponding response in the same format.`,
-    "Focus on producing a valid response object that matches the expected OpenAI format for this request.",
-    "Return exactly one markdown JSON code block containing a single valid JSON object and no surrounding prose.",
-    "Every string must be valid JSON: escape line breaks, quotes, backslashes, and control characters instead of writing literal control characters inside a string.",
-    'If the payload has "stream": true, still return the final completed JSON object (not SSE events).',
-    "Do not invent provider metadata such as id, model, created/created_at, usage, or SSE fields; the local bridge supplies those.",
-    "For Responses, the final status must be completed, failed, or incomplete; never return in_progress as the final buffered response.",
-    "Responses output_text is optional, but when present it must exactly equal the concatenated output_text message parts.",
   ];
-  if (tooling.tools.length > 0) {
+  if (hasToolSurface) {
+    lines.push(
+      `Interpret it exactly in OpenAI ${endpointFormat} format and produce the corresponding response in the same format.`,
+      "Focus on producing a valid response object that matches the expected OpenAI format for this request.",
+      "Return exactly one markdown JSON code block containing a single valid JSON object and no surrounding prose.",
+      "Every string must be valid JSON: escape line breaks, quotes, backslashes, and control characters instead of writing literal control characters inside a string.",
+      'If the payload has "stream": true, still return the final completed JSON object (not SSE events).',
+      "Do not invent provider metadata such as id, model, created/created_at, usage, or SSE fields; the local bridge supplies those.",
+      "For Responses, the final status must be completed, failed, or incomplete; never return in_progress as the final buffered response.",
+      "Responses output_text is optional, but when present it must exactly equal the concatenated output_text message parts.",
+    );
+  } else {
+    lines.push(
+      `Interpret it exactly in OpenAI ${endpointFormat} format and answer the request directly.`,
+      "Return the complete assistant answer as plain text.",
+      "Do not wrap the answer in JSON or a markdown code fence.",
+      'If the payload has "stream": true, still return the complete final answer.',
+    );
+  }
+  if (hasToolSurface) {
     lines.push(
       "You are producing a response for a local harness that will execute tool calls.",
       "If the request requires local files, shell state, or any other local environment access, emit an appropriate tool call instead of saying the environment is inaccessible.",
@@ -624,11 +638,9 @@ function buildSimulatedPrompt(
     }
   }
 
-  const trailingContract = buildSimulatedOutputContract(
-    endpointFormat,
-    tooling,
-    requestJson,
-  );
+  const trailingContract = hasToolSurface
+    ? buildSimulatedOutputContract(endpointFormat, tooling, requestJson)
+    : [];
   const render = (payload: JsonObject, compact: boolean): string =>
     [
       ...lines,
