@@ -72,6 +72,74 @@ describe("strict simulated output boundary", () => {
     );
   });
 
+  test("repairs literal newlines inside outer Responses strings", () => {
+    const result = decodeAndValidateSimulatedOutput(
+      `{"object":"response","status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"line one
+line two"}]}],"output_text":"line one
+line two"}`,
+      "responses",
+      tooling(),
+    );
+
+    expectAccepted(result);
+    expect(result.outputText).toBe("line one\nline two");
+  });
+
+  test("repairs every literal JSON control character inside strings", () => {
+    const controls = "\u0000\b\f\n\r\t\u001f";
+    const valid = JSON.stringify(responsesPayload([responseMessage(controls)]));
+    const malformed = valid
+      .replaceAll("\\u0000", "\u0000")
+      .replaceAll("\\b", "\b")
+      .replaceAll("\\f", "\f")
+      .replaceAll("\\n", "\n")
+      .replaceAll("\\r", "\r")
+      .replaceAll("\\t", "\t")
+      .replaceAll("\\u001f", "\u001f");
+
+    const result = decodeAndValidateSimulatedOutput(
+      malformed,
+      "responses",
+      tooling(),
+    );
+
+    expectAccepted(result);
+    expect(result.outputText).toBe(controls);
+  });
+
+  test("repairs literal newlines in nested function arguments", () => {
+    const result = decodeAndValidateSimulatedOutput(
+      `{"object":"response","status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call_exec","name":"exec","arguments":"{\\"cmd\\":\\"line one
+line two\\"}"}]}`,
+      "responses",
+      functionTooling(),
+    );
+
+    expectAccepted(result);
+    const item = result.items[0];
+    expect(item?.kind).toBe("function_call");
+    if (item?.kind !== "function_call") return;
+    expect(JSON.parse(item.call.argumentsJson)).toEqual({
+      cmd: "line one\nline two",
+    });
+  });
+
+  test("does not repair malformed JSON structure or controls outside strings", () => {
+    const payload = JSON.stringify(responsesPayload([responseMessage("hello")]));
+    expectRejected(
+      payload.slice(0, -1),
+      "responses",
+      tooling(),
+      "malformed_json",
+    );
+    expectRejected(
+      `${payload}\n\u0000`,
+      "responses",
+      tooling(),
+      "malformed_json",
+    );
+  });
+
   test("does not recursively inspect valid message text", () => {
     const content = [
       "Example JSON: ",

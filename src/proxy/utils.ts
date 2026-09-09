@@ -128,6 +128,45 @@ export function tryParseJsonObject(
   }
 }
 
+export function escapeJsonControlCharactersInStrings(raw: string): string {
+  let output = "";
+  let inString = false;
+  let escaped = false;
+
+  for (const ch of raw) {
+    if (inString) {
+      if (escaped) {
+        output += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        output += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === "\"") {
+        output += ch;
+        inString = false;
+        continue;
+      }
+      if (ch.charCodeAt(0) < 0x20) {
+        output += JSON.stringify(ch).slice(1, -1);
+        continue;
+      }
+      output += ch;
+      continue;
+    }
+
+    if (ch === "\"") {
+      inString = true;
+    }
+    output += ch;
+  }
+
+  return output;
+}
+
 export async function tryReadJsonPayload(
   request: Request,
 ): Promise<JsonPayload | null> {

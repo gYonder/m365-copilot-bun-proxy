@@ -102,6 +102,7 @@ import {
 } from "./tool-ledger";
 import {
   cloneJsonValue,
+  escapeJsonControlCharactersInStrings,
   extractGraphErrorMessage,
   isJsonObject,
   nowUnix,
@@ -3548,7 +3549,7 @@ function normalizeSimulatedToolArguments(argumentsNode: unknown): string {
     return "{}";
   }
 
-  const repaired = sanitizeJsonControlCharsInsideStringLiterals(raw);
+  const repaired = escapeJsonControlCharactersInStrings(raw);
   for (const candidate of [raw, repaired]) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
@@ -3559,62 +3560,6 @@ function normalizeSimulatedToolArguments(argumentsNode: unknown): string {
   }
 
   return JSON.stringify({ input: raw });
-}
-
-function sanitizeJsonControlCharsInsideStringLiterals(raw: string): string {
-  let output = "";
-  let inString = false;
-  let escaped = false;
-
-  for (let index = 0; index < raw.length; index++) {
-    const ch = raw[index];
-    if (!ch) {
-      continue;
-    }
-
-    if (inString) {
-      if (escaped) {
-        output += ch;
-        escaped = false;
-        continue;
-      }
-      if (ch === "\\") {
-        output += ch;
-        escaped = true;
-        continue;
-      }
-      if (ch === "\"") {
-        output += ch;
-        inString = false;
-        continue;
-      }
-      if (ch === "\n") {
-        output += "\\n";
-        continue;
-      }
-      if (ch === "\r") {
-        output += "\\r";
-        continue;
-      }
-      if (ch === "\t") {
-        output += "\\t";
-        continue;
-      }
-
-      output += ch;
-      continue;
-    }
-
-    if (ch === "\"") {
-      inString = true;
-      output += ch;
-      continue;
-    }
-
-    output += ch;
-  }
-
-  return output;
 }
 
 function normalizeSimulatedResponsesPayload(

@@ -21,7 +21,11 @@ import {
 } from "./responses-api";
 import { estimateJsonTokens } from "./context-accounting";
 import { stripPrivateCitationMarkers } from "./responses-provenance";
-import { isJsonObject, nowUnix } from "./utils";
+import {
+  escapeJsonControlCharactersInStrings,
+  isJsonObject,
+  nowUnix,
+} from "./utils";
 
 export type SimulatedOutputEndpoint = "chat.completions" | "responses";
 
@@ -139,7 +143,15 @@ function decodeJsonObject(
   try {
     parsed = JSON.parse(jsonText);
   } catch {
-    return { kind: "rejected", reason: "malformed_json" };
+    const repaired = escapeJsonControlCharactersInStrings(jsonText);
+    if (repaired === jsonText) {
+      return { kind: "rejected", reason: "malformed_json" };
+    }
+    try {
+      parsed = JSON.parse(repaired);
+    } catch {
+      return { kind: "rejected", reason: "malformed_json" };
+    }
   }
 
   if (!isJsonObject(parsed)) {
@@ -658,7 +670,7 @@ function validateFunctionCall(
     id,
     name: offered.name,
     type: "function" as const,
-    argumentsJson,
+    argumentsJson: escapeJsonControlCharactersInStrings(argumentsJson),
   };
   const validation = validateOpenAiToolCall(call, tooling);
   return validation.valid

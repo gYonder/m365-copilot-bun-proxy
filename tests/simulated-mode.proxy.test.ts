@@ -4638,10 +4638,90 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(502);
-    expect(callCount).toBe(2);
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("provider_drift");
+    const choices = body.choices as JsonObject[];
+    const message = choices[0]?.message as JsonObject;
+    const toolCalls = message.tool_calls as JsonObject[];
+    const toolFunction = toolCalls[0]?.function as JsonObject;
+    expect(toolFunction.name).toBe("apply_diff");
+    expect(JSON.parse(toolFunction.arguments as string)).toEqual({
+      path: "tests/agent-tests/fizz-buzz.ts",
+      diff: "<<<<<<< SEARCH\n:start_line:1\nfoo\n=======\nbar\n>>>>>>> REPLACE",
+    });
+  });
+
+  test("responses repairs raw controls in the outer tool envelope without retry", async () => {
+    const malformedEnvelope = `\`\`\`json
+{"object":"response","status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call_exec_raw_controls","name":"exec","arguments":"{\\"cmd\\":\\"line one
+line two\\"}"}]}
+\`\`\``;
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        malformedEnvelope,
+      );
+    });
+    services.observability = new BridgeObservability();
+    const app = createProxyApp(services);
+
+    const response = await app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify({
+          model: "m365-copilot",
+          stream: false,
+          input: "Run a multiline command.",
+          tools: [
+            {
+              type: "function",
+              name: "exec",
+              description: "Run a command.",
+              parameters: {
+                type: "object",
+                properties: { cmd: { type: "string" } },
+                required: ["cmd"],
+                additionalProperties: false,
+              },
+            },
+          ],
+          tool_choice: "auto",
+        }),
+      }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(callCount).toBe(1);
+    const body = (await response.json()) as JsonObject;
+    const output = body.output as JsonObject[];
+    expect(output[0]).toMatchObject({
+      type: "function_call",
+      call_id: "call_exec_raw_controls",
+      name: "exec",
+    });
+    expect(JSON.parse(output[0].arguments as string)).toEqual({
+      cmd: "line one\nline two",
+    });
+
+    const readiness = await app.fetch(new Request("http://localhost/readyz"));
+    const readinessBody = (await readiness.json()) as JsonObject;
+    const recentEvents = readinessBody.recentEvents as JsonObject[];
+    expect(
+      recentEvents.some(
+        (event) =>
+          event.name === "retry" &&
+          (event.fields as JsonObject).reason ===
+            "simulated_protocol_correction",
+      ),
+    ).toBeFalse();
   });
 
   test("chat/completions rejects an empty simulated payload without resending", async () => {
