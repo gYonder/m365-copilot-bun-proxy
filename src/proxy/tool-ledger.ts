@@ -301,7 +301,56 @@ export class ToolLedger {
     requestProfileKey: string,
     _result?: unknown,
   ): ToolLedgerResult<IssuedCall> {
+    const result = this.acceptResults([callId], requestProfileKey);
+    return result.ok
+      ? { ok: true, value: result.value[0] }
+      : result;
+  }
+
+  acceptResults(
+    callIds: readonly string[],
+    requestProfileKey: string,
+  ): ToolLedgerResult<IssuedCall[]> {
     this.expirePending(this.readNow());
+    if (new Set(callIds).size !== callIds.length) {
+      return this.reject(
+        "duplicate_result",
+        "duplicate_tool_result_or_replay",
+      );
+    }
+    for (const callId of callIds) {
+      const validation = this.validateResultEntry(callId, requestProfileKey);
+      if (!validation.ok) {
+        return validation;
+      }
+    }
+    const acceptedEntries: IssuedCall[] = [];
+    for (const callId of callIds) {
+      const entry = this.entries.get(callId);
+      if (!entry) {
+        return this.reject("invalid_call", "invalid_request");
+      }
+      acceptedEntries.push(entry);
+    }
+    const accepted = acceptedEntries.map((entry) => {
+      entry.status = "completed";
+      return { ...entry };
+    });
+    return { ok: true, value: accepted };
+  }
+
+  validateResult(
+    callId: string,
+    requestProfileKey: string,
+  ): ToolLedgerResult<IssuedCall> {
+    this.expirePending(this.readNow());
+    return this.validateResultEntry(callId, requestProfileKey);
+  }
+
+  private validateResultEntry(
+    callId: string,
+    requestProfileKey: string,
+  ): ToolLedgerResult<IssuedCall> {
     const entry = this.entries.get(callId);
     if (!entry) return this.reject("unknown_call_id", "invalid_request");
     if (entry.status === "completed") {
@@ -321,7 +370,6 @@ export class ToolLedger {
     if (metadata.round < latestRound) {
       return this.reject("out_of_order", "invalid_request");
     }
-    entry.status = "completed";
     return { ok: true, value: { ...entry } };
   }
 
@@ -354,6 +402,21 @@ export class ToolLedger {
   get(callId: string): IssuedCall | null {
     const entry = this.entries.get(callId);
     return entry ? { ...entry } : null;
+  }
+
+  getTaskIdForCall(callId: string): string | null {
+    this.expirePending(this.readNow());
+    return this.metadata.get(callId)?.taskId ?? null;
+  }
+
+  getTaskIdForResponse(responseId: string): string | null {
+    this.expirePending(this.readNow());
+    for (const metadata of this.metadata.values()) {
+      if (metadata.responseId === responseId) {
+        return metadata.taskId;
+      }
+    }
+    return null;
   }
 
   hasTask(taskId: string): boolean {

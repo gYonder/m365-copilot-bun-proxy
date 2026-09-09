@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { CopilotGraphClient, CopilotSubstrateClient } from "../src/proxy/clients";
 import { ConversationStore } from "../src/proxy/conversation-store";
+import { DurableStateStore } from "../src/proxy/durable-state";
 import { DebugMarkdownLogger } from "../src/proxy/logger";
 import { BridgeObservability } from "../src/proxy/observability";
 import {
   appendSimulatedProtocolCorrection,
+  buildSimulatedRegenerationPrompt,
   SIMULATED_CORRECTION_RESERVE_CHARS,
+  SIMULATED_REGENERATION_RESERVE_CHARS,
   tryParseResponsesRequest,
 } from "../src/proxy/request-parser";
 import { createProxyApp } from "../src/proxy/server";
@@ -14,6 +17,7 @@ import { ProxyTokenProvider } from "../src/proxy/token-provider";
 import {
   LogLevels,
   OpenAiTransformModes,
+  SimulatedOutputProtocols,
   ToolChoiceModes,
   TransportNames,
   type ChatResult,
@@ -546,7 +550,7 @@ describe("simulated transform mode proxy flow", () => {
       1,
       "duplicate_call_id",
       options.substrate.maxSendChars,
-      '{"object":"response","status":"completed","output":[]}',
+      '{"object":"response","status":"completed","output":[]}'.repeat(5),
     );
     expect(initial.length).toBeLessThanOrEqual(
       options.substrate.maxSendChars - SIMULATED_CORRECTION_RESERVE_CHARS,
@@ -2324,7 +2328,7 @@ describe("simulated transform mode proxy flow", () => {
             {
               status: "completed",
               type: "function_call",
-              call_id: "call_1",
+              call_id: `call_${upstreamCalls}`,
               name: "exec",
               arguments: "{}",
             },
@@ -2374,11 +2378,6 @@ describe("simulated transform mode proxy flow", () => {
           arguments: "{}",
         },
         { type: "function_call_output", call_id: "call_1", output: "ok" },
-        {
-          type: "custom_tool_call_output",
-          call_id: "custom_1",
-          output: "ok",
-        },
         { role: "user", content: "Give final answer." },
       ],
       tools: [
@@ -4057,9 +4056,11 @@ describe("simulated transform mode proxy flow", () => {
 
   test("responses rejects a repeated malformed in-progress wrapper after one correction", async () => {
     const malformed = "{\"id\":\"resp_retry_exhausted\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":const result = await tools.exec_command({cmd:\"pwd\"});text(result);}";
+    const capturedPrompts: string[] = [];
     let callCount = 0;
     const services = createServices((conversationId, payload) => {
       callCount += 1;
+      capturedPrompts.push(readPrompt(payload));
       return buildGraphChatResult(conversationId, payload, malformed);
     });
     services.observability = new BridgeObservability();
@@ -4084,6 +4085,38 @@ describe("simulated transform mode proxy flow", () => {
     const readinessBody = (await readiness.json()) as JsonObject;
     const events = readinessBody.events as JsonObject;
     expect((events.provider_drift as JsonObject).count).toBe(1);
+    const recentEvents = readinessBody.recentEvents as JsonObject[];
+    const correctionEvents = recentEvents.filter(
+      (event) =>
+        event.name === "retry" &&
+        (event.fields as JsonObject).reason ===
+          "simulated_protocol_correction",
+    );
+    expect(correctionEvents).toHaveLength(2);
+    expect(
+      (correctionEvents[0]?.fields as JsonObject).requestChars,
+    ).toBe(capturedPrompts[0]?.length);
+    expect(
+      (correctionEvents[1]?.fields as JsonObject).requestChars,
+    ).toBe(capturedPrompts[1]?.length);
+    expect(
+      (correctionEvents[1]?.fields as JsonObject).sameAsFirstCandidate,
+    ).toBeTrue();
+    expect(JSON.stringify(correctionEvents)).not.toContain(malformed);
+    const exhaustionEvent = recentEvents.find(
+      (event) => event.name === "provider_drift",
+    );
+    expect(
+      (exhaustionEvent?.fields as JsonObject).requestChars,
+    ).toBe(capturedPrompts[1]?.length);
+    expect(
+      (exhaustionEvent?.fields as JsonObject).sameAsFirstCandidate,
+    ).toBeTrue();
+    const decodeDiagnostics = (exhaustionEvent?.fields as JsonObject)
+      .decodeDiagnostics as JsonObject;
+    expect(typeof decodeDiagnostics.category).toBe("string");
+    expect(typeof decodeDiagnostics.candidateLength).toBe("number");
+    expect(JSON.stringify(exhaustionEvent)).not.toContain(malformed);
   });
 
   test("responses resumes a preceding leaked tool envelope on explicit request", async () => {
@@ -5536,6 +5569,920 @@ line two\\"}"}]}
     expect(args).toContain("exec_command");
     expect(args).toContain("pwd");
     expect(choices[0].finish_reason).toBe("tool_calls");
+  });
+
+  function makeResponsesPost(
+    app: ReturnType<typeof createProxyApp>,
+    body: JsonObject,
+    signal?: AbortSignal,
+  ) {
+    return app.fetch(
+      new Request("http://localhost/v1/responses", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-m365-transport": TransportNames.Graph,
+        },
+        body: JSON.stringify(body),
+        signal,
+      }),
+    );
+  }
+
+  function makeRetryRequestBody(turnId: string, extra?: JsonObject): JsonObject {
+    return {
+      model: "m365-copilot",
+      stream: false,
+      input: "Use the local shell to run pwd.",
+      client_metadata: {
+        thread_id: `thread-${turnId}`,
+        session_id: `session-${turnId}`,
+        turn_id: turnId,
+      },
+      tools: [
+        {
+          type: "custom",
+          name: "exec",
+          description: "Execute.",
+          format: { type: "grammar", syntax: "lark" },
+        },
+      ],
+      tool_choice: "auto",
+      ...extra,
+    };
+  }
+
+  test("sequential identical requests call counts 2,4,4,4,4, prompt isolation, and exact failure terminal replay", async () => {
+    const capturedPrompts: string[] = [];
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      capturedPrompts.push(readPrompt(payload));
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed candidate ${callCount}}`,
+      );
+    });
+    services.observability = new BridgeObservability();
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("seq-retry");
+
+    const res1 = await makeResponsesPost(app, body);
+    expect((await res1.json()).status).toBe("failed");
+    expect(callCount).toBe(2);
+
+    const res2 = await makeResponsesPost(app, body);
+    const body2 = (await res2.json()) as JsonObject;
+    expect(body2.status).toBe("failed");
+    expect(callCount).toBe(4);
+
+    for (let i = 0; i < 3; i++) {
+      const res = await makeResponsesPost(app, body);
+      expect(res.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+      expect((await res.json())).toEqual(body2);
+      expect(callCount).toBe(4);
+    }
+
+    expect(capturedPrompts[2]).toContain("PROTOCOL REGENERATION");
+    expect(capturedPrompts[2]).toContain("Regenerate the entire response from scratch");
+    expect(capturedPrompts[2]).not.toContain("malformed candidate 1");
+    expect(capturedPrompts[2]).not.toContain("malformed candidate 2");
+
+    expect(capturedPrompts[3]).toContain("PROTOCOL CORRECTION 1");
+    expect(capturedPrompts[3]).toContain("malformed candidate 3");
+    expect(capturedPrompts[3]).not.toContain("malformed candidate 1");
+    expect(capturedPrompts[3]).not.toContain("malformed candidate 2");
+
+    const readiness = (await (await app.fetch(new Request("http://localhost/readyz"))).json()) as JsonObject;
+    const recent = readiness.recentEvents as JsonObject[];
+    const retryEvents = recent.filter(
+      (e) => e.name === "retry" && (e.fields as JsonObject).reason === "simulated_protocol_correction",
+    );
+    expect(retryEvents).toHaveLength(4);
+    expect((retryEvents[0]?.fields as JsonObject).cycle).toBe(1);
+    expect((retryEvents[1]?.fields as JsonObject).cycle).toBe(1);
+    expect((retryEvents[2]?.fields as JsonObject).cycle).toBe(2);
+    expect((retryEvents[3]?.fields as JsonObject).cycle).toBe(2);
+
+    const dedupEvents = recent.filter((e) => e.name === "dedup_hit");
+    expect(dedupEvents.length).toBeGreaterThanOrEqual(3);
+    for (const de of dedupEvents) {
+      expect((de.fields as JsonObject).kind).toBe("protocol_failure_replay");
+    }
+  });
+
+  test("regeneration success clears failure state and later identical request uses successful replay", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      if (callCount <= 2) {
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+        );
+      }
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        toMarkdownJson({
+          id: "resp_regen_success",
+          object: "response",
+          status: "completed",
+          output: [responseMessage("regeneration succeeded")],
+          output_text: "regeneration succeeded",
+        }),
+      );
+    });
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("regen-success", {
+      tools: undefined,
+      input: "Hello again.",
+    });
+
+    const res1 = await makeResponsesPost(app, body);
+    expect((await res1.json()).status).toBe("failed");
+    expect(callCount).toBe(2);
+
+    const res2 = await makeResponsesPost(app, body);
+    const body2 = (await res2.json()) as JsonObject;
+    expect(body2.status).toBe("completed");
+    expect(body2.output_text).toBe("regeneration succeeded");
+    expect(callCount).toBe(3);
+
+    const res3 = await makeResponsesPost(app, body);
+    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+    expect((await res3.json())).toEqual(body2);
+    expect(callCount).toBe(3);
+  });
+
+  test("concurrent duplicates join in-flight without consuming regeneration cycle", async () => {
+    let callCount = 0;
+    let release1: (() => void) | undefined;
+    let release3: (() => void) | undefined;
+    const block1 = new Promise<void>((r) => { release1 = r; });
+    const block3 = new Promise<void>((r) => { release3 = r; });
+
+    const services = createServices(async (conversationId, payload) => {
+      callCount += 1;
+      if (callCount === 1) await block1;
+      if (callCount === 3) await block3;
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+      );
+    });
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("concurrent-retry");
+
+    const p1 = makeResponsesPost(app, body);
+    const p2 = makeResponsesPost(app, body);
+    await Promise.resolve();
+    release1?.();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    expect((await r1.json()).status).toBe("failed");
+    expect((await r2.json()).status).toBe("failed");
+    expect(callCount).toBe(2);
+
+    const p3 = makeResponsesPost(app, body);
+    const p4 = makeResponsesPost(app, body);
+    await Promise.resolve();
+    release3?.();
+    const [r3, r4] = await Promise.all([p3, p4]);
+    expect((await r3.json()).status).toBe("failed");
+    expect((await r4.json()).status).toBe("failed");
+    expect(callCount).toBe(4);
+  });
+
+  test("streaming cached failure has one terminal", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+      );
+    });
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("stream-cached-fail");
+
+    await makeResponsesPost(app, body);
+    await makeResponsesPost(app, body);
+    expect(callCount).toBe(4);
+
+    const streamRes = await makeResponsesPost(app, { ...body, stream: true });
+    expect(streamRes.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+
+    const events: JsonObject[] = [];
+    let sawDone = false;
+    for await (const event of readSseEvents(streamRes.body!)) {
+      const data = event.data.trim();
+      if (!data) continue;
+      if (data === "[DONE]") {
+        sawDone = true;
+        continue;
+      }
+      const parsed = tryParseJsonObject(data);
+      if (parsed) events.push(parsed);
+    }
+    expect(sawDone).toBeTrue();
+    const terminals = events.filter((e) =>
+      ["response.completed", "response.failed", "response.incomplete"].includes(String(e.type)),
+    );
+    expect(terminals).toHaveLength(1);
+    expect(terminals[0]?.type).toBe("response.failed");
+    expect(callCount).toBe(4);
+  });
+
+  test("decoder-cycle failure has no durable failure replay", async () => {
+    const durable = new DurableStateStore();
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+      );
+    });
+    services.responseStore = new ResponseStore(services.options, durable);
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("durable-fail");
+
+    await makeResponsesPost(app, body);
+    await makeResponsesPost(app, body);
+    expect(callCount).toBe(4);
+
+    expect(Object.keys(durable.state.replays)).toHaveLength(0);
+    expect(Object.keys(durable.state.responses)).toHaveLength(0);
+
+    const restartedServices = createServices((conversationId, payload) => {
+      callCount += 1;
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+      );
+    });
+    restartedServices.responseStore = new ResponseStore(restartedServices.options, durable);
+    const restartedApp = createProxyApp(restartedServices);
+
+    await makeResponsesPost(restartedApp, body);
+    expect(callCount).toBe(6);
+  });
+
+  test("regeneration throw fails closed and subsequent retries replay failure terminal without third cycle", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      if (callCount <= 2) {
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+        );
+      }
+      throw new Error("Upstream network error");
+    });
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("regen-throw");
+
+    const res1 = await makeResponsesPost(app, body);
+    const body1 = (await res1.json()) as JsonObject;
+    expect(body1.status).toBe("failed");
+    expect(callCount).toBe(2);
+
+    const res2 = await makeResponsesPost(app, body);
+    expect(res2.status).toBe(500);
+    expect(callCount).toBe(3);
+
+    const res3 = await makeResponsesPost(app, body);
+    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+    expect((await res3.json())).toEqual(body1);
+    expect(callCount).toBe(3);
+
+    const res4 = await makeResponsesPost(app, body);
+    expect(res4.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+    expect((await res4.json())).toEqual(body1);
+    expect(callCount).toBe(3);
+  });
+
+  test("upstream failure during regeneration fails closed without third cycle", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      if (callCount <= 2) {
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+        );
+      }
+      return {
+        isSuccess: false,
+        statusCode: 500,
+        rawBody: "Internal Server Error",
+        responseJson: null,
+        conversationId,
+      };
+    });
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("regen-upstream-500");
+
+    const res1 = await makeResponsesPost(app, body);
+    const body1 = (await res1.json()) as JsonObject;
+    expect(body1.status).toBe("failed");
+    expect(callCount).toBe(2);
+
+    const res2 = await makeResponsesPost(app, body);
+    expect(res2.status).toBe(500);
+    expect(callCount).toBe(3);
+
+    const res3 = await makeResponsesPost(app, body);
+    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+    expect((await res3.json())).toEqual(body1);
+    expect(callCount).toBe(3);
+  });
+
+  test("tool-result-bearing retry gets regeneration with idempotent ledger validation", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      if (callCount === 1) {
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            id: "resp_init_tool",
+            object: "response",
+            status: "completed",
+            output: [
+              {
+                type: "custom_tool_call",
+                status: "completed",
+                call_id: "call_tool_1",
+                name: "exec",
+                input: "{\"cmd\":\"pwd\"}",
+              },
+            ],
+          }),
+        );
+      }
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed candidate ${callCount}}`,
+      );
+    });
+    const app = createProxyApp(services);
+
+    const initReq = makeRetryRequestBody("turn-tool-init");
+    const initRes = await makeResponsesPost(app, initReq);
+    expect(initRes.status).toBe(200);
+    expect(callCount).toBe(1);
+    const initBody = (await initRes.json()) as JsonObject;
+
+    const continuationReq = makeRetryRequestBody("turn-tool-cont", {
+      previous_response_id: initBody.id as string,
+      input: [
+        {
+          type: "custom_tool_call_output",
+          call_id: "call_tool_1",
+          output: "/home/user",
+        },
+      ],
+    });
+
+    const res1 = await makeResponsesPost(app, continuationReq);
+    expect((await res1.json()).status).toBe("failed");
+    expect(callCount).toBe(3);
+
+    const ledgerResolution =
+      services.responseStore.resolveToolLedgerTaskScope(
+        ["call_tool_1"],
+        initBody.id as string,
+        "unused",
+      );
+    expect(ledgerResolution.kind).toBe("resolved");
+    if (ledgerResolution.kind !== "resolved") return;
+    const ledgerScope = ledgerResolution.taskId;
+    const ledgerAfterCont1 =
+      services.responseStore.getOrCreateToolLedger(ledgerScope);
+    expect(ledgerAfterCont1.get("call_tool_1")?.status).toBe("completed");
+
+    const res2 = await makeResponsesPost(app, continuationReq);
+    const body2 = (await res2.json()) as JsonObject;
+    expect(body2.status).toBe("failed");
+    expect(callCount).toBe(5);
+
+    const ledgerAfterRegen =
+      services.responseStore.getOrCreateToolLedger(ledgerScope);
+    expect(ledgerAfterRegen.get("call_tool_1")?.status).toBe("completed");
+
+    const res3 = await makeResponsesPost(app, continuationReq);
+    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+    expect((await res3.json())).toEqual(body2);
+    expect(callCount).toBe(5);
+  });
+
+  test("rejects mixed known and unknown tool-result call IDs before upstream", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        toMarkdownJson({
+          object: "response",
+          status: "completed",
+          output: [{
+            type: "custom_tool_call",
+            status: "completed",
+            call_id: "call_known",
+            name: "exec",
+            input: "{\"cmd\":\"pwd\"}",
+          }],
+        }),
+      );
+    });
+    const app = createProxyApp(services);
+    const initial = await makeResponsesPost(
+      app,
+      makeRetryRequestBody("mixed-call-init"),
+    );
+    const initialBody = (await initial.json()) as JsonObject;
+    expect(callCount).toBe(1);
+
+    const continuation = await makeResponsesPost(
+      app,
+      makeRetryRequestBody("mixed-call-result", {
+        previous_response_id: initialBody.id as string,
+        input: [
+          {
+            type: "custom_tool_call_output",
+            call_id: "call_known",
+            output: "known",
+          },
+          {
+            type: "custom_tool_call_output",
+            call_id: "call_unknown",
+            output: "unknown",
+          },
+        ],
+      }),
+    );
+    expect((await continuation.json()).status).toBe("failed");
+    expect(callCount).toBe(1);
+
+    const resolution =
+      services.responseStore.resolveToolLedgerTaskScope(
+        ["call_known"],
+        initialBody.id as string,
+        "unused",
+      );
+    expect(resolution.kind).toBe("resolved");
+    if (resolution.kind !== "resolved") return;
+    expect(
+      services.responseStore
+        .getOrCreateToolLedger(resolution.taskId)
+        .get("call_known")?.status,
+    ).toBe("pending");
+  });
+
+  test("rejects duplicate tool-result call IDs without completing the call", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        toMarkdownJson({
+          object: "response",
+          status: "completed",
+          output: [{
+            type: "custom_tool_call",
+            status: "completed",
+            call_id: "call_duplicate",
+            name: "exec",
+            input: "{\"cmd\":\"pwd\"}",
+          }],
+        }),
+      );
+    });
+    const app = createProxyApp(services);
+    const initial = await makeResponsesPost(
+      app,
+      makeRetryRequestBody("duplicate-result-init"),
+    );
+    const initialBody = (await initial.json()) as JsonObject;
+    expect(callCount).toBe(1);
+
+    const duplicateResult = {
+      type: "custom_tool_call_output",
+      call_id: "call_duplicate",
+      output: "result",
+    };
+    const continuation = await makeResponsesPost(
+      app,
+      makeRetryRequestBody("duplicate-result-cont", {
+        previous_response_id: initialBody.id as string,
+        input: [duplicateResult, duplicateResult],
+      }),
+    );
+    expect((await continuation.json()).status).toBe("failed");
+    expect(callCount).toBe(1);
+
+    const resolution = services.responseStore.resolveToolLedgerTaskScope(
+      ["call_duplicate"],
+      initialBody.id as string,
+      "unused",
+    );
+    expect(resolution.kind).toBe("resolved");
+    if (resolution.kind !== "resolved") return;
+    expect(
+      services.responseStore
+        .getOrCreateToolLedger(resolution.taskId)
+        .get("call_duplicate")?.status,
+    ).toBe("pending");
+  });
+
+  test("keeps corrected continuation tool calls in the original task ledger", async () => {
+    let callCount = 0;
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      if (callCount === 1) {
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson({
+            object: "response",
+            status: "completed",
+            output: [{
+              type: "custom_tool_call",
+              status: "completed",
+              call_id: "call_round_1",
+              name: "exec",
+              input: "{\"cmd\":\"pwd\"}",
+            }],
+          }),
+        );
+      }
+      if (callCount === 2) {
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          "{\"object\":\"response\",\"status\":\"completed\",\"output\":malformed}",
+        );
+      }
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        toMarkdownJson({
+          object: "response",
+          status: "completed",
+          output: [{
+            type: "custom_tool_call",
+            status: "completed",
+            call_id: "call_round_2",
+            name: "exec",
+            input: "{\"cmd\":\"ls\"}",
+          }],
+        }),
+      );
+    });
+    const app = createProxyApp(services);
+    const initial = await makeResponsesPost(
+      app,
+      makeRetryRequestBody("ledger-scope-init"),
+    );
+    const initialBody = (await initial.json()) as JsonObject;
+
+    const continuation = await makeResponsesPost(
+      app,
+      makeRetryRequestBody("ledger-scope-cont", {
+        previous_response_id: initialBody.id as string,
+        input: [{
+          type: "custom_tool_call_output",
+          call_id: "call_round_1",
+          output: "/home/user",
+        }],
+      }),
+    );
+    const continuationBody = (await continuation.json()) as JsonObject;
+    expect(continuationBody.status).toBe("completed");
+    expect(callCount).toBe(3);
+
+    const firstScope = services.responseStore.resolveToolLedgerTaskScope(
+      ["call_round_1"],
+      initialBody.id as string,
+      "unused",
+    );
+    const secondScope = services.responseStore.resolveToolLedgerTaskScope(
+      ["call_round_2"],
+      continuationBody.id as string,
+      "unused",
+    );
+    expect(firstScope.kind).toBe("resolved");
+    expect(secondScope).toEqual(firstScope);
+  });
+
+  test("bounds request-hash decoder failures in memory for stream and non-stream", async () => {
+    for (const stream of [false, true]) {
+      const durable = new DurableStateStore();
+      let callCount = 0;
+      const services = createServices((conversationId, payload) => {
+        callCount += 1;
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          `{"object":"response","status":"in_progress","output":malformed_${callCount}}`,
+        );
+      });
+      services.responseStore = new ResponseStore(services.options, durable);
+      const app = createProxyApp(services);
+      const body: JsonObject = {
+        model: "m365-copilot",
+        stream,
+        input: "Run pwd without protocol metadata.",
+        tools: [{
+          type: "custom",
+          name: "exec",
+          description: "Execute.",
+          format: { type: "grammar", syntax: "lark" },
+        }],
+        tool_choice: "auto",
+      };
+
+      const first = await makeResponsesPost(app, body);
+      await (stream ? first.text() : first.json());
+      expect(callCount).toBe(2);
+
+      const second = await makeResponsesPost(app, body);
+      await (stream ? second.text() : second.json());
+      expect(callCount).toBe(4);
+
+      const third = await makeResponsesPost(app, body);
+      expect(third.headers.get("x-m365-request-hash-replayed")).toBe("true");
+      await (stream ? third.text() : third.json());
+      expect(callCount).toBe(4);
+      expect(Object.keys(durable.state.replays)).toHaveLength(0);
+      expect(Object.keys(durable.state.responses)).toHaveLength(0);
+    }
+  });
+
+  test("cancellation after acceptance during regeneration fails closed without third cycle", async () => {
+    let callCount = 0;
+    const controller = new AbortController();
+    const services = createServices((conversationId, payload) => {
+      callCount += 1;
+      if (callCount <= 2) {
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
+        );
+      }
+      controller.abort();
+      return buildGraphChatResult(
+        conversationId,
+        payload,
+        toMarkdownJson({
+          id: `resp_${callCount}`,
+          object: "response",
+          status: "completed",
+          output: [responseMessage("completed text")],
+          output_text: "completed text",
+        }),
+      );
+    });
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("regen-cancel-acceptance", {
+      tools: undefined,
+      input: "Hello again.",
+    });
+
+    const res1 = await makeResponsesPost(app, body);
+    expect((await res1.json()).status).toBe("failed");
+    expect(callCount).toBe(2);
+
+    const res2 = await makeResponsesPost(app, body, controller.signal);
+    const body2 = (await res2.json()) as JsonObject;
+    expect(body2.status).toBe("failed");
+    expect(callCount).toBe(3);
+
+    const res3 = await makeResponsesPost(app, body);
+    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
+    expect((await res3.json())).toEqual(body2);
+    expect(callCount).toBe(3);
+  });
+
+  test("buildSimulatedRegenerationPrompt creates independent regeneration prompt directly from original prompt", () => {
+    const originalPrompt = "The JSON payload below is an entire request...\nSTRICT OUTPUT CONTRACT: Return valid JSON.";
+    const regen = buildSimulatedRegenerationPrompt(originalPrompt, 6000);
+    expect(regen).toContain("PROTOCOL REGENERATION:");
+    expect(regen).toContain("Regenerate the entire response from scratch");
+    expect(regen).toContain("Return exactly one complete JSON object");
+    expect(regen).toEndWith("Follow the strict output contract above.");
+
+    expect(() =>
+      buildSimulatedRegenerationPrompt(originalPrompt, 500),
+    ).toThrow("Substrate prompt regeneration cannot fit");
+  });
+
+  test("bridge_v1 corrects and rejects unframed prose instead of accepting directly", async () => {
+    let callCount = 0;
+    const services = createServices(
+      (conversationId, payload) => {
+        callCount += 1;
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          "Here is plain unframed prose without V1 framing or JSON.",
+        );
+      },
+      (options) => {
+        options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
+      },
+    );
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("bridge-v1-unframed");
+
+    const res = await makeResponsesPost(app, body);
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as JsonObject;
+    expect(json.status).toBe("failed");
+    expect(callCount).toBe(2);
+  });
+
+  test("bridge_v1 unframed prose triggers correction which accepts valid frame", async () => {
+    let callCount = 0;
+    const services = createServices(
+      (conversationId, payload) => {
+        callCount += 1;
+        if (callCount === 1) {
+          return buildGraphChatResult(
+            conversationId,
+            payload,
+            "Unframed plain prose.",
+          );
+        }
+        return buildGraphChatResult(
+          conversationId,
+          payload,
+          "M365_FINAL_V1\nParis",
+        );
+      },
+      (options) => {
+        options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
+      },
+    );
+    const app = createProxyApp(services);
+    const body = makeRetryRequestBody("bridge-v1-framed-correction", {
+      input: "What is the capital of France?",
+      tools: [],
+    });
+
+    const res = await makeResponsesPost(app, body);
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as JsonObject;
+    expect(json.status).toBe("completed");
+    expect(callCount).toBe(2);
+  });
+
+  test("derives responseFormat from text.format and disables bridge_v1", () => {
+    const options = createOptions();
+    options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
+
+    const parsedJsonObject = tryParseResponsesRequest(
+      {
+        model: "m365-copilot",
+        input: [{ role: "user", content: "hello" }],
+        text: { format: { type: "json_object" } },
+      },
+      options,
+    );
+    expect(parsedJsonObject.ok).toBeTrue();
+    if (parsedJsonObject.ok) {
+      expect(parsedJsonObject.request.base.responseFormat).toEqual({
+        type: "json_object",
+        name: null,
+        jsonSchema: null,
+      });
+      expect(parsedJsonObject.request.base.simulatedOutputProtocol).toBe(
+        SimulatedOutputProtocols.Legacy,
+      );
+    }
+
+    const parsedJsonSchema = tryParseResponsesRequest(
+      {
+        model: "m365-copilot",
+        input: [{ role: "user", content: "hello" }],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "test_schema",
+            schema: { type: "object", properties: { key: { type: "string" } } },
+          },
+        },
+      },
+      options,
+    );
+    expect(parsedJsonSchema.ok).toBeTrue();
+    if (parsedJsonSchema.ok) {
+      expect(parsedJsonSchema.request.base.responseFormat?.type).toBe("json_schema");
+      expect(parsedJsonSchema.request.base.responseFormat?.name).toBe("test_schema");
+      expect(parsedJsonSchema.request.base.responseFormat?.jsonSchema).toEqual({
+        type: "object",
+        properties: { key: { type: "string" } },
+      });
+      expect(parsedJsonSchema.request.base.simulatedOutputProtocol).toBe(
+        SimulatedOutputProtocols.Legacy,
+      );
+    }
+
+    const parsedNormal = tryParseResponsesRequest(
+      {
+        model: "m365-copilot",
+        input: [{ role: "user", content: "hello" }],
+      },
+      options,
+    );
+    expect(parsedNormal.ok).toBeTrue();
+    if (parsedNormal.ok) {
+      expect(parsedNormal.request.base.responseFormat).toBeNull();
+      expect(parsedNormal.request.base.simulatedOutputProtocol).toBe(
+        SimulatedOutputProtocols.BridgeV1,
+      );
+    }
+  });
+
+  test("near-limit regression: initial, regeneration, and regeneration-correction each fit maxChars without truncating envelope", () => {
+    const options = createOptions();
+    options.substrate.truncateBeforeSending = true;
+    options.substrate.maxSendChars = 6_000;
+
+    const largeToolResult = "x".repeat(10_000);
+    const parsed = tryParseResponsesRequest(
+      {
+        model: "m365-copilot",
+        input: [
+          { role: "user", content: "Initial task description" },
+          {
+            type: "function_call",
+            call_id: "call_1",
+            name: "test_fn",
+            arguments: "{}",
+          },
+          {
+            type: "function_call_output",
+            call_id: "call_1",
+            output: largeToolResult,
+          },
+        ],
+        tools: [
+          {
+            type: "function",
+            name: "test_fn",
+            parameters: { type: "object" },
+          },
+        ],
+      },
+      options,
+    );
+
+    expect(parsed.ok).toBeTrue();
+    if (!parsed.ok) return;
+
+    const initialPrompt = parsed.request.base.promptText;
+    expect(initialPrompt.length).toBeLessThanOrEqual(
+      options.substrate.maxSendChars -
+        (SIMULATED_CORRECTION_RESERVE_CHARS +
+          SIMULATED_REGENERATION_RESERVE_CHARS),
+    );
+
+    const regenPrompt = buildSimulatedRegenerationPrompt(
+      initialPrompt,
+      options.substrate.maxSendChars,
+    );
+    expect(regenPrompt.length).toBeLessThanOrEqual(
+      options.substrate.maxSendChars - SIMULATED_CORRECTION_RESERVE_CHARS,
+    );
+    expect(regenPrompt).toContain("PROTOCOL REGENERATION:");
+
+    const regenCorrection = appendSimulatedProtocolCorrection(
+      regenPrompt,
+      1,
+      "protocol_error",
+      options.substrate.maxSendChars,
+      '{"status":"failed"}',
+    );
+    expect(regenCorrection.length).toBeLessThanOrEqual(
+      options.substrate.maxSendChars,
+    );
+    expect(regenCorrection).toContain("PROTOCOL CORRECTION 1:");
   });
 });
 

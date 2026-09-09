@@ -128,21 +128,21 @@ export function tryParseJsonObject(
   }
 }
 
-export function escapeJsonControlCharactersInStrings(raw: string): string {
+export function repairJsonStringLexemes(raw: string): string {
   let output = "";
   let inString = false;
-  let escaped = false;
 
-  for (const ch of raw) {
+  for (let index = 0; index < raw.length; index += 1) {
+    const ch = raw[index];
     if (inString) {
-      if (escaped) {
-        output += ch;
-        escaped = false;
-        continue;
-      }
       if (ch === "\\") {
-        output += ch;
-        escaped = true;
+        const escapeLength = validJsonEscapeLength(raw, index);
+        if (escapeLength > 0) {
+          output += raw.slice(index, index + escapeLength);
+          index += escapeLength - 1;
+        } else {
+          output += "\\\\";
+        }
         continue;
       }
       if (ch === "\"") {
@@ -165,6 +165,16 @@ export function escapeJsonControlCharactersInStrings(raw: string): string {
   }
 
   return output;
+}
+
+function validJsonEscapeLength(raw: string, backslashIndex: number): number {
+  const escaped = raw[backslashIndex + 1];
+  if (!escaped) return 0;
+  if ("\"\\/bfnrt".includes(escaped)) return 2;
+  if (escaped !== "u") return 0;
+  return /^[0-9A-Fa-f]{4}$/.test(raw.slice(backslashIndex + 2, backslashIndex + 6))
+    ? 6
+    : 0;
 }
 
 export async function tryReadJsonPayload(

@@ -67,11 +67,13 @@ describe("sanitized bridge observability", () => {
       rejectionReason: "malformed_json",
       requestChars: 83_838,
       assistantTextSize: 13_776,
+      sameAsFirstCandidate: true,
       prompt: "private prompt",
     });
 
     expect(event.fields.requestChars).toBe(83_838);
     expect(event.fields.assistantTextSize).toBe(13_776);
+    expect(event.fields.sameAsFirstCandidate).toBeTrue();
     expect(event.fields.prompt).toBe("[redacted]");
     expect(JSON.stringify(event)).not.toContain("private prompt");
   });

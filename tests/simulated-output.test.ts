@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   decodeAndValidateSimulatedOutput,
+  type SimulatedOutputMalformedDiagnostics,
   type SimulatedOutputResult,
 } from "../src/proxy/simulated-output";
 import {
@@ -107,6 +108,23 @@ line two"}`,
     expect(result.outputText).toBe(controls);
   });
 
+  test("preserves deterministic invalid-escape repair acceptance", () => {
+    const valid = JSON.stringify(responsesPayload([responseMessage("line")]));
+    const repairedCandidate = valid.replaceAll(
+      '"line"',
+      String.raw`"\q"`,
+    );
+
+    const result = decodeAndValidateSimulatedOutput(
+      repairedCandidate,
+      "responses",
+      tooling(),
+    );
+
+    expectAccepted(result);
+    expect(result.outputText).toBe("\\q");
+  });
+
   test("repairs literal newlines in nested function arguments", () => {
     const result = decodeAndValidateSimulatedOutput(
       `{"object":"response","status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call_exec","name":"exec","arguments":"{\\"cmd\\":\\"line one
@@ -138,6 +156,80 @@ line two\\"}"}]}`,
       tooling(),
       "malformed_json",
     );
+  });
+
+  test("classifies malformed JSON with privacy-safe structural diagnostics", () => {
+    const malformedCases = [
+      ['{"value":"unterminated}', "unterminated_string"],
+      ['{"value":foo}', "unexpected_identifier"],
+      ['{"value":1,}', "invalid_property_name"],
+      ['{"value" 1}', "unexpected_token"],
+      ['{"value":1} trailing-candidate', "unknown"],
+    ] as const;
+
+    for (const [text, category] of malformedCases) {
+      const result = decodeAndValidateSimulatedOutput(
+        text,
+        "responses",
+        tooling(),
+      );
+
+      expect(result).toMatchObject({
+        kind: "rejected",
+        reason: "malformed_json",
+        diagnostics: { category },
+      });
+    }
+  });
+
+  test("captures lengths, structural state, and only nullable offsets", () => {
+    const candidate = '{"value":foo}';
+    const text = ` \n\`\`\`json\n${candidate}\n\`\`\`\n `;
+    const result = decodeAndValidateSimulatedOutput(
+      text,
+      "responses",
+      tooling(),
+    );
+
+    expect(result.kind).toBe("rejected");
+    if (result.kind !== "rejected") return;
+    const diagnostics = result.diagnostics;
+    expect(diagnostics).toBeDefined();
+    if (!diagnostics) return;
+
+    expect(diagnostics).toMatchObject({
+      category: "unexpected_identifier",
+      inputLength: text.length,
+      trimmedLength: text.trim().length,
+      candidateLength: candidate.length,
+      leadingWhitespaceLength: 2,
+      trailingWhitespaceLength: 2,
+      fenced: true,
+      repairAttempted: false,
+      repairParseCategory: null,
+      rootShape: "object",
+      startsWithObject: true,
+      endsWithObject: true,
+      startsWithArray: false,
+      endsWithArray: false,
+    } satisfies Partial<SimulatedOutputMalformedDiagnostics>);
+    expect(diagnostics.errorOffset).toBeNull();
+  });
+
+  test("does not serialize candidate content in malformed diagnostics", () => {
+    const candidate = '{"private_value":"privacy-safe-candidate"} trailing';
+    const result = decodeAndValidateSimulatedOutput(
+      candidate,
+      "responses",
+      tooling(),
+    );
+
+    expect(result.kind).toBe("rejected");
+    if (result.kind !== "rejected") return;
+    const serializedDiagnostics = JSON.stringify(result.diagnostics);
+    expect(serializedDiagnostics).not.toContain("private_value");
+    expect(serializedDiagnostics).not.toContain("privacy-safe-candidate");
+    expect(serializedDiagnostics).not.toContain(candidate);
   });
 
   test("does not recursively inspect valid message text", () => {
@@ -750,7 +842,10 @@ function expectRejected(
   toolingValue: OpenAiTooling,
   reason: Extract<SimulatedOutputResult, { kind: "rejected" }>["reason"],
 ): void {
-  expect(
-    decodeAndValidateSimulatedOutput(text, endpoint, toolingValue),
-  ).toEqual({ kind: "rejected", reason });
+  const result = decodeAndValidateSimulatedOutput(text, endpoint, toolingValue);
+  expect(result.kind).toBe("rejected");
+  expect(result.reason).toBe(reason);
+  if (reason !== "malformed_json") {
+    expect(result).toEqual({ kind: "rejected", reason });
+  }
 }

@@ -5,6 +5,7 @@
   "logStreamingResponseBody": false,
   "transport": "substrate",
   "openAiTransformMode": "simulated",
+  "simulatedOutputProtocol": "legacy",
   "temporaryChat": true,
   "ignoreIncomingAuthorizationHeader": true,
   "playwrightBrowser": "edge",

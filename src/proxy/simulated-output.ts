@@ -22,9 +22,9 @@ import {
 import { estimateJsonTokens } from "./context-accounting";
 import { stripPrivateCitationMarkers } from "./responses-provenance";
 import {
-  escapeJsonControlCharactersInStrings,
   isJsonObject,
   nowUnix,
+  repairJsonStringLexemes,
 } from "./utils";
 
 export type SimulatedOutputEndpoint = "chat.completions" | "responses";
@@ -48,6 +48,32 @@ export type SimulatedOutputRejectReason =
   | "tool_choice_violation"
   | "parallel_calls_violation"
   | "duplicate_call_id";
+
+export type SimulatedOutputParseCategory =
+  | "invalid_escape"
+  | "unterminated_string"
+  | "unexpected_identifier"
+  | "invalid_property_name"
+  | "unexpected_token"
+  | "unknown";
+
+export type SimulatedOutputMalformedDiagnostics = {
+  category: SimulatedOutputParseCategory;
+  inputLength: number;
+  trimmedLength: number;
+  candidateLength: number;
+  leadingWhitespaceLength: number;
+  trailingWhitespaceLength: number;
+  fenced: boolean;
+  repairAttempted: boolean;
+  repairParseCategory: SimulatedOutputParseCategory | null;
+  rootShape: "empty" | "object" | "array" | "other";
+  startsWithObject: boolean;
+  endsWithObject: boolean;
+  startsWithArray: boolean;
+  endsWithArray: boolean;
+  errorOffset: number | null;
+};
 
 export type SimulatedOutputItemStatus =
   | "in_progress"
@@ -101,6 +127,7 @@ export type SimulatedOutputTerminalCause =
 export type SimulatedOutputRejected = {
   kind: "rejected";
   reason: SimulatedOutputRejectReason;
+  diagnostics?: SimulatedOutputMalformedDiagnostics;
 };
 
 export type SimulatedOutputResult =
@@ -142,15 +169,29 @@ function decodeJsonObject(
   let parsed: unknown;
   try {
     parsed = JSON.parse(jsonText);
-  } catch {
-    const repaired = escapeJsonControlCharactersInStrings(jsonText);
+  } catch (error) {
+    const repaired = repairJsonStringLexemes(jsonText);
     if (repaired === jsonText) {
-      return { kind: "rejected", reason: "malformed_json" };
+      return malformedJsonRejection(
+        assistantText,
+        trimmed,
+        jsonText,
+        error,
+        false,
+        null,
+      );
     }
     try {
       parsed = JSON.parse(repaired);
-    } catch {
-      return { kind: "rejected", reason: "malformed_json" };
+    } catch (repairError) {
+      return malformedJsonRejection(
+        assistantText,
+        trimmed,
+        jsonText,
+        error,
+        true,
+        classifyJsonParseError(repairError),
+      );
     }
   }
 
@@ -158,6 +199,73 @@ function decodeJsonObject(
     return { kind: "rejected", reason: "json_object_required" };
   }
   return { kind: "accepted", payload: parsed };
+}
+
+function malformedJsonRejection(
+  assistantText: string,
+  trimmed: string,
+  jsonText: string,
+  error: unknown,
+  repairAttempted: boolean,
+  repairParseCategory: SimulatedOutputParseCategory | null,
+): SimulatedOutputRejected {
+  const root = jsonText.trim();
+  const firstCharacter = root[0] ?? null;
+  const lastCharacter = root.at(-1) ?? null;
+  return {
+    kind: "rejected",
+    reason: "malformed_json",
+    diagnostics: {
+      category: classifyJsonParseError(error),
+      inputLength: assistantText.length,
+      trimmedLength: trimmed.length,
+      candidateLength: jsonText.length,
+      leadingWhitespaceLength: assistantText.length -
+        assistantText.trimStart().length,
+      trailingWhitespaceLength: assistantText.length -
+        assistantText.trimEnd().length,
+      fenced: trimmed.startsWith("```"),
+      repairAttempted,
+      repairParseCategory,
+      rootShape: firstCharacter === null
+        ? "empty"
+        : firstCharacter === "{"
+        ? "object"
+        : firstCharacter === "["
+        ? "array"
+        : "other",
+      startsWithObject: firstCharacter === "{",
+      endsWithObject: lastCharacter === "}",
+      startsWithArray: firstCharacter === "[",
+      endsWithArray: lastCharacter === "]",
+      errorOffset: readParseErrorOffset(error),
+    },
+  };
+}
+
+function classifyJsonParseError(error: unknown): SimulatedOutputParseCategory {
+  const message = error instanceof Error ? error.message : "";
+  if (/invalid escape|valid unicode escape/i.test(message)) return "invalid_escape";
+  if (/unterminated string/i.test(message)) return "unterminated_string";
+  if (/unexpected identifier/i.test(message)) return "unexpected_identifier";
+  if (/property name must be a string literal/i.test(message)) {
+    return "invalid_property_name";
+  }
+  if (/unexpected|expected/i.test(message)) return "unexpected_token";
+  return "unknown";
+}
+
+function readParseErrorOffset(error: unknown): number | null {
+  if (typeof error !== "object" || error === null) {
+    return null;
+  }
+  const record = error as Record<string, unknown>;
+  const offset = record.offset ?? record.position;
+  return typeof offset === "number" &&
+      Number.isSafeInteger(offset) &&
+      offset >= 0
+    ? offset
+    : null;
 }
 
 function unwrapSingleJsonFence(trimmed: string): string | null {
@@ -670,7 +778,7 @@ function validateFunctionCall(
     id,
     name: offered.name,
     type: "function" as const,
-    argumentsJson: escapeJsonControlCharactersInStrings(argumentsJson),
+    argumentsJson: repairJsonStringLexemes(argumentsJson),
   };
   const validation = validateOpenAiToolCall(call, tooling);
   return validation.valid

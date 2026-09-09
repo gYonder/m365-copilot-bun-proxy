@@ -62,11 +62,13 @@ import {
   scopeConversationKey,
   selectConversation,
   appendSimulatedProtocolCorrection,
+  buildSimulatedRegenerationPrompt,
   tryParseOpenAiRequest,
   tryParseResponsesRequest,
 } from "./request-parser";
 import {
   OpenAiTransformModes,
+  SimulatedOutputProtocols,
   ToolChoiceModes,
   TransportNames,
   type JsonValue,
@@ -89,23 +91,25 @@ import {
   type SimulatedOutputAccepted,
   type SimulatedOutputEndpoint,
   type SimulatedOutputRejected,
+  type SimulatedOutputResult,
 } from "./simulated-output";
+import { decodeSimulatedActionOutputV1 } from "./simulated-action-output";
 import { ProxyTokenProvider } from "./token-provider";
 import { ProxyVizTraceStore } from "./viz-trace-store";
 import { RateCircuitBreaker } from "./rate-circuit-breaker";
 import { ImageGenerationService } from "./image-generation";
 import { BridgeObservability } from "./observability";
 import {
+  ToolLedgerError,
   type ToolCallToIssue,
   type ToolLedger,
-  type ToolLedgerError,
 } from "./tool-ledger";
 import {
   cloneJsonValue,
-  escapeJsonControlCharactersInStrings,
   extractGraphErrorMessage,
   isJsonObject,
   nowUnix,
+  repairJsonStringLexemes,
   readSseEvents,
   tryGetBoolean,
   tryGetRawString,
@@ -1440,12 +1444,69 @@ async function handleResponsesCreateOnce(
     );
   }
 
-  const toolLedgerScope = computeResponsesToolLedgerScope(
-    payload.json,
+  const failureCycleClaim =
+    responseStore.claimProtocolFailureCycle(replayIdentityKey);
+  if (failureCycleClaim.kind === "replay") {
+    services.observability?.record("dedup_hit", {
+      kind: isProtocolIdentity
+        ? "protocol_failure_replay"
+        : "legacy_failure_replay",
+    });
+    responseHeaders.set(
+      isProtocolIdentity
+        ? "x-m365-protocol-identity-replayed"
+        : "x-m365-request-hash-replayed",
+      "true",
+    );
+    return buildStoredReplayResponsesResult(
+      services,
+      parsedRequest,
+      responseHeaders,
+      failureCycleClaim.conversationId,
+      failureCycleClaim.response,
+      request.signal,
+    );
+  }
+  const cycleStrategy: SimulatedCycleStrategy =
+    failureCycleClaim.kind === "regenerate" ? "regenerate" : "primary";
+
+  const logicalConversationScope =
     conversationId ??
-      parsedRequest.protocolIdentity.conversationId ??
-      scopedConversationKey,
+    parsedRequest.protocolIdentity.conversationId ??
+    scopedConversationKey;
+  const computedToolLedgerScope = computeResponsesToolLedgerScope(
+    payload.json,
+    logicalConversationScope,
   );
+  const toolResultCallIds = parsedRequest.protocolIdentity.callIds;
+  const toolLedgerResolution =
+    toolResultCallIds.length > 0
+      ? responseStore.resolveToolLedgerTaskScope(
+          toolResultCallIds,
+          parsedRequest.previousResponseId,
+          computedToolLedgerScope,
+        )
+      : { kind: "none" as const };
+  if (toolLedgerResolution.kind === "conflict") {
+    return buildResponsesLedgerFailureResult(
+      services,
+      parsedRequest,
+      responseHeaders,
+      conversationId,
+      taskDeadlineMs,
+      new ToolLedgerError(
+        "unknown_call_id",
+        classifyBridgeFailure("invalid_request"),
+      ),
+      request.signal,
+      replayIdentityKey,
+      cycleStrategy === "regenerate" ? "exhausted" : undefined,
+    );
+  }
+  let toolLedgerScope =
+    toolLedgerResolution.kind === "resolved"
+      ? toolLedgerResolution.taskId
+      : computedToolLedgerScope;
   const toolProfileKey = requestProfile.compatibilityKey;
   const toolLedger = responseStore.getOrCreateToolLedger(toolLedgerScope);
   const toolResultFailure = validateResponsesToolResults(
@@ -1454,6 +1515,7 @@ async function handleResponsesCreateOnce(
     toolLedgerScope,
     toolProfileKey,
     responseStore,
+    cycleStrategy === "regenerate",
   );
   if (toolResultFailure) {
     return buildResponsesLedgerFailureResult(
@@ -1465,44 +1527,67 @@ async function handleResponsesCreateOnce(
       toolResultFailure,
       request.signal,
       replayIdentityKey,
+      cycleStrategy === "regenerate" ? "exhausted" : undefined,
     );
   }
 
+  const simulatedPromptMaxChars =
+    options.substrate.truncateBeforeSending
+      ? options.substrate.maxSendChars
+      : 0;
+
+  let activeBaseRequest = baseRequest;
+  if (cycleStrategy === "regenerate") {
+    activeBaseRequest = buildSimulatedProtocolRegenerationRequest(
+      baseRequest,
+      simulatedPromptMaxChars,
+    );
+    parsedRequest.base = activeBaseRequest;
+    conversationId = null;
+  }
+
   if (!conversationId) {
-    if (!conversationId) {
-      const createResult =
+    const createResult =
+      selectedTransport === TransportNames.Substrate
+        ? substrateClient.createConversation()
+        : await graphClient.createConversation(authorizationHeader);
+
+    if (!createResult.isSuccess || !createResult.conversationId) {
+      const fallbackMessage =
         selectedTransport === TransportNames.Substrate
-          ? substrateClient.createConversation()
-          : await graphClient.createConversation(authorizationHeader);
+          ? "Unable to initialize Substrate conversation."
+          : "Unable to create Microsoft 365 Copilot conversation.";
+      const code =
+        selectedTransport === TransportNames.Substrate
+          ? "substrate_error"
+          : "graph_error";
+      return writeFromUpstreamFailure(
+        services,
+        createResult.statusCode,
+        createResult.rawBody,
+        fallbackMessage,
+        code,
+      );
+    }
 
-      if (!createResult.isSuccess || !createResult.conversationId) {
-        const fallbackMessage =
-          selectedTransport === TransportNames.Substrate
-            ? "Unable to initialize Substrate conversation."
-            : "Unable to create Microsoft 365 Copilot conversation.";
-        const code =
-          selectedTransport === TransportNames.Substrate
-            ? "substrate_error"
-            : "graph_error";
-        return writeFromUpstreamFailure(
-          services,
-          createResult.statusCode,
-          createResult.rawBody,
-          fallbackMessage,
-          code,
-        );
-      }
-
-      conversationId = createResult.conversationId;
-      createdConversation = true;
-      if (scopedConversationKey) {
-        conversationStore.set(scopedConversationKey, conversationId);
-      }
+    conversationId = createResult.conversationId;
+    createdConversation = true;
+    if (scopedConversationKey) {
+      conversationStore.set(scopedConversationKey, conversationId);
     }
   }
 
   if (conversationId && scopedConversationKey) {
     conversationStore.set(scopedConversationKey, conversationId);
+  }
+  if (
+    toolResultCallIds.length === 0 &&
+    toolLedgerResolution.kind !== "resolved"
+  ) {
+    toolLedgerScope = computeResponsesToolLedgerScope(
+      payload.json,
+      conversationId,
+    );
   }
 
   if (!conversationId) {
@@ -1520,17 +1605,13 @@ async function handleResponsesCreateOnce(
     responseHeaders.set("x-m365-conversation-created", "true");
   }
 
-  const graphPayload = buildCopilotRequestPayload(baseRequest);
-  const shouldBufferAssistant = requiresBufferedAssistantResponse(baseRequest);
-  const simulatedPromptMaxChars =
-    options.substrate.truncateBeforeSending
-      ? options.substrate.maxSendChars
-      : 0;
+  const graphPayload = buildCopilotRequestPayload(activeBaseRequest);
+  const shouldBufferAssistant = requiresBufferedAssistantResponse(activeBaseRequest);
 
   const executeChatTurn = async (
     turnConversationId: string = conversationId!,
     turnIsStartOfSession: boolean = createdConversation,
-    turnRequest: ParsedOpenAiRequest = baseRequest,
+    turnRequest: ParsedOpenAiRequest = activeBaseRequest,
   ): Promise<ChatResult> => {
     if (selectedTransport === TransportNames.Substrate) {
       const result = await substrateClient.chat(
@@ -1575,21 +1656,50 @@ async function handleResponsesCreateOnce(
     // Do not chain the general confab retry with protocol correction. A bad
     // simulated payload gets one focused correction turn; all other requests
     // retain the independently configured confab recovery behavior.
-    return baseRequest.transformMode === OpenAiTransformModes.Simulated
+    return activeBaseRequest.transformMode === OpenAiTransformModes.Simulated
       ? result
       : retryConfabGiveUp(
           services,
           selectedTransport,
-          baseRequest,
+          activeBaseRequest,
           result,
           executeChatTurn,
         );
   };
+  const safeExecuteChatTurnWithRecovery = async (): Promise<ChatResult> => {
+    try {
+      return await executeChatTurnWithRecovery();
+    } catch (error) {
+      if (
+        cycleStrategy === "regenerate" &&
+        replayIdentityKey &&
+        failureCycleClaim.kind === "regenerate"
+      ) {
+        services.responseStore.rememberExhaustedProtocolFailure(
+          replayIdentityKey,
+          failureCycleClaim.conversationId,
+          failureCycleClaim.response,
+        );
+      }
+      throw error;
+    }
+  };
 
-  if (baseRequest.stream) {
+  if (activeBaseRequest.stream) {
     if (shouldBufferAssistant) {
-      const buffered = await executeChatTurnWithRecovery();
+      const buffered = await safeExecuteChatTurnWithRecovery();
       if (!buffered.isSuccess) {
+        if (
+          cycleStrategy === "regenerate" &&
+          replayIdentityKey &&
+          failureCycleClaim.kind === "regenerate"
+        ) {
+          services.responseStore.rememberExhaustedProtocolFailure(
+            replayIdentityKey,
+            failureCycleClaim.conversationId,
+            failureCycleClaim.response,
+          );
+        }
         return writeFromUpstreamFailure(
           services,
           buffered.statusCode,
@@ -1615,15 +1725,15 @@ async function handleResponsesCreateOnce(
         buffered.assistantText ??
         extractCopilotAssistantText(
           buffered.responseJson,
-          baseRequest.promptText,
+          activeBaseRequest.promptText,
         ) ??
         "";
-      if (baseRequest.transformMode === OpenAiTransformModes.Simulated) {
+      if (activeBaseRequest.transformMode === OpenAiTransformModes.Simulated) {
         const resolution = await resolveSimulatedOutput(
           services,
           buffered,
           "responses",
-          baseRequest,
+          activeBaseRequest,
           selectedTransport,
           conversationId,
           request.signal,
@@ -1637,6 +1747,7 @@ async function handleResponsesCreateOnce(
           (retryConversationId, retryRequest) =>
             executeChatTurn(retryConversationId, true, retryRequest),
           simulatedPromptMaxChars,
+          cycleStrategy,
         );
         if (resolution.kind === "upstream_failure") {
           return buildResponsesFailureResult(
@@ -1652,9 +1763,11 @@ async function handleResponsesCreateOnce(
                 : "graph_error",
             undefined,
             request.signal.aborted ? undefined : replayIdentityKey,
+            true,
+            cycleStrategy === "regenerate" ? "exhausted" : undefined,
           );
         }
-        if (resolution.kind === "cancelled") {
+        if (resolution.kind === "cancelled" || request.signal.aborted) {
           return buildResponsesFailureResult(
             services,
             parsedRequest,
@@ -1663,8 +1776,9 @@ async function handleResponsesCreateOnce(
             taskDeadlineMs,
             "upstream_timeout",
             request.signal,
-            undefined,
+            cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
             false,
+            cycleStrategy === "regenerate" ? "exhausted" : undefined,
           );
         }
         if (resolution.kind === "rejected") {
@@ -1677,19 +1791,8 @@ async function handleResponsesCreateOnce(
             resolution.reason,
             undefined,
             replayIdentityKey,
-          );
-        }
-        if (request.signal.aborted) {
-          return buildResponsesFailureResult(
-            services,
-            parsedRequest,
-            responseHeaders,
-            conversationId,
-            taskDeadlineMs,
-            "upstream_timeout",
-            request.signal,
-            undefined,
-            false,
+            true,
+            cycleStrategy === "primary" ? "retry_available" : "exhausted",
           );
         }
         conversationId = resolution.conversationId;
@@ -1702,12 +1805,14 @@ async function handleResponsesCreateOnce(
           parsedRequest,
           conversationId,
           resolution.output,
+          toolLedgerScope,
           requestProfile.compatibilityKey,
           responseHeaders,
           trace,
           replayIdentityKey,
           taskDeadlineMs,
           request.signal,
+          cycleStrategy,
         );
       }
 
@@ -1750,6 +1855,7 @@ async function handleResponsesCreateOnce(
           stripPrivateCitationMarkers(assistantText),
         ),
         responseId,
+        toolLedgerScope,
         requestProfile.compatibilityKey,
         responseHeaders,
         trace,
@@ -1803,8 +1909,19 @@ async function handleResponsesCreateOnce(
     );
   }
 
-  const chatResponse = await executeChatTurnWithRecovery();
+  const chatResponse = await safeExecuteChatTurnWithRecovery();
   if (!chatResponse.isSuccess) {
+    if (
+      cycleStrategy === "regenerate" &&
+      replayIdentityKey &&
+      failureCycleClaim.kind === "regenerate"
+    ) {
+      services.responseStore.rememberExhaustedProtocolFailure(
+        replayIdentityKey,
+        failureCycleClaim.conversationId,
+        failureCycleClaim.response,
+      );
+    }
     return writeFromUpstreamFailure(
       services,
       chatResponse.statusCode,
@@ -1828,14 +1945,14 @@ async function handleResponsesCreateOnce(
 
   const assistantText =
     chatResponse.assistantText ??
-    extractCopilotAssistantText(chatResponse.responseJson, baseRequest.promptText) ??
+    extractCopilotAssistantText(chatResponse.responseJson, activeBaseRequest.promptText) ??
     "";
-  if (baseRequest.transformMode === OpenAiTransformModes.Simulated) {
+  if (activeBaseRequest.transformMode === OpenAiTransformModes.Simulated) {
     const resolution = await resolveSimulatedOutput(
       services,
       chatResponse,
       "responses",
-      baseRequest,
+      activeBaseRequest,
       selectedTransport,
       conversationId,
       request.signal,
@@ -1849,6 +1966,7 @@ async function handleResponsesCreateOnce(
       (retryConversationId, retryRequest) =>
         executeChatTurn(retryConversationId, true, retryRequest),
       simulatedPromptMaxChars,
+      cycleStrategy,
     );
     if (resolution.kind === "upstream_failure") {
       return buildResponsesFailureResult(
@@ -1864,9 +1982,11 @@ async function handleResponsesCreateOnce(
             : "graph_error",
         undefined,
         request.signal.aborted ? undefined : replayIdentityKey,
+        true,
+        cycleStrategy === "regenerate" ? "exhausted" : undefined,
       );
     }
-    if (resolution.kind === "cancelled") {
+    if (resolution.kind === "cancelled" || request.signal.aborted) {
       return buildResponsesFailureResult(
         services,
         parsedRequest,
@@ -1875,8 +1995,9 @@ async function handleResponsesCreateOnce(
         taskDeadlineMs,
         "upstream_timeout",
         request.signal,
-        undefined,
+        cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
         false,
+        cycleStrategy === "regenerate" ? "exhausted" : undefined,
       );
     }
     if (resolution.kind === "rejected") {
@@ -1889,19 +2010,8 @@ async function handleResponsesCreateOnce(
         resolution.reason,
         undefined,
         replayIdentityKey,
-      );
-    }
-    if (request.signal.aborted) {
-      return buildResponsesFailureResult(
-        services,
-        parsedRequest,
-        responseHeaders,
-        conversationId,
-        taskDeadlineMs,
-        "upstream_timeout",
-        request.signal,
-        undefined,
-        false,
+        true,
+        cycleStrategy === "primary" ? "retry_available" : "exhausted",
       );
     }
     conversationId = resolution.conversationId;
@@ -1918,8 +2028,9 @@ async function handleResponsesCreateOnce(
         taskDeadlineMs,
         "upstream_timeout",
         request.signal,
-        undefined,
+        cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
         false,
+        cycleStrategy === "regenerate" ? "exhausted" : undefined,
       );
     }
     const projection = buildLocalResponsesProjection(
@@ -1932,7 +2043,7 @@ async function handleResponsesCreateOnce(
       resolution.output.status === "completed"
         ? issueResponsesToolCalls(
             responseStore,
-            computeResponsesToolLedgerScope(payload.json, conversationId),
+            toolLedgerScope,
             requestProfile.compatibilityKey,
             projection.responseId,
             outputItemsForLedger(projection.outputItems),
@@ -1948,6 +2059,7 @@ async function handleResponsesCreateOnce(
         toolLedgerFailure,
         request.signal,
         replayIdentityKey,
+        cycleStrategy === "regenerate" ? "exhausted" : undefined,
       );
     }
     if (request.signal.aborted) {
@@ -1959,8 +2071,9 @@ async function handleResponsesCreateOnce(
         taskDeadlineMs,
         "upstream_timeout",
         request.signal,
-        undefined,
+        cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
         false,
+        cycleStrategy === "regenerate" ? "exhausted" : undefined,
       );
     }
     responseStore.set(
@@ -2073,7 +2186,7 @@ async function handleResponsesCreateOnce(
   }
   const toolLedgerFailure = issueResponsesToolCalls(
     responseStore,
-    computeResponsesToolLedgerScope(payload.json, conversationId),
+    toolLedgerScope,
     requestProfile.compatibilityKey,
     responseId,
     assistantToolCallsForLedger(assistantResponse.toolCalls),
@@ -2518,6 +2631,7 @@ async function buildBufferedResponsesStreamResponse(
   assistantResponse: ReturnType<typeof buildAssistantResponse>,
   annotations: JsonObject[],
   responseId: string,
+  toolLedgerScope: string,
   requestProfileKey: string,
   headers: Headers,
   trace: TraceContext | null,
@@ -2562,7 +2676,7 @@ async function buildBufferedResponsesStreamResponse(
         }
         const ledgerFailure = issueResponsesToolCalls(
           services.responseStore,
-          computeResponsesToolLedgerScope(parsedRequest.rawRequest, conversationId),
+          toolLedgerScope,
           requestProfileKey,
           responseId,
           outputItemsForLedger(outputItems),
@@ -2761,6 +2875,8 @@ export function looksLikeConfabGiveUp(text: string | null | undefined): boolean 
   return ConfabGiveUpPatterns.some((pattern) => pattern.test(text));
 }
 
+export type SimulatedCycleStrategy = "primary" | "regenerate";
+
 function buildSimulatedProtocolRetryRequest(
   request: ParsedOpenAiRequest,
   attempt: number,
@@ -2776,6 +2892,21 @@ function buildSimulatedProtocolRetryRequest(
       rejectedReason,
       maxChars,
       rejectedAssistantText,
+      request.simulatedOutputProtocol,
+    ),
+  };
+}
+
+function buildSimulatedProtocolRegenerationRequest(
+  request: ParsedOpenAiRequest,
+  maxChars = 0,
+): ParsedOpenAiRequest {
+  return {
+    ...request,
+    promptText: buildSimulatedRegenerationPrompt(
+      request.promptText,
+      maxChars,
+      request.simulatedOutputProtocol,
     ),
   };
 }
@@ -2816,6 +2947,39 @@ type SimulatedResolution =
       kind: "cancelled";
     };
 
+function decodeSimulatedCandidate(
+  assistantText: string,
+  endpoint: SimulatedOutputEndpoint,
+  request: ParsedOpenAiRequest,
+): {
+  result: SimulatedOutputResult;
+  isRecognizedV1: boolean;
+} {
+  const isEligibleBridgeV1 =
+    endpoint === "responses" &&
+    request.simulatedOutputProtocol === SimulatedOutputProtocols.BridgeV1;
+
+  if (isEligibleBridgeV1) {
+    const v1Result = decodeSimulatedActionOutputV1(assistantText, request);
+    if (v1Result.kind !== "not_v1") {
+      return {
+        result: v1Result,
+        isRecognizedV1: true,
+      };
+    }
+  }
+
+  const legacyResult = decodeAndValidateSimulatedOutput(
+    assistantText,
+    endpoint,
+    request.tooling,
+  );
+  return {
+    result: legacyResult,
+    isRecognizedV1: false,
+  };
+}
+
 async function resolveSimulatedOutput(
   services: Services,
   initialResult: ChatResult,
@@ -2830,17 +2994,18 @@ async function resolveSimulatedOutput(
     request: ParsedOpenAiRequest,
   ) => Promise<ChatResult>,
   maxPromptChars = 0,
+  cycleStrategy: SimulatedCycleStrategy = "primary",
 ): Promise<SimulatedResolution> {
+  const cycle: 1 | 2 = cycleStrategy === "regenerate" ? 2 : 1;
+  const strategy = cycleStrategy;
+
   if (!initialResult.isSuccess) {
     return { kind: "upstream_failure", result: initialResult };
   }
 
   const firstText = simulatedAssistantText(initialResult, request.promptText);
-  const first = decodeAndValidateSimulatedOutput(
-    firstText,
-    endpoint,
-    request.tooling,
-  );
+  const firstDecoded = decodeSimulatedCandidate(firstText, endpoint, request);
+  const first = firstDecoded.result;
   if (first.kind === "accepted" && !hasKnownInvalidSimulatedOutput(first)) {
     if (signal?.aborted) {
       return { kind: "cancelled" };
@@ -2853,6 +3018,8 @@ async function resolveSimulatedOutput(
     };
   }
   if (
+    request.simulatedOutputProtocol !== SimulatedOutputProtocols.BridgeV1 &&
+    !firstDecoded.isRecognizedV1 &&
     canAcceptToolFreeAssistantText(
       endpoint,
       request.tooling,
@@ -2874,6 +3041,8 @@ async function resolveSimulatedOutput(
     ? first
     : { kind: "rejected" as const, reason: "invalid_envelope" as const };
   const canAcceptCorrectionText =
+    request.simulatedOutputProtocol !== SimulatedOutputProtocols.BridgeV1 &&
+    !firstDecoded.isRecognizedV1 &&
     !hasSimulatedToolSurface(request.tooling) &&
     !looksLikeToolCallAttemptText(firstText) &&
     !looksLikeSimulatedEndpointEnvelope(endpoint, firstText);
@@ -2886,6 +3055,9 @@ async function resolveSimulatedOutput(
     firstRejection,
     firstText.length,
     1,
+    undefined,
+    cycle,
+    strategy,
   );
   if (signal?.aborted) {
     return { kind: "cancelled" };
@@ -2899,6 +3071,9 @@ async function resolveSimulatedOutput(
       request,
       firstRejection,
       firstText.length,
+      undefined,
+      cycle,
+      strategy,
     );
     return {
       kind: "rejected",
@@ -2924,16 +3099,19 @@ async function resolveSimulatedOutput(
     return { kind: "upstream_failure", result: retryResult };
   }
   const retryText = simulatedAssistantText(retryResult, request.promptText);
-  const second = decodeAndValidateSimulatedOutput(
+  const secondDecoded = decodeSimulatedCandidate(
     retryText,
     endpoint,
-    request.tooling,
+    retryRequest,
   );
+  const second = secondDecoded.result;
   if (
+    request.simulatedOutputProtocol !== SimulatedOutputProtocols.BridgeV1 &&
     canAcceptCorrectionText &&
+    !secondDecoded.isRecognizedV1 &&
     canAcceptToolFreeAssistantText(
       endpoint,
-      request.tooling,
+      retryRequest.tooling,
       second,
       retryText,
     )
@@ -2949,26 +3127,32 @@ async function resolveSimulatedOutput(
     second.kind === "rejected" ||
     hasKnownInvalidSimulatedOutput(second)
   ) {
+    const secondRejection = second.kind === "rejected"
+      ? second
+      : { kind: "rejected" as const, reason: "invalid_envelope" as const };
+    const sameAsFirstCandidate = retryText === firstText;
     recordSimulatedCorrection(
       services,
       endpoint,
       route,
-      request,
-      second.kind === "rejected"
-        ? second
-        : { kind: "rejected", reason: "invalid_envelope" },
+      retryRequest,
+      secondRejection,
       retryText.length,
       2,
+      sameAsFirstCandidate,
+      cycle,
+      strategy,
     );
     recordSimulatedProtocolExhaustion(
       services,
       endpoint,
       route,
-      request,
-      second.kind === "rejected"
-        ? second
-        : { kind: "rejected", reason: "invalid_envelope" },
+      retryRequest,
+      secondRejection,
       retryText.length,
+      sameAsFirstCandidate,
+      cycle,
+      strategy,
     );
     return {
       kind: "rejected",
@@ -3083,8 +3267,11 @@ function recordSimulatedCorrection(
   rejection: SimulatedOutputRejected,
   assistantTextSize: number,
   attempt: number,
+  sameAsFirstCandidate?: boolean,
+  cycle: 1 | 2 = 1,
+  strategy: SimulatedCycleStrategy = "primary",
 ): void {
-  services.observability?.record("retry", {
+  const fields: JsonObject = {
     reason: "simulated_protocol_correction",
     endpoint,
     route,
@@ -3093,7 +3280,18 @@ function recordSimulatedCorrection(
     offeredToolCount: request.tooling.tools.length,
     assistantTextSize,
     requestChars: request.promptText.length,
-  });
+    cycle,
+    strategy,
+    outputProtocol:
+      request.simulatedOutputProtocol ?? SimulatedOutputProtocols.Legacy,
+  };
+  if (sameAsFirstCandidate !== undefined) {
+    fields.sameAsFirstCandidate = sameAsFirstCandidate;
+  }
+  if (rejection.diagnostics) {
+    fields.decodeDiagnostics = { ...rejection.diagnostics };
+  }
+  services.observability?.record("retry", fields);
 }
 
 function recordSimulatedProtocolExhaustion(
@@ -3103,8 +3301,11 @@ function recordSimulatedProtocolExhaustion(
   request: ParsedOpenAiRequest,
   rejection: SimulatedOutputRejected,
   assistantTextSize: number,
+  sameAsFirstCandidate?: boolean,
+  cycle: 1 | 2 = 1,
+  strategy: SimulatedCycleStrategy = "primary",
 ): void {
-  services.observability?.record("provider_drift", {
+  const fields: JsonObject = {
     reason: "simulated_protocol_correction_exhausted",
     endpoint,
     route,
@@ -3112,7 +3313,18 @@ function recordSimulatedProtocolExhaustion(
     offeredToolCount: request.tooling.tools.length,
     assistantTextSize,
     requestChars: request.promptText.length,
-  });
+    cycle,
+    strategy,
+    outputProtocol:
+      request.simulatedOutputProtocol ?? SimulatedOutputProtocols.Legacy,
+  };
+  if (sameAsFirstCandidate !== undefined) {
+    fields.sameAsFirstCandidate = sameAsFirstCandidate;
+  }
+  if (rejection.diagnostics) {
+    fields.decodeDiagnostics = { ...rejection.diagnostics };
+  }
+  services.observability?.record("provider_drift", fields);
 }
 
 // Re-issue a buffered (non-streaming) Substrate turn when the model returns a
@@ -3549,7 +3761,7 @@ function normalizeSimulatedToolArguments(argumentsNode: unknown): string {
     return "{}";
   }
 
-  const repaired = escapeJsonControlCharactersInStrings(raw);
+  const repaired = repairJsonStringLexemes(raw);
   for (const candidate of [raw, repaired]) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
@@ -3960,12 +4172,14 @@ async function buildSimulatedResponsesStreamResponseFromAccepted(
   parsedRequest: ParsedResponsesRequest,
   conversationId: string,
   accepted: SimulatedOutputAccepted,
+  toolLedgerScope: string,
   requestProfileKey: string,
   headers: Headers,
   trace: TraceContext | null,
   replayIdentityKey: string,
   taskDeadlineMs: number,
   signal?: AbortSignal,
+  cycleStrategy: SimulatedCycleStrategy = "primary",
 ): Promise<Response> {
   const projection = buildLocalResponsesProjection(
     accepted,
@@ -3982,18 +4196,16 @@ async function buildSimulatedResponsesStreamResponseFromAccepted(
       taskDeadlineMs,
       "upstream_timeout",
       signal,
-      undefined,
+      cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
       false,
+      cycleStrategy === "regenerate" ? "exhausted" : undefined,
     );
   }
   const ledgerFailure =
     accepted.status === "completed"
       ? issueResponsesToolCalls(
           services.responseStore,
-          computeResponsesToolLedgerScope(
-            parsedRequest.rawRequest,
-            conversationId,
-          ),
+          toolLedgerScope,
           requestProfileKey,
           projection.responseId,
           outputItemsForLedger(projection.outputItems),
@@ -4009,6 +4221,7 @@ async function buildSimulatedResponsesStreamResponseFromAccepted(
       ledgerFailure,
       signal,
       replayIdentityKey,
+      cycleStrategy === "regenerate" ? "exhausted" : undefined,
     );
   }
   services.responseStore.set(
@@ -4465,12 +4678,14 @@ function rememberResponsesReplayIdentity(
       conversationId,
       response,
     );
+    responseStore.clearProtocolFailureCycle(replayIdentityKey);
     return;
   }
   const requestHash = replayIdentityKey.startsWith("legacy:")
     ? replayIdentityKey.slice("legacy:".length)
     : replayIdentityKey;
   responseStore.rememberCompletedRequest(requestHash, conversationId, response);
+  responseStore.clearProtocolFailureCycle(replayIdentityKey);
 }
 
 export function computeResponsesReplayIdentityKey(
@@ -4586,6 +4801,7 @@ function validateResponsesToolResults(
   taskId: string,
   requestProfileKey: string,
   responseStore: ResponseStore,
+  isRegenerationCycle = false,
 ): ToolLedgerError | null {
   const resultItems = Array.isArray(requestJson.input)
     ? requestJson.input.filter((item): item is JsonObject => {
@@ -4601,23 +4817,40 @@ function validateResponsesToolResults(
   }
 
   const hadPending = ledger.hasPending(taskId);
-  let accepted = false;
+  const callIds = resultItems.map((item) => tryGetString(item, "call_id") ?? "");
+  if (new Set(callIds).size !== callIds.length) {
+    return new ToolLedgerError(
+      "duplicate_result",
+      classifyBridgeFailure("duplicate_tool_result_or_replay"),
+    );
+  }
+  const callIdsToAccept: string[] = [];
   for (const item of resultItems) {
     const callId = tryGetString(item, "call_id") ?? "";
     const knownCall = ledger.get(callId);
     if (!knownCall && !hadPending) {
       continue;
     }
-    const result = ledger.acceptResult(callId, requestProfileKey);
-    if (!result.ok) {
-      if (accepted) {
-        responseStore.saveToolLedger(taskId, ledger);
+    if (isRegenerationCycle && knownCall?.status === "completed") {
+      if (knownCall.request_profile_key !== requestProfileKey) {
+        return new ToolLedgerError(
+          "cross_profile",
+          classifyBridgeFailure("invalid_request"),
+        );
       }
+      continue;
+    }
+    const result = ledger.validateResult(callId, requestProfileKey);
+    if (!result.ok) {
       return result.error;
     }
-    accepted = true;
+    callIdsToAccept.push(callId);
   }
-  if (accepted) {
+  if (callIdsToAccept.length > 0) {
+    const result = ledger.acceptResults(callIdsToAccept, requestProfileKey);
+    if (!result.ok) {
+      return result.error;
+    }
     responseStore.saveToolLedger(taskId, ledger);
   }
   return null;
@@ -4693,6 +4926,7 @@ function buildResponsesLedgerFailureResult(
   failure: ToolLedgerError,
   signal?: AbortSignal,
   replayIdentityKey?: string,
+  protocolFailurePhase?: "retry_available" | "exhausted",
 ): Response {
   return buildResponsesFailureResult(
     services,
@@ -4703,7 +4937,44 @@ function buildResponsesLedgerFailureResult(
     failure.reason,
     signal,
     replayIdentityKey,
+    true,
+    protocolFailurePhase,
   );
+}
+
+function createResponsesFailureTerminal(
+  parsedRequest: ParsedResponsesRequest,
+  rawReason: string,
+  conversationId: string | null = null,
+  responseId: string = createOpenAiResponseId(),
+  createdAt: number = nowUnix(),
+  output: JsonObject[] = [],
+): { failure: BridgeFailure; response: JsonObject } {
+  const failure = classifyResponsesFailure(rawReason);
+  const terminal: Parameters<typeof buildOpenAiResponseObject>[8] =
+    failure.terminal === "failed"
+      ? {
+          status: "failed",
+          error: { code: failure.code, message: failure.message },
+          incomplete_details: null,
+        }
+      : {
+          status: "incomplete",
+          error: null,
+          incomplete_details: { reason: failure.reason },
+        };
+  const response = buildOpenAiResponseObject(
+    responseId,
+    createdAt,
+    parsedRequest.base.model,
+    failure.terminal,
+    output,
+    parsedRequest,
+    conversationId,
+    parsedRequest.contextInputTokens ?? undefined,
+    terminal,
+  );
+  return { failure, response };
 }
 
 function buildResponsesFailureResult(
@@ -4716,6 +4987,7 @@ function buildResponsesFailureResult(
   signal?: AbortSignal,
   replayIdentityKey?: string,
   persistResponse = true,
+  protocolFailurePhase?: "retry_available" | "exhausted",
 ): Response {
   const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
@@ -4723,58 +4995,62 @@ function buildResponsesFailureResult(
     services.options.includeConversationIdInResponseBody
       ? conversationId
       : null;
-  const inProgress = buildOpenAiResponseObject(
-    responseId,
-    createdAt,
-    parsedRequest.base.model,
-    "in_progress",
-    [],
-    parsedRequest,
-    responseConversationId,
-  );
-  const precomputedWriter = new ResponsesEventWriter(() => {});
-  emitResponsesFailureTerminal(
-    precomputedWriter,
-    inProgress,
-    rawReason,
-    parsedRequest,
-  );
-  const precomputedTerminal =
-    precomputedWriter.terminalState &&
-    precomputedWriter.terminalState.kind !== "cancelled"
-      ? precomputedWriter.terminalState.response
-      : null;
-  if (replayIdentityKey && precomputedTerminal) {
-    services.responseStore.set(
+  const { failure, response: terminalResponse } =
+    createResponsesFailureTerminal(
+      parsedRequest,
+      rawReason,
+      responseConversationId,
       responseId,
-      precomputedTerminal,
-      conversationId,
-      taskDeadlineMs,
+      createdAt,
     );
-    rememberResponsesReplayIdentity(
-      services.responseStore,
-      replayIdentityKey,
-      conversationId,
-      precomputedTerminal,
-    );
-  }
 
-  if (!parsedRequest.base.stream) {
-    const terminalResponse = precomputedTerminal ?? inProgress;
+  if (replayIdentityKey) {
     if (persistResponse) {
-      services.responseStore.set(
-        responseId,
-        terminalResponse,
-        conversationId,
-        taskDeadlineMs,
-      );
+      if (protocolFailurePhase) {
+        services.responseStore.setTransient(
+          responseId,
+          terminalResponse,
+          conversationId,
+          taskDeadlineMs,
+        );
+      } else {
+        services.responseStore.set(
+          responseId,
+          terminalResponse,
+          conversationId,
+          taskDeadlineMs,
+        );
+      }
     }
-    if (replayIdentityKey && !precomputedTerminal) {
+    if (protocolFailurePhase === "retry_available") {
+      services.responseStore.rememberRetryableProtocolFailure(
+        replayIdentityKey,
+        conversationId,
+        terminalResponse,
+      );
+    } else if (protocolFailurePhase === "exhausted") {
+      services.responseStore.rememberExhaustedProtocolFailure(
+        replayIdentityKey,
+        conversationId,
+        terminalResponse,
+      );
+    } else {
       rememberResponsesReplayIdentity(
         services.responseStore,
         replayIdentityKey,
         conversationId,
         terminalResponse,
+      );
+    }
+  }
+
+  if (!parsedRequest.base.stream) {
+    if (persistResponse && !replayIdentityKey && !protocolFailurePhase) {
+      services.responseStore.set(
+        responseId,
+        terminalResponse,
+        conversationId,
+        taskDeadlineMs,
       );
     }
     headers.set("content-type", "application/json");
@@ -4787,6 +5063,16 @@ function buildResponsesFailureResult(
     });
   }
 
+  const inProgress = buildOpenAiResponseObject(
+    responseId,
+    createdAt,
+    parsedRequest.base.model,
+    "in_progress",
+    [],
+    parsedRequest,
+    responseConversationId,
+  );
+
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
@@ -4798,32 +5084,10 @@ function buildResponsesFailureResult(
       } else {
         writer.created(inProgress);
         writer.inProgress(inProgress);
-        emitResponsesFailureTerminal(
-          writer,
-          inProgress,
-          rawReason,
-          parsedRequest,
-        );
-        if (
-          writer.terminalState &&
-          writer.terminalState.kind !== "cancelled"
-        ) {
-          if (!precomputedTerminal) {
-            services.responseStore.set(
-              responseId,
-              writer.terminalState.response,
-              conversationId,
-              taskDeadlineMs,
-            );
-          }
-          if (replayIdentityKey && !precomputedTerminal) {
-            rememberResponsesReplayIdentity(
-              services.responseStore,
-              replayIdentityKey,
-              conversationId,
-              writer.terminalState.response,
-            );
-          }
+        if (failure.terminal === "incomplete") {
+          writer.incomplete(terminalResponse, failure);
+        } else {
+          writer.failed(terminalResponse, failure);
         }
       }
       if (writer.terminalState?.kind !== "cancelled") {

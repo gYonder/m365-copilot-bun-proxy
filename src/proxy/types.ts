@@ -37,6 +37,14 @@ export const OpenAiTransformModes = {
   Mapped: "mapped",
 } as const;
 
+export const SimulatedOutputProtocols = {
+  Legacy: "legacy",
+  BridgeV1: "bridge_v1",
+} as const;
+
+export type SimulatedOutputProtocol =
+  (typeof SimulatedOutputProtocols)[keyof typeof SimulatedOutputProtocols];
+
 export const ProxyVizTraceStatuses = {
   Pending: "pending",
   Completed: "completed",
@@ -107,6 +115,7 @@ export type ParsedOpenAiRequest = {
   model: string;
   stream: boolean;
   transformMode: string;
+  simulatedOutputProtocol?: SimulatedOutputProtocol;
   rawRequest?: JsonObject;
   hostedWebSearch?: boolean;
   promptText: string;
@@ -258,6 +267,7 @@ export type WrapperOptions = {
   logLevel: LogLevel;
   logStreamingResponseBody?: boolean;
   openAiTransformMode: string;
+  simulatedOutputProtocol?: SimulatedOutputProtocol;
   temporaryChat: boolean;
   ignoreIncomingAuthorizationHeader: boolean;
   playwrightBrowser: PlaywrightBrowser;
@@ -280,6 +290,13 @@ export type WrapperOptions = {
   confabRetries: number;
   msalAuth: boolean;
   imageGeneration: ImageGenerationOptions;
+};
+
+export type LoadedWrapperOptions = Omit<
+  WrapperOptions,
+  "simulatedOutputProtocol"
+> & {
+  simulatedOutputProtocol: SimulatedOutputProtocol;
 };
 
 export type ObservabilityOptions = {

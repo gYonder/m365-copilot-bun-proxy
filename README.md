@@ -102,11 +102,47 @@ Headless token fetch uses the saved Playwright browser state, opens M365 Copilot
 
 `openAiTransformMode` controls how requests are translated for M365 Copilot:
 
-- `simulated` (default): sends the full incoming OpenAI JSON payload with a strict endpoint-specific output contract. The proxy buffers the complete upstream turn, validates one whole JSON envelope, performs at most one protocol correction, and locally builds the OpenAI response or terminal failure.
+- `simulated` (default): sends the full incoming OpenAI JSON payload with an
+  endpoint-specific output contract. The proxy buffers the complete upstream
+  turn, validates it before emitting output, and locally builds the OpenAI
+  response or terminal failure.
 - Tool-free simulated requests ask for direct assistant text and project that
   text into the requested OpenAI response shape. Strict whole-envelope
   validation remains mandatory whenever tools are available.
 - `mapped`: uses the legacy request/response mapping logic.
+
+`simulatedOutputProtocol` selects the tool-bearing Responses contract:
+
+- `legacy` (default): requires the validated endpoint JSON envelope.
+- `bridge_v1`: accepts exact bridge-owned frames for one final message, one
+  function call, or one custom-tool call, with strict legacy JSON retained as a
+  compatibility fallback. JSON response formats always use `legacy`.
+
+Enable the V1 contract for a canary with:
+
+```bash
+CONFIG__simulatedOutputProtocol=bridge_v1 bun run start:proxy
+```
+
+The V1 frames start at byte zero:
+
+```text
+M365_FINAL_V1
+<raw final text>
+
+M365_FUNCTION_TOOL_CALL_V1
+<exact tool name>
+<one JSON argument object>
+
+M365_CUSTOM_TOOL_CALL_V1
+<exact tool name>
+<raw input to EOF>
+```
+
+Recognized malformed frames are corrected or rejected; they are never accepted
+as final prose. Function arguments, offered tool names, tool choice, schemas,
+call IDs, and parallel policy still pass the same strict validator used by the
+legacy protocol.
 
 The legacy `substrate.earlyCompleteOnSimulatedPayload` and
 `substrate.incrementalSimulatedContentStreaming` settings remain accepted for
@@ -273,17 +309,25 @@ Example tool-call response shape:
 
 Strictness behavior:
 
-- Simulated mode accepts only a complete, endpoint-correct JSON envelope. This
-  applies to final assistant messages as well as function and custom-tool calls;
-  arbitrary unwrapped text is never converted into a successful response.
-- A malformed or invalid envelope receives one bounded protocol-correction turn.
-  When safe and within the prompt budget, the rejected candidate is supplied as
-  escaped data so the model can repair its serialization instead of regenerating
-  the response independently. A second rejection becomes a structured
-  `provider_drift` failure.
+- Tool-free simulated turns accept direct assistant text. Tool-bearing turns use
+  the configured strict protocol described above.
+- Strict JSON decoding first applies deterministic lexical repair only inside
+  JSON strings: literal control characters are escaped, and invalid escape
+  prefixes are preserved as literal backslashes. Truncation, quote insertion,
+  brace balancing, surrounding prose, multiple values, and structural damage
+  are never guessed or repaired.
+- A malformed or invalid candidate receives one bounded protocol-correction
+  turn. If that primary cycle is exhausted, the next sequential identical
+  request receives one fresh regeneration cycle with an independent prompt and
+  one correction. Later identical retries replay the cached failed terminal.
+  This bounds a live failure episode to four upstream generations without
+  durably storing failed response bodies.
 - Tool choice, offered name and namespace, function/custom kind, argument schema,
   call IDs, and parallel-call policy are validated before any output is emitted.
   Mixed valid/invalid call batches are rejected atomically.
+- Malformed-output telemetry contains only parse categories, lengths, booleans,
+  root-shape metadata, and parser-provided offsets. It never records prompts,
+  candidates, tool input, URLs, identifiers, or authentication material.
 
 Input normalization notes:
 

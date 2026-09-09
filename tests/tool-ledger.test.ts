@@ -52,6 +52,8 @@ describe("ToolLedger", () => {
     const ledger = new ToolLedger({ now: () => 1_000 });
     issue(ledger, "call-1");
 
+    expect(ledger.validateResult("call-1", "profile-1").ok).toBe(true);
+    expect(ledger.get("call-1")?.status).toBe("pending");
     expect(ledger.acceptResult("call-1", "profile-1", "small").ok).toBe(true);
     const duplicate = ledger.acceptResult("call-1", "profile-1", "large");
     expect(duplicate.ok).toBe(false);
@@ -60,6 +62,32 @@ describe("ToolLedger", () => {
       expect(duplicate.error.code).toBe("duplicate_suppressed");
     }
     expect(ledger.get("call-1")?.status).toBe("completed");
+  });
+
+  test("accepts result batches atomically", () => {
+    const ledger = new ToolLedger({ now: () => 1_000 });
+    issue(ledger, "call-1");
+    issue(ledger, "call-2", { second: true }, 1, "response-1");
+
+    const duplicate = ledger.acceptResults(
+      ["call-1", "call-1"],
+      "profile-1",
+    );
+    expect(duplicate.ok).toBe(false);
+    expect(ledger.get("call-1")?.status).toBe("pending");
+
+    const mixed = ledger.acceptResults(
+      ["call-1", "call-unknown"],
+      "profile-1",
+    );
+    expect(mixed.ok).toBe(false);
+    expect(ledger.get("call-1")?.status).toBe("pending");
+
+    expect(ledger.acceptResults(["call-1", "call-2"], "profile-1").ok).toBe(
+      true,
+    );
+    expect(ledger.get("call-1")?.status).toBe("completed");
+    expect(ledger.get("call-2")?.status).toBe("completed");
   });
 
   test("accepts reverse-order siblings but rejects superseded rounds", () => {
@@ -300,6 +328,20 @@ describe("ToolLedger", () => {
         })),
       ).reason,
     ).toBe("call_bound_exceeded");
+  });
+
+  test("exposes taskId for a known call and null for unknown or expired", () => {
+    let now = 1_000;
+    const ledger = new ToolLedger({
+      now: () => now,
+      pendingTtlMs: 500,
+    });
+    issue(ledger, "call-1", { a: 1 });
+    expect(ledger.getTaskIdForCall("call-1")).toBe("task-1");
+    expect(ledger.getTaskIdForCall("unknown-call")).toBeNull();
+
+    now = 1_600;
+    expect(ledger.getTaskIdForCall("call-1")).toBeNull();
   });
 });
 

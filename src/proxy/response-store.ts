@@ -35,7 +35,33 @@ type ToolLedgerEntry = {
   expiresAtUtc: number;
 };
 
+type ProtocolFailureCycleEntry = {
+  phase: "retry_available" | "retry_claimed" | "exhausted";
+  conversationId: string | null;
+  response: JsonObject;
+  expiresAtUtc: number;
+};
+
+export type ProtocolFailureCycleClaim =
+  | { kind: "primary" }
+  | {
+      kind: "regenerate";
+      conversationId: string | null;
+      response: JsonObject;
+    }
+  | {
+      kind: "replay";
+      conversationId: string | null;
+      response: JsonObject;
+    };
+
+export type ToolLedgerTaskScopeResolution =
+  | { kind: "none" }
+  | { kind: "resolved"; taskId: string }
+  | { kind: "conflict" };
+
 const RequestHashGuardTtlMs = 60_000;
+const ProtocolFailureCycleTtlMs = 60_000;
 const MaxStoredResponses = 1_024;
 const MaxRequestHashes = 2_048;
 
@@ -47,13 +73,18 @@ export class ResponseStore {
   private readonly taskDeadlines = new Map<string, TaskDeadlineEntry>();
   private readonly toolLedgers = new Map<string, ToolLedgerEntry>();
   private readonly inFlightResponses = new Map<string, Promise<Response>>();
+  private readonly protocolFailureCycles = new Map<
+    string,
+    ProtocolFailureCycleEntry
+  >();
 
   constructor(
     private readonly options: WrapperOptions,
     private readonly durable = new DurableStateStore(),
     private readonly observability: BridgeObservability | null = null,
+    private readonly nowMs: () => number = Date.now,
   ) {
-    const now = Date.now();
+    const now = this.nowMs();
     for (const [id, entry] of Object.entries(this.durable.state.responses)) {
       if (entry.expiresAtUtc > now) this.conversationLinks.set(id, entry);
     }
@@ -86,6 +117,43 @@ export class ResponseStore {
     contextInputTokens: number | null = null,
     contextWindowId: string | null = null,
   ): void {
+    this.storeResponse(
+      responseId,
+      response,
+      conversationId,
+      taskDeadlineMs,
+      contextInputTokens,
+      contextWindowId,
+      true,
+    );
+  }
+
+  setTransient(
+    responseId: string,
+    response: JsonObject,
+    conversationId: string | null,
+    taskDeadlineMs: number | null = null,
+  ): void {
+    this.storeResponse(
+      responseId,
+      response,
+      conversationId,
+      taskDeadlineMs,
+      null,
+      null,
+      false,
+    );
+  }
+
+  private storeResponse(
+    responseId: string,
+    response: JsonObject,
+    conversationId: string | null,
+    taskDeadlineMs: number | null,
+    contextInputTokens: number | null,
+    contextWindowId: string | null,
+    persistConversationLink: boolean,
+  ): void {
     if (!responseId.trim()) {
       return;
     }
@@ -110,13 +178,15 @@ export class ResponseStore {
         expiresAtUtc: record.expiresAtUtc,
       });
       this.trimOldest(this.conversationLinks, MaxStoredResponses, "response_link");
-      this.durable.state.responses[responseId] = {
-        conversationId: conversationId.trim(),
-        expiresAtUtc: record.expiresAtUtc,
-        contextInputTokens: record.contextInputTokens ?? undefined,
-        contextWindowId: record.contextWindowId,
-      };
-      this.durable.save();
+      if (persistConversationLink) {
+        this.durable.state.responses[responseId] = {
+          conversationId: conversationId.trim(),
+          expiresAtUtc: record.expiresAtUtc,
+          contextInputTokens: record.contextInputTokens ?? undefined,
+          contextWindowId: record.contextWindowId,
+        };
+        this.durable.save();
+      }
     }
   }
 
@@ -179,7 +249,7 @@ export class ResponseStore {
     }
     this.purgeExpired();
     const existing = this.taskDeadlines.get(normalizedKey);
-    const now = Date.now();
+    const now = this.nowMs();
     if (existing && existing.deadlineMs > now && existing.expiresAtUtc > now) {
       this.taskDeadlines.delete(normalizedKey);
       this.taskDeadlines.set(normalizedKey, existing);
@@ -238,6 +308,54 @@ export class ResponseStore {
     };
     this.trimToolLedgers();
     this.durable.save();
+  }
+
+  resolveToolLedgerTaskScope(
+    callIds: Iterable<string>,
+    previousResponseId: string | null,
+    fallbackTaskId: string,
+  ): ToolLedgerTaskScopeResolution {
+    const ids = Array.from(new Set(callIds))
+      .map((id) => id.trim())
+      .filter(Boolean);
+    if (ids.length === 0) {
+      return { kind: "none" };
+    }
+    this.purgeExpired();
+    const taskIdsForResponse = new Set<string>();
+    if (previousResponseId?.trim()) {
+      for (const entry of this.toolLedgers.values()) {
+        this.recordToolLedgerRecovery(entry.ledger.recoverExpired(Date.now()));
+        const taskId = entry.ledger.getTaskIdForResponse(previousResponseId);
+        if (taskId) {
+          taskIdsForResponse.add(taskId);
+        }
+      }
+    }
+    if (taskIdsForResponse.size > 1) {
+      return { kind: "conflict" };
+    }
+    const taskId =
+      taskIdsForResponse.values().next().value ?? fallbackTaskId.trim();
+    if (!taskId) {
+      return { kind: "none" };
+    }
+    const entry = this.toolLedgers.get(durableKey(taskId));
+    if (!entry) {
+      return { kind: "none" };
+    }
+    this.recordToolLedgerRecovery(entry.ledger.recoverExpired(Date.now()));
+    const matchedTaskIds = ids.map((callId) =>
+      entry.ledger.getTaskIdForCall(callId),
+    );
+    if (matchedTaskIds.every((matchedTaskId) => matchedTaskId === null)) {
+      return taskIdsForResponse.size === 1
+        ? { kind: "conflict" }
+        : { kind: "none" };
+    }
+    return matchedTaskIds.every((matchedTaskId) => matchedTaskId === taskId)
+      ? { kind: "resolved", taskId }
+      : { kind: "conflict" };
   }
 
   tryDelete(responseId: string): boolean {
@@ -391,6 +509,63 @@ export class ResponseStore {
     this.durable.save();
   }
 
+  claimProtocolFailureCycle(identityKey: string): ProtocolFailureCycleClaim {
+    const key = identityKey.trim();
+    if (!key) return { kind: "primary" };
+    this.purgeExpired();
+    const entry = this.protocolFailureCycles.get(key);
+    if (!entry) return { kind: "primary" };
+    if (entry.phase === "retry_available") {
+      this.protocolFailureCycles.delete(key);
+      this.protocolFailureCycles.set(key, {
+        ...entry,
+        phase: "retry_claimed",
+        expiresAtUtc: this.nowMs() + ProtocolFailureCycleTtlMs,
+      });
+      return {
+        kind: "regenerate",
+        conversationId: entry.conversationId,
+        response: cloneJsonValue(entry.response),
+      };
+    }
+    return {
+      kind: "replay",
+      conversationId: entry.conversationId,
+      response: cloneJsonValue(entry.response),
+    };
+  }
+
+  rememberRetryableProtocolFailure(
+    identityKey: string,
+    conversationId: string | null,
+    response: JsonObject,
+  ): void {
+    this.rememberProtocolFailure(
+      identityKey,
+      conversationId,
+      response,
+      "retry_available",
+    );
+  }
+
+  rememberExhaustedProtocolFailure(
+    identityKey: string,
+    conversationId: string | null,
+    response: JsonObject,
+  ): void {
+    this.rememberProtocolFailure(
+      identityKey,
+      conversationId,
+      response,
+      "exhausted",
+    );
+  }
+
+  clearProtocolFailureCycle(identityKey: string): void {
+    const key = identityKey.trim();
+    if (key) this.protocolFailureCycles.delete(key);
+  }
+
   tryGetInFlightResponse(identityKey: string): Promise<Response> | null {
     return this.inFlightResponses.get(identityKey.trim()) ?? null;
   }
@@ -441,7 +616,7 @@ export class ResponseStore {
 
   private purgeExpired(): void {
     let durableReplayChanged = false;
-    const now = Date.now();
+    const now = this.nowMs();
 
     if (this.entries.size > 0) {
       const now = Date.now();
@@ -492,6 +667,19 @@ export class ResponseStore {
       }
     }
 
+    for (const [key, entry] of this.protocolFailureCycles.entries()) {
+      if (
+        entry.expiresAtUtc <= now &&
+        !(
+          entry.phase === "retry_claimed" &&
+          this.inFlightResponses.has(key)
+        )
+      ) {
+        this.protocolFailureCycles.delete(key);
+        this.recordEviction("protocol_failure_cycle", "ttl");
+      }
+    }
+
     for (const [key] of this.protocolReplayBodies.entries()) {
       const entry = this.durable.state.replays[key];
       if (!entry || entry.expiresAtUtc <= now) {
@@ -539,6 +727,29 @@ export class ResponseStore {
       delete this.durable.state.toolLedgers[oldest.value];
       this.recordEviction("tool_ledger", "lru");
     }
+  }
+
+  private rememberProtocolFailure(
+    identityKey: string,
+    conversationId: string | null,
+    response: JsonObject,
+    phase: ProtocolFailureCycleEntry["phase"],
+  ): void {
+    const key = identityKey.trim();
+    if (!key) return;
+    this.purgeExpired();
+    this.protocolFailureCycles.delete(key);
+    this.protocolFailureCycles.set(key, {
+      phase,
+      conversationId: conversationId?.trim() || null,
+      response: cloneJsonValue(response),
+      expiresAtUtc: this.nowMs() + ProtocolFailureCycleTtlMs,
+    });
+    this.trimOldest(
+      this.protocolFailureCycles,
+      MaxRequestHashes,
+      "protocol_failure_cycle",
+    );
   }
 
   private recordToolLedgerRecovery(
