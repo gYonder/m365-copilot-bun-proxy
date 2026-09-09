@@ -310,6 +310,8 @@ function buildHealthResponse(
     openAiTransformMode: normalizeOpenAiTransformMode(
       options.openAiTransformMode,
     ),
+    simulatedOutputProtocol:
+      options.simulatedOutputProtocol ?? SimulatedOutputProtocols.Legacy,
     transport: options.transport,
     defaultModel: options.defaultModel,
     configured_context_limit: ConfiguredContextLimit,

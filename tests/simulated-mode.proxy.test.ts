@@ -232,6 +232,7 @@ describe("simulated transform mode proxy flow", () => {
         (options) => {
           options.openAiTransformMode = OpenAiTransformModes.Mapped;
           options.defaultModel = "gpt-5.6-sol";
+          options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
         },
       ),
     );
@@ -242,6 +243,9 @@ describe("simulated transform mode proxy flow", () => {
     const body = (await response.json()) as JsonObject;
     expect(body.status).toBe("ok");
     expect(body.openAiTransformMode).toBe(OpenAiTransformModes.Mapped);
+    expect(body.simulatedOutputProtocol).toBe(
+      SimulatedOutputProtocols.BridgeV1,
+    );
     expect(body.defaultModel).toBe("gpt-5.6-sol");
     expect(body.configured_context_limit).toBe(128_000);
     expect(body.observed_safe_context_limit).toBeNull();
