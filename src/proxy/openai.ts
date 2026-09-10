@@ -560,52 +560,19 @@ export function classifyToolAttempt(
   if (tooling.tools.length === 0) {
     return { kind: "none" };
   }
-  const invalidReason = classifyToolAttemptShape(assistantText);
-  if (invalidReason) {
-    return { kind: "invalid_attempt", reason: invalidReason };
-  }
-  return { kind: "none" };
-}
-
-export function looksLikeToolCallAttemptText(assistantText: string): boolean {
-  return classifyToolAttemptShape(assistantText) !== null;
-}
-
-function classifyToolAttemptShape(assistantText: string): string | null {
   for (const candidate of enumerateJsonCandidates(assistantText)) {
     const node = tryParseJsonNode(candidate);
     if (node === null) {
       continue;
     }
     if (looksLikeToolCallAttempt(node)) {
-      return "tool_call_attempt_rejected";
+      return { kind: "invalid_attempt", reason: "tool_call_attempt_rejected" };
     }
   }
   if (looksLikeMalformedToolCallEnvelope(assistantText)) {
-    return "malformed_tool_call_envelope";
+    return { kind: "invalid_attempt", reason: "malformed_tool_call_envelope" };
   }
-  if (looksLikeMalformedSimulatedResponseEnvelope(assistantText)) {
-    return "malformed_simulated_response_envelope";
-  }
-  return null;
-}
-
-function looksLikeMalformedSimulatedResponseEnvelope(
-  assistantText: string,
-): boolean {
-  const looksLikeResponsesWrapper =
-    /"object"\s*:\s*"response"/i.test(assistantText) &&
-    /"status"\s*:\s*"in_progress"/i.test(assistantText) &&
-    /"output"\s*:/i.test(assistantText);
-  if (!looksLikeResponsesWrapper) {
-    return false;
-  }
-
-  return (
-    /tools\.(?:apply_patch|exec_command)\s*\(/i.test(assistantText) ||
-    /await\s+tools\.[A-Za-z_][A-Za-z0-9_]*\s*\(/i.test(assistantText) ||
-    /text\s*\(\s*(?:JSON\.stringify\s*\()?/i.test(assistantText)
-  );
+  return { kind: "none" };
 }
 
 function looksLikeMalformedToolCallEnvelope(assistantText: string): boolean {
@@ -683,11 +650,7 @@ function extractToolCallsFromNode(node: JsonValue, tooling: OpenAiTooling): Open
     return wrappedFromOutput;
   }
 
-  const singleCall = tryBuildToolCall(
-    node,
-    tooling,
-    typeof node.type === "string" ? node.type : undefined,
-  );
+  const singleCall = tryBuildToolCall(node, tooling);
   return singleCall ? [singleCall] : [];
 }
 
@@ -749,7 +712,6 @@ function extractToolCallsFromResponsesNode(
             : item.arguments ?? null,
       },
       tooling,
-      type,
     );
     if (toolCall) {
       toolCalls.push(toolCall);
@@ -767,11 +729,7 @@ function extractToolCallsFromArray(
     if (!isJsonObject(item)) {
       continue;
     }
-    const toolCall = tryBuildToolCall(
-      item,
-      tooling,
-      typeof item.type === "string" ? item.type : undefined,
-    );
+    const toolCall = tryBuildToolCall(item, tooling);
     if (toolCall) {
       toolCalls.push(toolCall);
     }
@@ -782,7 +740,6 @@ function extractToolCallsFromArray(
 function tryBuildToolCall(
   callObject: JsonObject,
   tooling: OpenAiTooling,
-  sourceType?: string,
 ): OpenAiAssistantToolCall | null {
   const functionObject = isJsonObject(callObject.function) ? callObject.function : null;
 
@@ -793,23 +750,6 @@ function tryBuildToolCall(
     callObject.recipient_name,
   );
   if (!name) {
-    return null;
-  }
-  const normalizedSourceType = sourceType?.toLowerCase();
-  const sourceToolType =
-    normalizedSourceType === "custom" ||
-      normalizedSourceType === "custom_tool_call"
-      ? "custom"
-      : normalizedSourceType === "function" ||
-          normalizedSourceType === "function_call"
-        ? "function"
-        : null;
-  if (
-    tooling.toolChoiceMode === ToolChoiceModes.Function &&
-    tooling.toolChoiceToolType &&
-    sourceToolType &&
-    sourceToolType !== tooling.toolChoiceToolType
-  ) {
     return null;
   }
 
@@ -897,13 +837,6 @@ export function validateOpenAiToolCall(
   const offeredTool = tooling.tools.find((tool) => tool.name === call.name);
   if (!offeredTool) {
     return { valid: false, reason: "unoffered_tool" };
-  }
-  if (
-    tooling.toolChoiceMode === ToolChoiceModes.Function &&
-    tooling.toolChoiceToolType &&
-    offeredTool.type !== tooling.toolChoiceToolType
-  ) {
-    return { valid: false, reason: "tool_choice_mismatch" };
   }
 
   if (offeredTool.type === "custom") {

@@ -1,23 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { CopilotGraphClient, CopilotSubstrateClient } from "../src/proxy/clients";
 import { ConversationStore } from "../src/proxy/conversation-store";
-import { DurableStateStore } from "../src/proxy/durable-state";
 import { DebugMarkdownLogger } from "../src/proxy/logger";
-import { BridgeObservability } from "../src/proxy/observability";
-import {
-  appendSimulatedProtocolCorrection,
-  buildSimulatedRegenerationPrompt,
-  SIMULATED_CORRECTION_RESERVE_CHARS,
-  SIMULATED_REGENERATION_RESERVE_CHARS,
-  tryParseResponsesRequest,
-} from "../src/proxy/request-parser";
+import { tryParseResponsesRequest } from "../src/proxy/request-parser";
 import { createProxyApp } from "../src/proxy/server";
 import { ResponseStore } from "../src/proxy/response-store";
 import { ProxyTokenProvider } from "../src/proxy/token-provider";
 import {
   LogLevels,
   OpenAiTransformModes,
-  SimulatedOutputProtocols,
   ToolChoiceModes,
   TransportNames,
   type ChatResult,
@@ -35,195 +26,6 @@ import {
 } from "../src/proxy/utils";
 
 describe("simulated transform mode proxy flow", () => {
-  test("tool-free Responses prompt requests direct assistant text", () => {
-    const options = createOptions();
-    options.substrate.maxSendChars = 6_000;
-    const parsed = tryParseResponsesRequest(
-      {
-        model: "gpt-5.6-sol",
-        stream: true,
-        input: "Summarize the conversation for compaction.",
-      },
-      options,
-    );
-
-    expect(parsed.ok).toBeTrue();
-    if (!parsed.ok) return;
-    const prompt = parsed.request.base.promptText;
-    expect(prompt).toContain("Return the complete assistant answer as plain text.");
-    expect(prompt).not.toContain(
-      "Return exactly one markdown JSON code block containing a single valid JSON object",
-    );
-    expect(prompt).not.toContain("STRICT OUTPUT CONTRACT:");
-    expect(prompt.length).toBeLessThanOrEqual(
-      options.substrate.maxSendChars - SIMULATED_CORRECTION_RESERVE_CHARS,
-    );
-  });
-
-  test("tool-free Responses stream accepts a compaction-shaped prose summary without retry", async () => {
-    const summary = [
-      "Conversation summary:",
-      "",
-      "The implementation uses this example:",
-      "```ts",
-      "const value = await loadContext();",
-      "```",
-      "",
-      "Preserve the remaining requirements.",
-      "x".repeat(5_000),
-    ].join("\n");
-    let callCount = 0;
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        return buildGraphChatResult(conversationId, payload, summary);
-      }),
-    );
-
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: true,
-          input: "Summarize the conversation for compaction.",
-        }),
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(1);
-    let completed: JsonObject | null = null;
-    for await (const event of readSseEvents(response.body!)) {
-      const parsed = tryParseJsonObject(event.data.trim());
-      if (parsed && tryGetString(parsed, "type") === "response.completed") {
-        completed = isJsonObject(parsed.response) ? parsed.response : null;
-      }
-    }
-    expect(completed?.status).toBe("completed");
-    expect(completed?.output_text).toBe(summary);
-  });
-
-  test("tool-free Responses preserves JSON-shaped assistant text", async () => {
-    const summary = '{"summary":"Keep this as assistant text."}';
-    let callCount = 0;
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        return buildGraphChatResult(conversationId, payload, summary);
-      }),
-    );
-
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: false,
-          input: "Return a JSON summary.",
-        }),
-      }),
-    );
-
-    expect(callCount).toBe(1);
-    expect((await response.json() as JsonObject).output_text).toBe(summary);
-  });
-
-  test("tool-free Responses accepts prose containing a Responses JSON example", async () => {
-    const summary =
-      'The API can return {"object":"response","status":"completed"} as an example.';
-    const app = createProxyApp(
-      createServices((conversationId, payload) =>
-        buildGraphChatResult(conversationId, payload, summary)
-      ),
-    );
-
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: false,
-          input: "Summarize the API discussion.",
-        }),
-      }),
-    );
-
-    expect((await response.json() as JsonObject).output_text).toBe(summary);
-  });
-
-  test("tool-free Responses accepts plain text after a structural correction", async () => {
-    let callCount = 0;
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        const result = buildGraphChatResult(
-          conversationId,
-          payload,
-          callCount === 1 ? "" : "Recovered summary.",
-        );
-        return callCount === 1 ? { ...result, assistantText: " " } : result;
-      }),
-    );
-
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: false,
-          input: "Summarize the conversation.",
-        }),
-      }),
-    );
-
-    expect(callCount).toBe(2);
-    expect((await response.json() as JsonObject).output_text).toBe(
-      "Recovered summary.",
-    );
-  });
-
-  test("tool_choice none does not advertise tool calls in the simulated prompt", () => {
-    const parsed = tryParseResponsesRequest(
-      {
-        model: "gpt-5.6-sol",
-        input: "Answer without tools.",
-        tools: [{
-          type: "function",
-          name: "exec_command",
-          parameters: { type: "object", properties: {} },
-        }],
-        tool_choice: "none",
-      },
-      createOptions(),
-    );
-
-    expect(parsed.ok).toBeTrue();
-    if (!parsed.ok) return;
-    expect(parsed.request.base.promptText).toContain(
-      "Return the complete assistant answer as plain text.",
-    );
-    expect(parsed.request.base.promptText).not.toContain(
-      "Tool calls are supported here",
-    );
-  });
-
   test("GET /healthz reports active transform mode", async () => {
     const app = createProxyApp(
       createServices(
@@ -232,7 +34,6 @@ describe("simulated transform mode proxy flow", () => {
         (options) => {
           options.openAiTransformMode = OpenAiTransformModes.Mapped;
           options.defaultModel = "gpt-5.6-sol";
-          options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
         },
       ),
     );
@@ -243,9 +44,6 @@ describe("simulated transform mode proxy flow", () => {
     const body = (await response.json()) as JsonObject;
     expect(body.status).toBe("ok");
     expect(body.openAiTransformMode).toBe(OpenAiTransformModes.Mapped);
-    expect(body.simulatedOutputProtocol).toBe(
-      SimulatedOutputProtocols.BridgeV1,
-    );
     expect(body.defaultModel).toBe("gpt-5.6-sol");
     expect(body.configured_context_limit).toBe(128_000);
     expect(body.observed_safe_context_limit).toBeNull();
@@ -393,7 +191,6 @@ describe("simulated transform mode proxy flow", () => {
       {
         name: "exec",
         type: "custom",
-        namespace: "functions",
         description: "Execute a tool expression.",
         parameters: {},
         format: { type: "grammar", syntax: "lark" },
@@ -518,82 +315,6 @@ describe("simulated transform mode proxy flow", () => {
     );
   });
 
-  test("bounds the initial and correction prompts without cutting fenced request JSON", () => {
-    const options = createOptions();
-    options.substrate.truncateBeforeSending = true;
-    options.substrate.maxSendChars = 6_000;
-    const parsed = tryParseResponsesRequest(
-      {
-        model: "gpt-5.6-sol",
-        input: [
-          {
-            type: "function_call_output",
-            call_id: "call_bounded",
-            output: `HEAD-${"x".repeat(20_000)}-TAIL`,
-          },
-          { type: "message", role: "user", content: "Continue." },
-        ],
-        tools: [{
-          type: "function",
-          name: "exec_command",
-          parameters: {
-            type: "object",
-            properties: { cmd: { type: "string" } },
-            required: ["cmd"],
-          },
-        }],
-      },
-      options,
-    );
-
-    expect(parsed.ok).toBeTrue();
-    if (!parsed.ok) return;
-    const initial = parsed.request.base.promptText;
-    const correction = appendSimulatedProtocolCorrection(
-      initial,
-      1,
-      "duplicate_call_id",
-      options.substrate.maxSendChars,
-      '{"object":"response","status":"completed","output":[]}'.repeat(5),
-    );
-    expect(initial.length).toBeLessThanOrEqual(
-      options.substrate.maxSendChars - SIMULATED_CORRECTION_RESERVE_CHARS,
-    );
-    expect(correction.length).toBeLessThanOrEqual(
-      options.substrate.maxSendChars,
-    );
-    const fenced = /```json\n([\s\S]*?)\n```\nSTRICT OUTPUT CONTRACT:/.exec(
-      correction,
-    );
-    expect(fenced).not.toBeNull();
-    expect(JSON.parse(fenced?.[1] ?? "")).toBeObject();
-    expect(correction).toEndWith(
-      "follow the strict output contract above.",
-    );
-    expect(correction).not.toContain("REJECTED CANDIDATE JSON STRING:");
-  });
-
-  test("includes a bounded malformed candidate in the correction prompt", () => {
-    const malformed = `{"object":"response","status":"completed","output":[{"type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"${"updated\n".repeat(1_700)}"}]}]}`;
-    const correction = appendSimulatedProtocolCorrection(
-      "ORIGINAL REQUEST\nSTRICT OUTPUT CONTRACT:",
-      1,
-      "malformed_json",
-      100_000,
-      malformed,
-    );
-
-    expect(malformed.length).toBeGreaterThan(10_000);
-    expect(correction).toContain("REJECTED CANDIDATE JSON STRING:");
-    expect(correction).toContain(JSON.stringify(malformed));
-    expect(correction).toContain(
-      "Repair the candidate's JSON serialization instead of independently regenerating the response.",
-    );
-    expect(correction).toEndWith(
-      "follow the strict output contract above.",
-    );
-  });
-
   test("GET /v1/models returns all supported models", async () => {
     const app = createProxyApp(
       createServices((conversationId, payload) =>
@@ -683,7 +404,7 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as JsonObject;
-    expect(body.id).toMatch(/^chatcmpl-/);
+    expect(body.id).toBe("chatcmpl_simulated_1");
     expect((body.choices as JsonObject[])[0]?.message).toEqual(
       (simulatedCompletion.choices as JsonObject[])[0]?.message,
     );
@@ -692,67 +413,11 @@ describe("simulated transform mode proxy flow", () => {
       "The JSON payload below is an entire request for the OpenAI chat.completions format.",
     );
     expect(capturedPrompt).toContain(
-      "Return the complete assistant answer as plain text.",
+      "Focus on producing a valid response object that matches the expected OpenAI format for this request.",
     );
     expect(capturedPrompt).not.toContain("You are simulating");
     expect(capturedPrompt).toContain("```json");
     expect(capturedPrompt).toContain("\"messages\"");
-  });
-
-  test("chat/completions non-stream synthesizes local usage and ignores provider usage", async () => {
-    const simulatedCompletion: JsonObject = {
-      object: "chat.completion",
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: "usage test" },
-        finish_reason: "stop",
-      }],
-      usage: { prompt_tokens: 999, completion_tokens: 999, total_tokens: 999 },
-    };
-    const app = createProxyApp(
-      createServices((conversationId, payload) =>
-        buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson(simulatedCompletion),
-        ),
-      ),
-    );
-    const request = {
-      model: "m365-copilot",
-      stream: false,
-      messages: [{ role: "user", content: "Estimate this locally." }],
-    };
-    const first = await app.fetch(
-      new Request("http://localhost/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify(request),
-      }),
-    );
-    const second = await app.fetch(
-      new Request("http://localhost/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify(request),
-      }),
-    );
-
-    const firstBody = (await first.json()) as JsonObject;
-    const secondBody = (await second.json()) as JsonObject;
-    expect(firstBody.usage).toEqual(secondBody.usage);
-    expect(firstBody.usage).toMatchObject({
-      prompt_tokens: expect.any(Number),
-      completion_tokens: expect.any(Number),
-      total_tokens: expect.any(Number),
-    });
-    expect((firstBody.usage as JsonObject).total_tokens).not.toBe(999);
   });
 
   test("chat/completions stream uses simulated JSON payload", async () => {
@@ -866,68 +531,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(sawDone).toBeTrue();
   });
 
-  test("chat/completions stream emits a final usage-only chunk when requested", async () => {
-    const simulatedCompletion: JsonObject = {
-      object: "chat.completion",
-      choices: [{
-        index: 0,
-        message: { role: "assistant", content: "stream usage" },
-        finish_reason: "stop",
-      }],
-      usage: { prompt_tokens: 999, completion_tokens: 999, total_tokens: 999 },
-    };
-    const app = createProxyApp(
-      createServices((conversationId, payload) =>
-        buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson(simulatedCompletion),
-        ),
-      ),
-    );
-    const response = await app.fetch(
-      new Request("http://localhost/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: true,
-          stream_options: { include_usage: true },
-          messages: [{ role: "user", content: "Stream usage locally." }],
-        }),
-      }),
-    );
-
-    let usageChunk: JsonObject | null = null;
-    for await (const event of readSseEvents(response.body!)) {
-      if (event.data.trim().toLowerCase() === "[done]") {
-        break;
-      }
-      const chunk = tryParseJsonObject(event.data.trim());
-      if (
-        chunk &&
-        Array.isArray(chunk.choices) &&
-        chunk.choices.length === 0 &&
-        isJsonObject(chunk.usage)
-      ) {
-        usageChunk = chunk;
-      }
-    }
-
-    expect(usageChunk).not.toBeNull();
-    expect(usageChunk?.choices).toEqual([]);
-    expect(usageChunk?.usage).toMatchObject({
-      prompt_tokens: expect.any(Number),
-      completion_tokens: expect.any(Number),
-      total_tokens: expect.any(Number),
-    });
-    expect((usageChunk?.usage as JsonObject).total_tokens).not.toBe(999);
-  });
-
-  test("chat/completions simulated streaming remains buffered", async () => {
+  test("chat/completions stream in simulated mode uses substrate stream path", async () => {
     const simulatedCompletion: JsonObject = {
       id: "chatcmpl_simulated_stream_substrate",
       object: "chat.completion",
@@ -986,8 +590,8 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).not.toBeNull();
-    expect(chatCallCount).toBe(1);
-    expect(chatStreamCallCount).toBe(0);
+    expect(chatCallCount).toBe(0);
+    expect(chatStreamCallCount).toBe(1);
 
     let streamedText = "";
     let sawDone = false;
@@ -1121,7 +725,7 @@ describe("simulated transform mode proxy flow", () => {
       }
     }
 
-    expect(contentChunks).toHaveLength(1);
+    expect(contentChunks.length).toBeGreaterThan(1);
     expect(streamedText).toBe(finalContent);
     expect(sawDone).toBeTrue();
   });
@@ -1228,8 +832,8 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).not.toBeNull();
-    expect(chatStreamCallCount).toBe(0);
-    expect(chatCallCount).toBe(1);
+    expect(chatStreamCallCount).toBe(1);
+    expect(chatCallCount).toBe(0);
 
     let sawToolDelta = false;
     let sawDone = false;
@@ -1266,8 +870,8 @@ describe("simulated transform mode proxy flow", () => {
       }
     }
 
-    expect(sawToolDelta).toBeTrue();
-    expect(finishReason).toBe("tool_calls");
+    expect(sawToolDelta).toBeFalse();
+    expect(finishReason).toBeNull();
     expect(sawDone).toBeTrue();
   });
 
@@ -1347,8 +951,8 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(response.body).not.toBeNull();
-    expect(chatStreamCallCount).toBe(0);
-    expect(chatCallCount).toBe(1);
+    expect(chatStreamCallCount).toBe(1);
+    expect(chatCallCount).toBe(0);
 
     let streamedText = "";
     let sawDone = false;
@@ -1442,51 +1046,8 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(createResponse.status).toBe(200);
     const body = (await createResponse.json()) as JsonObject;
-    expect(body.id).toMatch(/^resp_/);
+    expect(body.id).toBe("resp_simulated_1");
     expect(body.output_text).toBe("hello from responses mode");
-  });
-
-  test("responses preserves validated partial item status in the local projection", async () => {
-    const simulatedResponse: JsonObject = {
-      object: "response",
-      status: "incomplete",
-      incomplete_details: { reason: "provider deadline" },
-      output: [{
-        id: "msg_partial",
-        type: "message",
-        status: "incomplete",
-        role: "assistant",
-        content: [{ type: "output_text", text: "partial" }],
-      }],
-      output_text: "partial",
-    };
-    const app = createProxyApp(
-      createServices((conversationId, payload) =>
-        buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson(simulatedResponse),
-        ),
-      ),
-    );
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          input: "Continue.",
-        }),
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as JsonObject;
-    expect(body.status).toBe("incomplete");
-    expect((body.output as JsonObject[])[0]?.status).toBe("incomplete");
   });
 
   test("responses auto tool choice accepts final assistant text without resend", async () => {
@@ -1494,10 +1055,8 @@ describe("simulated transform mode proxy flow", () => {
     const payload: JsonObject = {
       id: "resp_auto_text",
       object: "response",
-      status: "completed",
       output: [
         {
-          status: "completed",
           type: "message",
           role: "assistant",
           content: [{ type: "output_text", text: "done" }],
@@ -1563,17 +1122,7 @@ describe("simulated transform mode proxy flow", () => {
         return buildGraphChatResult(
           conversationId,
           requestPayload,
-          toMarkdownJson({
-            object: "response",
-            status: "completed",
-            output: [{
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [{ type: "output_text", text: "done" }],
-            }],
-            output_text: "done",
-          }),
+          "done",
         );
       }),
     );
@@ -1642,11 +1191,9 @@ describe("simulated transform mode proxy flow", () => {
           toMarkdownJson({
             id: "resp_required_text",
             object: "response",
-            status: "completed",
             output: [
               {
                 type: "message",
-                status: "completed",
                 role: "assistant",
                 content: [{ type: "output_text", text: "done" }],
               },
@@ -1677,10 +1224,8 @@ describe("simulated transform mode proxy flow", () => {
         }),
       }),
     );
-    expect(response.status).toBe(200);
-    expect(upstreamCalls).toBe(2);
-    const failure = (await response.json()) as JsonObject;
-    expect(failure.status).toBe("failed");
+    expect(response.status).toBe(502);
+    expect(upstreamCalls).toBe(1);
   });
 
   test("responses non-stream normalizes output_text output items", async () => {
@@ -1720,7 +1265,8 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(createResponse.status).toBe(200);
     const body = (await createResponse.json()) as JsonObject;
-    expect(body.status).toBe("failed");
+    expect(body.id).toBe("resp_simulated_output_text_item");
+    expect(body.output_text).toBe("hello from output_text item");
   });
 
   test("responses non-stream normalizes assistant role/content output items", async () => {
@@ -1760,7 +1306,8 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(createResponse.status).toBe(200);
     const body = (await createResponse.json()) as JsonObject;
-    expect(body.status).toBe("failed");
+    expect(body.id).toBe("resp_simulated_role_content");
+    expect(body.output_text).toBe("hello from role/content item");
   });
 
   test("responses non-stream preserves whitespace across output text parts", async () => {
@@ -1770,7 +1317,6 @@ describe("simulated transform mode proxy flow", () => {
       status: "completed",
       output: [{
         type: "message",
-        status: "completed",
         role: "assistant",
         content: [
           { type: "output_text", text: "Repository" },
@@ -1811,7 +1357,7 @@ describe("simulated transform mode proxy flow", () => {
     );
   });
 
-  test("responses non-stream rejects outputs aliases at the strict boundary", async () => {
+  test("responses non-stream accepts outputs alias with nested function_call payloads", async () => {
     const simulatedResponse: JsonObject = {
       id: "response-002",
       object: "response",
@@ -1871,11 +1417,15 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(createResponse.status).toBe(200);
     const body = (await createResponse.json()) as JsonObject;
-    expect(body.id).toMatch(/^resp_/);
+    expect(body.id).toBe("response-002");
     expect(Array.isArray(body.output)).toBeTrue();
     expect(body.outputs).toBeUndefined();
-    expect(body.status).toBe("failed");
-    expect(body.output).toEqual([]);
+    const outputItem = (body.output as JsonObject[])[0] as JsonObject;
+    expect(tryGetString(outputItem, "type")).toBe("function_call");
+    expect(tryGetString(outputItem, "name")).toBe("get_weather");
+    expect(typeof outputItem.arguments).toBe("string");
+    expect(String(outputItem.arguments)).toContain("\"location\":\"London\"");
+    expect(tryGetString(body, "output_text") ?? "").toBe("");
   });
 
   test("responses stream assigns unique proxy response ids per request", async () => {
@@ -2064,8 +1614,6 @@ describe("simulated transform mode proxy flow", () => {
     expect(Array.isArray(inProgressResponse.output)).toBeTrue();
     expect((createdResponse.output as unknown[]).length).toBe(0);
     expect((inProgressResponse.output as unknown[]).length).toBe(0);
-    expect(createdResponse.usage).toBeNull();
-    expect(inProgressResponse.usage).toBeNull();
     expect(tryGetString(createdResponse, "output_text") ?? "").toBe("");
     expect(tryGetString(inProgressResponse, "output_text") ?? "").toBe("");
     expect(tryGetBoolean(completedResponse, "store")).toBeTrue();
@@ -2073,115 +1621,6 @@ describe("simulated transform mode proxy flow", () => {
     const usage = completedResponse.usage as JsonObject;
     expect(typeof usage.input_tokens).toBe("number");
     expect(typeof usage.output_tokens).toBe("number");
-  });
-
-  test.each([
-    {
-      status: "failed",
-      terminalType: "response.failed",
-      terminalFields: {
-        error: { code: "provider_failed", message: "provider said no" },
-        incomplete_details: null,
-      },
-    },
-    {
-      status: "incomplete",
-      terminalType: "response.incomplete",
-      terminalFields: {
-        error: null,
-        incomplete_details: { reason: "provider deadline" },
-      },
-    },
-  ])("replays a $status Responses stream with a clean in_progress snapshot", async ({
-    status,
-    terminalType,
-    terminalFields,
-  }) => {
-    const app = createProxyApp(
-      createServices((conversationId, payload) =>
-        buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson({
-            id: "provider-response-id",
-            object: "response",
-            model: "provider-model",
-            created_at: 1,
-            status,
-            output: [],
-            output_text: "",
-            usage: { total_tokens: 999 },
-            ...terminalFields,
-          }),
-        ),
-      ),
-    );
-    const requestBody = {
-      model: "m365-copilot",
-      stream: true,
-      client_metadata: {
-        thread_id: `thread-${status}`,
-        session_id: `session-${status}`,
-        turn_id: `turn-${status}`,
-      },
-      input: "Return the provider terminal state.",
-    };
-    const send = () =>
-      app.fetch(
-        new Request("http://localhost/v1/responses", {
-          method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-m365-transport": TransportNames.Graph,
-          },
-          body: JSON.stringify(requestBody),
-        }),
-      );
-    const collect = async (response: Response): Promise<JsonObject[]> => {
-      const events: JsonObject[] = [];
-      for await (const event of readSseEvents(response.body!)) {
-        const data = event.data.trim();
-        if (!data || data === "[DONE]") continue;
-        const parsed = tryParseJsonObject(data);
-        if (parsed) events.push(parsed);
-      }
-      return events;
-    };
-
-    const firstEvents = await collect(await send());
-    const replayEvents = await collect(await send());
-    const inProgress = replayEvents.find(
-      (event) => event.type === "response.in_progress",
-    )?.response as JsonObject;
-    const terminal = replayEvents.find(
-      (event) => event.type === terminalType,
-    );
-
-    expect(inProgress).toMatchObject({
-      status: "in_progress",
-      error: null,
-      incomplete_details: null,
-      usage: null,
-      output: [],
-    });
-    expect(terminal).toMatchObject({
-      type: terminalType,
-      response: {
-        status,
-        ...terminalFields,
-        usage: expect.any(Object),
-        output: [],
-      },
-    });
-    const terminalResponse = terminal?.response as JsonObject;
-    expect(tryGetString(terminalResponse, "id")?.startsWith("resp_")).toBeTrue();
-    expect(tryGetString(terminalResponse, "model")).toBe("m365-copilot");
-    expect(terminalResponse.created_at).not.toBe(1);
-    expect(
-      (terminalResponse.usage as JsonObject).total_tokens,
-    ).not.toBe(999);
-    expect(firstEvents.some((event) => event.type === terminalType)).toBeTrue();
-    expect(replayEvents.at(-1)?.type).toBe(terminalType);
   });
 
   test("responses accepts spec conversation string input and returns spec conversation output", async () => {
@@ -2327,12 +1766,10 @@ describe("simulated transform mode proxy flow", () => {
         const response = {
           id: `resp_tool_${upstreamCalls}`,
           object: "response",
-          status: "completed",
           output: [
             {
-              status: "completed",
               type: "function_call",
-              call_id: `call_${upstreamCalls}`,
+              call_id: "call_1",
               name: "exec",
               arguments: "{}",
             },
@@ -2382,6 +1819,11 @@ describe("simulated transform mode proxy flow", () => {
           arguments: "{}",
         },
         { type: "function_call_output", call_id: "call_1", output: "ok" },
+        {
+          type: "custom_tool_call_output",
+          call_id: "custom_1",
+          output: "ok",
+        },
         { role: "user", content: "Give final answer." },
       ],
       tools: [
@@ -2447,7 +1889,6 @@ describe("simulated transform mode proxy flow", () => {
             status: "completed",
             output: [
               {
-                status: "completed",
                 type: "function_call",
                 call_id: "call_concurrent_1",
                 name: "exec",
@@ -2537,7 +1978,6 @@ describe("simulated transform mode proxy flow", () => {
             model: "simulated-model",
             output: [
               {
-                status: "completed",
                 type: "message",
                 role: "assistant",
                 content: [{ type: "output_text", text: "hello once" }],
@@ -2592,9 +2032,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(second.headers.get("x-m365-conversation-id")).toBe("conv_simulated_1");
     const secondBody = (await second.json()) as JsonObject;
     expect(tryGetString(secondBody, "status")).toBe("completed");
-    expect(tryGetString(secondBody, "id")).toBe(
-      tryGetString(firstBody, "id"),
-    );
+    expect(tryGetString(secondBody, "id")).toBe("resp_hash_guard_first");
     expect(Array.isArray(secondBody.output)).toBeTrue();
     expect((secondBody.output as unknown[]).length).toBe(1);
     expect(tryGetString(secondBody, "output_text") ?? "").toBe("hello once");
@@ -2698,7 +2136,6 @@ describe("simulated transform mode proxy flow", () => {
             model: "simulated-model",
             output: [
               {
-                status: "completed",
                 type: "message",
                 role: "assistant",
                 content: [{ type: "output_text", text: conversationId }],
@@ -2904,170 +2341,6 @@ describe("simulated transform mode proxy flow", () => {
     expect(output[0]?.input).toBe(expectedPatch);
   });
 
-  test("reconstructs synthesized Responses SSE payloads without duplicated parts or arguments", async () => {
-    const expectedPatch = "*** Begin Patch\n*** Add File: exact.txt\n+exact\n*** End Patch";
-    const providerResponse: JsonObject = {
-      object: "response",
-      status: "completed",
-      output: [
-        {
-          id: "provider_message",
-          type: "message",
-          status: "completed",
-          role: "assistant",
-          content: [
-            { type: "output_text", text: "first " },
-            { type: "refusal", refusal: "not this part" },
-            { type: "output_text", text: "second" },
-          ],
-        },
-        {
-          id: "provider_function",
-          type: "function_call",
-          status: "completed",
-          call_id: "call_function",
-          name: "exec",
-          arguments: '{"cmd":"pwd"}',
-        },
-        {
-          id: "provider_custom",
-          type: "custom_tool_call",
-          status: "completed",
-          call_id: "call_custom",
-          name: "apply_patch",
-          input: expectedPatch,
-        },
-      ],
-      output_text: "first second",
-    };
-    const app = createProxyApp(
-      createServices((conversationId, payload) =>
-        buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson(providerResponse),
-        ),
-      ),
-    );
-
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: true,
-          input: "Return the exact mixed response.",
-          tools: [
-            {
-              type: "function",
-              name: "exec",
-              parameters: { type: "object" },
-            },
-            {
-              type: "custom",
-              name: "apply_patch",
-              format: {
-                type: "grammar",
-                syntax: "lark",
-                definition: "start: /[\\s\\S]+/",
-              },
-            },
-          ],
-          tool_choice: "auto",
-          parallel_tool_calls: true,
-        }),
-      }),
-    );
-
-    const events: JsonObject[] = [];
-    for await (const event of readSseEvents(response.body!)) {
-      const data = event.data.trim();
-      if (!data || data === "[DONE]") continue;
-      const parsed = tryParseJsonObject(data);
-      if (parsed) events.push(parsed);
-    }
-
-    const added = events.filter((event) =>
-      event.type === "response.output_item.added"
-    );
-    expect(added).toHaveLength(3);
-    for (const event of added) {
-      const item = event.item as JsonObject;
-      expect(item.status).toBe("in_progress");
-      if (item.type === "message") {
-        expect(item.content).toEqual([]);
-      } else if (item.type === "function_call") {
-        expect(item.arguments).toBe("");
-      } else if (item.type === "custom_tool_call") {
-        expect(item.input).toBe("");
-      }
-    }
-
-    const reconstructed = new Map<number, JsonObject>();
-    const completedItems = new Map<number, JsonObject>();
-    for (const event of added) {
-      const index = Number(event.output_index);
-      reconstructed.set(index, {
-        ...(event.item as JsonObject),
-        content: event.item && (event.item as JsonObject).type === "message"
-          ? []
-          : (event.item as JsonObject).content,
-      });
-    }
-    for (const event of events) {
-      const index = Number(event.output_index);
-      const item = reconstructed.get(index);
-      if (!item) continue;
-      if (event.type === "response.content_part.added") {
-        const content = Array.isArray(item.content) ? item.content : [];
-        content[Number(event.content_index)] = event.part;
-        item.content = content;
-      } else if (event.type === "response.content_part.done") {
-        const content = Array.isArray(item.content) ? item.content : [];
-        content[Number(event.content_index)] = event.part;
-        item.content = content;
-      } else if (event.type === "response.output_text.delta") {
-        const content = item.content as JsonObject[];
-        const part = content[Number(event.content_index)] as JsonObject;
-        part.text = `${part.text ?? ""}${event.delta ?? ""}`;
-      } else if (event.type === "response.refusal.delta") {
-        const content = item.content as JsonObject[];
-        const part = content[Number(event.content_index)] as JsonObject;
-        part.refusal = `${part.refusal ?? ""}${event.delta ?? ""}`;
-      } else if (event.type === "response.function_call_arguments.delta") {
-        item.arguments = `${item.arguments ?? ""}${event.delta ?? ""}`;
-      } else if (event.type === "response.custom_tool_call_input.delta") {
-        item.input = `${item.input ?? ""}${event.delta ?? ""}`;
-      } else if (event.type === "response.output_item.done") {
-        completedItems.set(index, event.item as JsonObject);
-      }
-    }
-
-    for (const [index, item] of completedItems) {
-      const reconstructedItem = reconstructed.get(index)!;
-      reconstructedItem.status = item.status;
-      expect(reconstructedItem).toEqual(item);
-    }
-    const completed = events.find((event) => event.type === "response.completed");
-    expect(completed).toBeTruthy();
-    const completedOutput = (completed!.response as JsonObject).output as JsonObject[];
-    expect([...completedItems.values()]).toEqual(completedOutput);
-    expect(
-      events
-        .filter((event) => event.type === "response.output_text.delta")
-        .map((event) => event.content_index),
-    ).toEqual([0, 2]);
-    expect(
-      events
-        .filter((event) => event.type === "response.refusal.delta")
-        .map((event) => event.content_index),
-    ).toEqual([1]);
-  });
-
 
   test("does not infer replay from a trailing assistant tail", async () => {
     let chatCallCount = 0;
@@ -3080,14 +2353,7 @@ describe("simulated transform mode proxy flow", () => {
           toMarkdownJson({
             id: "resp_should_not_be_used",
             object: "response",
-            status: "completed",
-            output: [{
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [{ type: "output_text", text: "unused" }],
-            }],
-            output_text: "unused",
+            output: [{ type: "output_text", text: "unused" }],
           }),
         );
       }),
@@ -3153,14 +2419,7 @@ describe("simulated transform mode proxy flow", () => {
           toMarkdownJson({
             id: "resp_should_not_be_used",
             object: "response",
-            status: "completed",
-            output: [{
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [{ type: "output_text", text: "unused" }],
-            }],
-            output_text: "unused",
+            output: [{ type: "output_text", text: "unused" }],
           }),
         );
       }),
@@ -3266,14 +2525,7 @@ describe("simulated transform mode proxy flow", () => {
           toMarkdownJson({
             id: "resp_should_not_be_used_single_assistant",
             object: "response",
-            status: "completed",
-            output: [{
-              type: "message",
-              status: "completed",
-              role: "assistant",
-              content: [{ type: "output_text", text: "unused" }],
-            }],
-            output_text: "unused",
+            output: [{ type: "output_text", text: "unused" }],
           }),
         );
       }),
@@ -3323,14 +2575,7 @@ describe("simulated transform mode proxy flow", () => {
             toMarkdownJson({
               id: "resp_should_not_be_used_header_only",
               object: "response",
-              status: "completed",
-              output: [{
-                type: "message",
-                status: "completed",
-                role: "assistant",
-                content: [{ type: "output_text", text: "unused" }],
-              }],
-              output_text: "unused",
+              output: [{ type: "output_text", text: "unused" }],
             }),
           ),
         (options) => {
@@ -3391,7 +2636,6 @@ describe("simulated transform mode proxy flow", () => {
             model: "simulated-model",
             output: [
               {
-                status: "completed",
                 type: "message",
                 role: "assistant",
                 content: [{ type: "output_text", text: "Hi" }],
@@ -3489,12 +2733,11 @@ describe("simulated transform mode proxy flow", () => {
     expect(replayTwo.headers.get("x-m365-replay-suppressed")).toBeNull();
     expect(replayTwo.headers.get("x-m365-conversation-id")).toBe("conv_simulated_1");
     const replayTwoBody = (await replayTwo.json()) as JsonObject;
-    expect(tryGetString(replayTwoBody, "id")?.startsWith("resp_")).toBeTrue();
-    expect(tryGetString(replayTwoBody, "id")).not.toBe(replayOneId);
+    expect(tryGetString(replayTwoBody, "id")).toBe(replayOneId);
     expect(tryGetString(replayTwoBody, "output_text") ?? "").toBe("Hi");
   });
 
-  test("chat/completions rejects top-level choice-shaped payloads", async () => {
+  test("chat/completions normalizes top-level choice-shaped payload into choices array", async () => {
     const malformedChoiceShape: JsonObject = {
       index: 0,
       finish_reason: "tool_calls",
@@ -3555,12 +2798,20 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(200);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("provider_drift");
+    expect(Array.isArray(body.choices)).toBeTrue();
+    const firstChoice = (body.choices as JsonObject[])[0] as JsonObject;
+    const message = firstChoice.message as JsonObject;
+    const toolCall = (message.tool_calls as JsonObject[])[0] as JsonObject;
+    const functionNode = toolCall.function as JsonObject;
+
+    expect(tryGetString(message, "role")).toBe("assistant");
+    expect(tryGetString(firstChoice, "finish_reason")).toBe("tool_calls");
+    expect(typeof functionNode.arguments).toBe("string");
   });
 
-  test("chat/completions rejects non-string tool-call arguments", async () => {
+  test("chat/completions normalizes tool-call arguments objects into JSON strings", async () => {
     const payloadWithObjectArguments: JsonObject = {
       id: "chatcmpl_obj_args",
       object: "chat.completion",
@@ -3632,9 +2883,16 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(502);
+    expect(response.status).toBe(200);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("provider_drift");
+    const choices = body.choices as JsonObject[];
+    const message = choices[0]?.message as JsonObject;
+    const toolCall = (message.tool_calls as JsonObject[])[0] as JsonObject;
+    const functionNode = toolCall.function as JsonObject;
+
+    expect(typeof functionNode.arguments).toBe("string");
+    expect(String(functionNode.arguments)).toContain("\"path\"");
+    expect(String(functionNode.arguments)).toContain("\"content\"");
   });
 
   test("chat/completions simulated prompt includes explicit tool-call guidance", async () => {
@@ -3712,7 +2970,7 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(capturedPrompt).toContain(
-      "Use choices[0].message.tool_calls",
+      "Tool calls are supported here: emit assistant tool calls when appropriate.",
     );
     expect(capturedPrompt).toContain(
       "If the request requires local files, shell state, or any other local environment access, emit an appropriate tool call instead of saying the environment is inaccessible.",
@@ -3802,15 +3060,12 @@ describe("simulated transform mode proxy flow", () => {
       "This request requires at least one tool call. Do not return a plain-text-only assistant response.",
     );
     expect(capturedPrompt).toContain(
-      "STRICT OUTPUT CONTRACT:",
+      "CRITICAL OUTPUT CONTRACT — this instruction appears after the request",
     );
     expect(capturedPrompt).toContain(
-      "escape line breaks, quotes, backslashes, and control characters",
+      '"type":"function_call","call_id":"call_1","name":"TOOL_NAME"',
     );
-    expect(capturedPrompt).toContain(
-      '"type":"function_call","status":"completed"',
-    );
-    expect(capturedPrompt.lastIndexOf("STRICT OUTPUT CONTRACT")).toBeGreaterThan(
+    expect(capturedPrompt.lastIndexOf("CRITICAL OUTPUT CONTRACT")).toBeGreaterThan(
       capturedPrompt.lastIndexOf("```"),
     );
   });
@@ -3834,7 +3089,6 @@ describe("simulated transform mode proxy flow", () => {
                 output: [
                   {
                     type: "message",
-                    status: "completed",
                     role: "assistant",
                     content: [{ type: "output_text", text: "The path is unknown." }],
                   },
@@ -3848,7 +3102,6 @@ describe("simulated transform mode proxy flow", () => {
                 output: [
                   {
                     type: "function_call",
-                    status: "completed",
                     call_id: "call_retry",
                     name: "exec_command",
                     arguments: "{\"cmd\":\"pwd\"}",
@@ -3892,9 +3145,9 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(callCount).toBe(2);
-    expect(capturedPrompts[1]).toContain("PROTOCOL CORRECTION 1:");
+    expect(capturedPrompts[1]).toContain("PROTOCOL RETRY 1:");
     expect(capturedPrompts[1]).toContain(
-      "Use {\"object\":\"response\",\"status\":\"completed\"",
+      "Return only the minified JSON tool-call object",
     );
   });
 
@@ -3930,7 +3183,6 @@ describe("simulated transform mode proxy flow", () => {
                 output: [
                   {
                     type: "custom_tool_call",
-                    status: "completed",
                     call_id: "call_repaired_exec",
                     name: "exec",
                     input:
@@ -3972,10 +3224,7 @@ describe("simulated transform mode proxy flow", () => {
 
     expect(response.status).toBe(200);
     expect(callCount).toBe(2);
-    expect(capturedPrompts[1]).toContain("PROTOCOL CORRECTION 1:");
-    expect(capturedPrompts[1]).toContain(
-      JSON.stringify(malformedEnvelope).replaceAll("`", "\\u0060"),
-    );
+    expect(capturedPrompts[1]).toContain("PROTOCOL RETRY 1:");
     const body = (await response.json()) as JsonObject;
     const output = Array.isArray(body.output) ? body.output : [];
     expect(output).toHaveLength(1);
@@ -3985,142 +3234,6 @@ describe("simulated transform mode proxy flow", () => {
       name: "exec",
     });
     expect(tryGetString(output[0], "input")).toContain("tools.exec_command");
-  });
-
-  test.each([
-    {
-      label: "fenced",
-      malformed: "```json\n{\n  \"id\": \"resp_retry1\",\n  \"object\": \"response\",\n  \"status\": \"in_progress\",\n  \"model\": \"gpt-5.6-sol\",\n  \"output\": const applied = await tools.apply_patch(patch); text(applied);\n}\n```",
-    },
-    {
-      label: "unfenced",
-      malformed: "{\"id\":\"resp_retry2\",\"object\":\"response\",\"status\":\"in_progress\",\"model\":\"gpt-5.6-sol\",\"output\":const result = await tools.exec_command({cmd:\"pwd\"});text(JSON.stringify(result));}",
-    },
-  ])("responses repairs a $label malformed in-progress Responses wrapper", async ({ malformed }) => {
-    const capturedPrompts: string[] = [];
-    let callCount = 0;
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        capturedPrompts.push(readPrompt(payload));
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          callCount === 1
-            ? malformed
-            : toMarkdownJson({
-                id: "resp_repaired_wrapper",
-                object: "response",
-                status: "completed",
-                output: [{
-                  type: "custom_tool_call",
-                status: "completed",
-                call_id: "call_repaired_wrapper",
-                  name: "exec",
-                  input: 'const result = await tools.exec_command({cmd:"pwd"}); text(result);',
-                }],
-              }),
-        );
-      }),
-    );
-
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: false,
-          input: "Use the local shell to run pwd.",
-          tools: [{
-            type: "custom",
-            name: "exec",
-            description: "Execute a tool expression.",
-            format: { type: "grammar", syntax: "lark", definition: "start: /[\\s\\S]+/" },
-          }],
-          tool_choice: "auto",
-        }),
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
-    expect(capturedPrompts[1]).toContain("PROTOCOL CORRECTION 1:");
-    const body = (await response.json()) as JsonObject;
-    const output = Array.isArray(body.output) ? body.output : [];
-    expect(output[0]).toMatchObject({
-      type: "custom_tool_call",
-      call_id: "call_repaired_wrapper",
-      name: "exec",
-    });
-  });
-
-  test("responses rejects a repeated malformed in-progress wrapper after one correction", async () => {
-    const malformed = "{\"id\":\"resp_retry_exhausted\",\"object\":\"response\",\"status\":\"in_progress\",\"output\":const result = await tools.exec_command({cmd:\"pwd\"});text(result);}";
-    const capturedPrompts: string[] = [];
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      capturedPrompts.push(readPrompt(payload));
-      return buildGraphChatResult(conversationId, payload, malformed);
-    });
-    services.observability = new BridgeObservability();
-    const app = createProxyApp(services);
-    const response = await app.fetch(new Request("http://localhost/v1/responses", {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-m365-transport": TransportNames.Graph },
-      body: JSON.stringify({
-        model: "m365-copilot",
-        stream: false,
-        input: "Use the local shell to run pwd.",
-        tools: [{ type: "custom", name: "exec", description: "Execute a tool expression.", format: { type: "grammar", syntax: "lark" } }],
-        tool_choice: "auto",
-      }),
-    }));
-    expect(callCount).toBe(2);
-    expect(response.status).toBe(200);
-    const body = (await response.json()) as JsonObject;
-    expect(body.status).toBe("failed");
-    expect((body.error as JsonObject).code).toBe("provider_drift");
-    const readiness = await app.fetch(new Request("http://localhost/readyz"));
-    const readinessBody = (await readiness.json()) as JsonObject;
-    const events = readinessBody.events as JsonObject;
-    expect((events.provider_drift as JsonObject).count).toBe(1);
-    const recentEvents = readinessBody.recentEvents as JsonObject[];
-    const correctionEvents = recentEvents.filter(
-      (event) =>
-        event.name === "retry" &&
-        (event.fields as JsonObject).reason ===
-          "simulated_protocol_correction",
-    );
-    expect(correctionEvents).toHaveLength(2);
-    expect(
-      (correctionEvents[0]?.fields as JsonObject).requestChars,
-    ).toBe(capturedPrompts[0]?.length);
-    expect(
-      (correctionEvents[1]?.fields as JsonObject).requestChars,
-    ).toBe(capturedPrompts[1]?.length);
-    expect(
-      (correctionEvents[1]?.fields as JsonObject).sameAsFirstCandidate,
-    ).toBeTrue();
-    expect(JSON.stringify(correctionEvents)).not.toContain(malformed);
-    const exhaustionEvent = recentEvents.find(
-      (event) => event.name === "provider_drift",
-    );
-    expect(
-      (exhaustionEvent?.fields as JsonObject).requestChars,
-    ).toBe(capturedPrompts[1]?.length);
-    expect(
-      (exhaustionEvent?.fields as JsonObject).sameAsFirstCandidate,
-    ).toBeTrue();
-    const decodeDiagnostics = (exhaustionEvent?.fields as JsonObject)
-      .decodeDiagnostics as JsonObject;
-    expect(typeof decodeDiagnostics.category).toBe("string");
-    expect(typeof decodeDiagnostics.candidateLength).toBe("number");
-    expect(JSON.stringify(exhaustionEvent)).not.toContain(malformed);
   });
 
   test("responses resumes a preceding leaked tool envelope on explicit request", async () => {
@@ -4151,7 +3264,6 @@ describe("simulated transform mode proxy flow", () => {
                 output: [
                   {
                     type: "custom_tool_call",
-                    status: "completed",
                     call_id: "call_resumed_exec",
                     name: "exec",
                     input:
@@ -4184,7 +3296,6 @@ describe("simulated transform mode proxy flow", () => {
     );
     expect(leaked.status).toBe(200);
     const leakedBody = (await leaked.json()) as JsonObject;
-    expect(leakedBody.status).toBe("failed");
 
     const resumed = await app.fetch(
       new Request("http://localhost/v1/responses", {
@@ -4222,7 +3333,6 @@ describe("simulated transform mode proxy flow", () => {
             },
             {
               type: "message",
-              status: "completed",
               role: "user",
               content: [{ type: "input_text", text: "resume work" }],
             },
@@ -4233,11 +3343,16 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(resumed.status).toBe(200);
-    expect(callCount).toBe(4);
-    expect(capturedPrompts[1]).not.toContain("RECOVERY TURN");
-    expect(resumed.headers.get("x-m365-tool-call-recovery")).toBeNull();
+    expect(callCount).toBe(2);
+    expect(capturedPrompts[1]).toContain("RECOVERY TURN");
+    expect(resumed.headers.get("x-m365-tool-call-recovery")).toBe("true");
     const resumedBody = (await resumed.json()) as JsonObject;
-    expect(resumedBody.status).toBe("failed");
+    const output = Array.isArray(resumedBody.output) ? resumedBody.output : [];
+    expect(output[0]).toMatchObject({
+      type: "custom_tool_call",
+      call_id: "call_resumed_exec",
+      name: "exec",
+    });
 
     const fullHistoryResume = await app.fetch(
       new Request("http://localhost/v1/responses", {
@@ -4275,8 +3390,8 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(fullHistoryResume.status).toBe(200);
-    expect(callCount).toBe(5);
-    expect(capturedPrompts[4]).toContain("RECOVERY TURN");
+    expect(callCount).toBe(3);
+    expect(capturedPrompts[2]).toContain("RECOVERY TURN");
     expect(fullHistoryResume.headers.get("x-m365-tool-call-recovery")).toBe(
       "true",
     );
@@ -4293,28 +3408,8 @@ describe("simulated transform mode proxy flow", () => {
           conversationId,
           payload,
           callCount === 1
-            ? toMarkdownJson({
-                object: "response",
-                status: "completed",
-                output: [{
-                  type: "message",
-                  status: "completed",
-                  role: "assistant",
-                  content: [{ type: "output_text", text: "The requested analysis is complete." }],
-                }],
-                output_text: "The requested analysis is complete.",
-              })
-            : toMarkdownJson({
-                object: "response",
-                status: "completed",
-                output: [{
-                  type: "message",
-                  status: "completed",
-                  role: "assistant",
-                  content: [{ type: "output_text", text: "Continuing with the next explanation." }],
-                }],
-                output_text: "Continuing with the next explanation.",
-              }),
+            ? "The requested analysis is complete."
+            : "Continuing with the next explanation.",
         );
       }),
     );
@@ -4388,7 +3483,6 @@ describe("simulated transform mode proxy flow", () => {
             output: [
               {
                 type: "message",
-                status: "completed",
                 role: "assistant",
                 content: [{ type: "output_text", text: "I cannot access the tool." }],
               },
@@ -4427,18 +3521,8 @@ describe("simulated transform mode proxy flow", () => {
       }),
     );
 
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(502);
     expect(callCount).toBe(2);
-    const events: JsonObject[] = [];
-    for await (const event of readSseEvents(response.body!)) {
-      const data = event.data.trim();
-      if (!data || data === "[DONE]") continue;
-      const parsed = tryParseJsonObject(data);
-      if (parsed) events.push(parsed);
-    }
-    const terminal = events.find((event) => event.type === "response.failed");
-    expect(terminal).toBeTruthy();
-    expect((terminal?.response as JsonObject).status).toBe("failed");
   });
 
   test("responses simulated prompt treats copying previous output to the clipboard as a local tool action", async () => {
@@ -4473,7 +3557,6 @@ describe("simulated transform mode proxy flow", () => {
                   output: [
                     {
                       type: "function_call",
-                      status: "completed",
                       call_id: "call_clipboard",
                       name: "exec_command",
                       arguments: "{\"cmd\":\"pbcopy < output.txt\"}",
@@ -4544,7 +3627,6 @@ describe("simulated transform mode proxy flow", () => {
             output: [
               {
                 type: "function_call",
-                status: "completed",
                 call_id: "call_mcp_1",
                 name: "mcp__wiki__search",
                 arguments: "{\"query\":\"order allocation\"}",
@@ -4595,7 +3677,7 @@ describe("simulated transform mode proxy flow", () => {
     expect(response.status).toBe(200);
     expect(capturedPrompt).toContain('\"name\": \"mcp__wiki__search\"');
     expect(capturedPrompt).toContain(
-      "Function calls use",
+      "Tool calls are supported here: emit function_call output items when appropriate.",
     );
     expect(functionCall).toBeTruthy();
   });
@@ -4628,17 +3710,13 @@ describe("simulated transform mode proxy flow", () => {
       ],
     };
 
-    let callCount = 0;
     const app = createProxyApp(
       createServices((conversationId, payload) =>
-        (() => {
-          callCount += 1;
-          return buildGraphChatResult(
-            conversationId,
-            payload,
-            toMarkdownJson(payloadWithBrokenArguments),
-          );
-        })(),
+        buildGraphChatResult(
+          conversationId,
+          payload,
+          toMarkdownJson(payloadWithBrokenArguments),
+        ),
       ),
     );
 
@@ -4676,89 +3754,19 @@ describe("simulated transform mode proxy flow", () => {
     );
 
     expect(response.status).toBe(200);
-    expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
     const choices = body.choices as JsonObject[];
     const message = choices[0]?.message as JsonObject;
-    const toolCalls = message.tool_calls as JsonObject[];
-    const toolFunction = toolCalls[0]?.function as JsonObject;
-    expect(toolFunction.name).toBe("apply_diff");
-    expect(JSON.parse(toolFunction.arguments as string)).toEqual({
-      path: "tests/agent-tests/fizz-buzz.ts",
-      diff: "<<<<<<< SEARCH\n:start_line:1\nfoo\n=======\nbar\n>>>>>>> REPLACE",
-    });
-  });
+    const toolCall = (message.tool_calls as JsonObject[])[0] as JsonObject;
+    const functionNode = toolCall.function as JsonObject;
+    const argumentsText = String(functionNode.arguments ?? "");
 
-  test("responses repairs raw controls in the outer tool envelope without retry", async () => {
-    const malformedEnvelope = `\`\`\`json
-{"object":"response","status":"completed","output":[{"type":"function_call","status":"completed","call_id":"call_exec_raw_controls","name":"exec","arguments":"{\\"cmd\\":\\"line one
-line two\\"}"}]}
-\`\`\``;
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        malformedEnvelope,
-      );
-    });
-    services.observability = new BridgeObservability();
-    const app = createProxyApp(services);
-
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          stream: false,
-          input: "Run a multiline command.",
-          tools: [
-            {
-              type: "function",
-              name: "exec",
-              description: "Run a command.",
-              parameters: {
-                type: "object",
-                properties: { cmd: { type: "string" } },
-                required: ["cmd"],
-                additionalProperties: false,
-              },
-            },
-          ],
-          tool_choice: "auto",
-        }),
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(1);
-    const body = (await response.json()) as JsonObject;
-    const output = body.output as JsonObject[];
-    expect(output[0]).toMatchObject({
-      type: "function_call",
-      call_id: "call_exec_raw_controls",
-      name: "exec",
-    });
-    expect(JSON.parse(output[0].arguments as string)).toEqual({
-      cmd: "line one\nline two",
-    });
-
-    const readiness = await app.fetch(new Request("http://localhost/readyz"));
-    const readinessBody = (await readiness.json()) as JsonObject;
-    const recentEvents = readinessBody.recentEvents as JsonObject[];
-    expect(
-      recentEvents.some(
-        (event) =>
-          event.name === "retry" &&
-          (event.fields as JsonObject).reason ===
-            "simulated_protocol_correction",
-      ),
-    ).toBeFalse();
+    expect(typeof functionNode.arguments).toBe("string");
+    const parsedArguments = JSON.parse(argumentsText) as Record<string, unknown>;
+    expect(parsedArguments.path).toBe("tests/agent-tests/fizz-buzz.ts");
+    expect(typeof parsedArguments.diff).toBe("string");
+    expect(String(parsedArguments.diff)).toContain("<<<<<<< SEARCH");
+    expect(String(parsedArguments.diff)).toContain(">>>>>>> REPLACE");
   });
 
   test("chat/completions rejects an empty simulated payload without resending", async () => {
@@ -4829,9 +3837,9 @@ line two\\"}"}]}
     );
 
     expect(response.status).toBe(502);
-    expect(callCount).toBe(2);
+    expect(callCount).toBe(1);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("provider_drift");
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
   test("chat/completions accepts a toolless auto-tool payload without resending", async () => {
@@ -5024,259 +4032,13 @@ line two\\"}"}]}
 
     expect(response.status).toBe(200);
     expect(callCount).toBe(2);
-    expect(capturedPrompts[1]).toContain("PROTOCOL CORRECTION 1:");
+    expect(capturedPrompts[1]).toContain("PROTOCOL RETRY 1:");
     const body = (await response.json()) as JsonObject;
     const choices = body.choices as JsonObject[];
     const message = choices[0]?.message as JsonObject;
     const calls = message.tool_calls as JsonObject[];
     expect(calls).toHaveLength(1);
     expect(((calls[0]?.function as JsonObject).name)).toBe("write_to_file");
-  });
-
-  test("chat/completions corrects duplicate call IDs before projection", async () => {
-    const duplicate: JsonObject = {
-      object: "chat.completion",
-      choices: [{
-        index: 0,
-        finish_reason: "tool_calls",
-        message: {
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: "call_duplicate",
-              type: "function",
-              function: { name: "exec", arguments: "{}" },
-            },
-            {
-              id: "call_duplicate",
-              type: "function",
-              function: { name: "exec", arguments: "{}" },
-            },
-          ],
-        },
-      }],
-    };
-    const corrected: JsonObject = {
-      object: "chat.completion",
-      choices: [{
-        index: 0,
-        finish_reason: "tool_calls",
-        message: {
-          role: "assistant",
-          content: null,
-          tool_calls: [{
-            id: "call_corrected",
-            type: "function",
-            function: { name: "exec", arguments: "{}" },
-          }],
-        },
-      }],
-    };
-    let callCount = 0;
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson(callCount === 1 ? duplicate : corrected),
-        );
-      }),
-    );
-    const response = await app.fetch(
-      new Request("http://localhost/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          messages: [{ role: "user", content: "Run exec." }],
-          tools: [{
-            type: "function",
-            function: {
-              name: "exec",
-              parameters: { type: "object" },
-            },
-          }],
-        }),
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
-    const body = (await response.json()) as JsonObject;
-    const choices = body.choices as JsonObject[];
-    const calls = (choices[0]?.message as JsonObject).tool_calls as JsonObject[];
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.id).toBe("call_corrected");
-  });
-
-  test("responses corrects duplicate call IDs before ledger mutation", async () => {
-    const duplicate: JsonObject = {
-      object: "response",
-      status: "completed",
-      output: [
-        responseFunctionCall("exec", "{}", "call_duplicate"),
-        responseFunctionCall("exec", "{}", "call_duplicate"),
-      ],
-    };
-    const corrected: JsonObject = {
-      object: "response",
-      status: "completed",
-      output: [responseFunctionCall("exec", "{}", "call_corrected")],
-    };
-    let callCount = 0;
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson(callCount === 1 ? duplicate : corrected),
-        );
-      }),
-    );
-    const response = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify({
-          model: "m365-copilot",
-          input: [{ type: "message", role: "user", content: "Run exec." }],
-          tools: [{
-            type: "function",
-            name: "exec",
-            parameters: { type: "object" },
-          }],
-        }),
-      }),
-    );
-
-    expect(response.status).toBe(200);
-    expect(callCount).toBe(2);
-    const body = (await response.json()) as JsonObject;
-    const output = body.output as JsonObject[];
-    expect(output).toHaveLength(1);
-    expect(output[0]?.call_id).toBe("call_corrected");
-  });
-
-  test("does not replay a cancelled Chat correction", async () => {
-    const controller = new AbortController();
-    let abortNext = true;
-    let callCount = 0;
-    const invalid = "{\"not\":\"a chat completion\"}";
-    const valid = toMarkdownJson({
-      object: "chat.completion",
-      choices: [{
-        index: 0,
-        finish_reason: "stop",
-        message: { role: "assistant", content: "retried" },
-      }],
-    });
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        if (abortNext) {
-          abortNext = false;
-          controller.abort();
-          return buildGraphChatResult(conversationId, payload, invalid);
-        }
-        return buildGraphChatResult(conversationId, payload, valid);
-      }),
-    );
-    const requestBody = {
-      model: "m365-copilot",
-      messages: [{ role: "user", content: "Retry safely." }],
-    };
-    const first = await app.fetch(
-      new Request("http://localhost/v1/chat/completions", {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify(requestBody),
-      }),
-    );
-    expect(first.status).toBe(499);
-    expect((await first.json()).error.code).toBe("client_aborted");
-
-    const second = await app.fetch(
-      new Request("http://localhost/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify(requestBody),
-      }),
-    );
-    expect(second.status).toBe(200);
-    expect(callCount).toBe(2);
-  });
-
-  test("does not register a cancelled Responses correction for replay", async () => {
-    const controller = new AbortController();
-    let callCount = 0;
-    const invalid = '{"object":"response"}';
-    const valid = toMarkdownJson({
-      object: "response",
-      status: "completed",
-      output: [responseMessage("retried")],
-    });
-    const app = createProxyApp(
-      createServices((conversationId, payload) => {
-        callCount += 1;
-        if (callCount === 2) {
-          controller.abort();
-        }
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          callCount === 1 ? invalid : valid,
-        );
-      }),
-    );
-    const requestBody = {
-      model: "m365-copilot",
-      input: [{ type: "message", role: "user", content: "Retry safely." }],
-    };
-    const first = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify(requestBody),
-      }),
-    );
-    expect(first.status).toBe(200);
-    const firstBody = (await first.json()) as JsonObject;
-    expect(firstBody.status).toBe("failed");
-    expect((firstBody.error as JsonObject).code).toBe("upstream_timeout");
-
-    const second = await app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify(requestBody),
-      }),
-    );
-    expect(second.status).toBe(200);
-    expect((await second.json()).status).toBe("completed");
-    expect(callCount).toBe(3);
   });
 
   test("chat/completions stream accepts toolless auto-tool payload without resending", async () => {
@@ -5455,7 +4217,7 @@ line two\\"}"}]}
     expect(response.status).toBe(502);
     expect(callCount).toBe(2);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("provider_drift");
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
   test("chat/completions returns 502 for a bare tool-call envelope emitted as text after retry", async () => {
@@ -5512,7 +4274,7 @@ line two\\"}"}]}
     // Should return 502, not 200 with the envelope as content
     expect(response.status).toBe(502);
     const body = (await response.json()) as JsonObject;
-    expect((body.error as JsonObject).code).toBe("provider_drift");
+    expect((body.error as JsonObject).code).toBe("invalid_simulated_payload");
   });
 
   test("chat/completions extracts a bare functions.exec envelope when exec is offered as a custom tool", async () => {
@@ -5574,946 +4336,7 @@ line two\\"}"}]}
     expect(args).toContain("pwd");
     expect(choices[0].finish_reason).toBe("tool_calls");
   });
-
-  function makeResponsesPost(
-    app: ReturnType<typeof createProxyApp>,
-    body: JsonObject,
-    signal?: AbortSignal,
-  ) {
-    return app.fetch(
-      new Request("http://localhost/v1/responses", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-m365-transport": TransportNames.Graph,
-        },
-        body: JSON.stringify(body),
-        signal,
-      }),
-    );
-  }
-
-  function makeRetryRequestBody(turnId: string, extra?: JsonObject): JsonObject {
-    return {
-      model: "m365-copilot",
-      stream: false,
-      input: "Use the local shell to run pwd.",
-      client_metadata: {
-        thread_id: `thread-${turnId}`,
-        session_id: `session-${turnId}`,
-        turn_id: turnId,
-      },
-      tools: [
-        {
-          type: "custom",
-          name: "exec",
-          description: "Execute.",
-          format: { type: "grammar", syntax: "lark" },
-        },
-      ],
-      tool_choice: "auto",
-      ...extra,
-    };
-  }
-
-  test("sequential identical requests call counts 2,4,4,4,4, prompt isolation, and exact failure terminal replay", async () => {
-    const capturedPrompts: string[] = [];
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      capturedPrompts.push(readPrompt(payload));
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed candidate ${callCount}}`,
-      );
-    });
-    services.observability = new BridgeObservability();
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("seq-retry");
-
-    const res1 = await makeResponsesPost(app, body);
-    expect((await res1.json()).status).toBe("failed");
-    expect(callCount).toBe(2);
-
-    const res2 = await makeResponsesPost(app, body);
-    const body2 = (await res2.json()) as JsonObject;
-    expect(body2.status).toBe("failed");
-    expect(callCount).toBe(4);
-
-    for (let i = 0; i < 3; i++) {
-      const res = await makeResponsesPost(app, body);
-      expect(res.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-      expect((await res.json())).toEqual(body2);
-      expect(callCount).toBe(4);
-    }
-
-    expect(capturedPrompts[2]).toContain("PROTOCOL REGENERATION");
-    expect(capturedPrompts[2]).toContain("Regenerate the entire response from scratch");
-    expect(capturedPrompts[2]).not.toContain("malformed candidate 1");
-    expect(capturedPrompts[2]).not.toContain("malformed candidate 2");
-
-    expect(capturedPrompts[3]).toContain("PROTOCOL CORRECTION 1");
-    expect(capturedPrompts[3]).toContain("malformed candidate 3");
-    expect(capturedPrompts[3]).not.toContain("malformed candidate 1");
-    expect(capturedPrompts[3]).not.toContain("malformed candidate 2");
-
-    const readiness = (await (await app.fetch(new Request("http://localhost/readyz"))).json()) as JsonObject;
-    const recent = readiness.recentEvents as JsonObject[];
-    const retryEvents = recent.filter(
-      (e) => e.name === "retry" && (e.fields as JsonObject).reason === "simulated_protocol_correction",
-    );
-    expect(retryEvents).toHaveLength(4);
-    expect((retryEvents[0]?.fields as JsonObject).cycle).toBe(1);
-    expect((retryEvents[1]?.fields as JsonObject).cycle).toBe(1);
-    expect((retryEvents[2]?.fields as JsonObject).cycle).toBe(2);
-    expect((retryEvents[3]?.fields as JsonObject).cycle).toBe(2);
-
-    const dedupEvents = recent.filter((e) => e.name === "dedup_hit");
-    expect(dedupEvents.length).toBeGreaterThanOrEqual(3);
-    for (const de of dedupEvents) {
-      expect((de.fields as JsonObject).kind).toBe("protocol_failure_replay");
-    }
-  });
-
-  test("regeneration success clears failure state and later identical request uses successful replay", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      if (callCount <= 2) {
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-        );
-      }
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        toMarkdownJson({
-          id: "resp_regen_success",
-          object: "response",
-          status: "completed",
-          output: [responseMessage("regeneration succeeded")],
-          output_text: "regeneration succeeded",
-        }),
-      );
-    });
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("regen-success", {
-      tools: undefined,
-      input: "Hello again.",
-    });
-
-    const res1 = await makeResponsesPost(app, body);
-    expect((await res1.json()).status).toBe("failed");
-    expect(callCount).toBe(2);
-
-    const res2 = await makeResponsesPost(app, body);
-    const body2 = (await res2.json()) as JsonObject;
-    expect(body2.status).toBe("completed");
-    expect(body2.output_text).toBe("regeneration succeeded");
-    expect(callCount).toBe(3);
-
-    const res3 = await makeResponsesPost(app, body);
-    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-    expect((await res3.json())).toEqual(body2);
-    expect(callCount).toBe(3);
-  });
-
-  test("concurrent duplicates join in-flight without consuming regeneration cycle", async () => {
-    let callCount = 0;
-    let release1: (() => void) | undefined;
-    let release3: (() => void) | undefined;
-    const block1 = new Promise<void>((r) => { release1 = r; });
-    const block3 = new Promise<void>((r) => { release3 = r; });
-
-    const services = createServices(async (conversationId, payload) => {
-      callCount += 1;
-      if (callCount === 1) await block1;
-      if (callCount === 3) await block3;
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-      );
-    });
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("concurrent-retry");
-
-    const p1 = makeResponsesPost(app, body);
-    const p2 = makeResponsesPost(app, body);
-    await Promise.resolve();
-    release1?.();
-    const [r1, r2] = await Promise.all([p1, p2]);
-    expect((await r1.json()).status).toBe("failed");
-    expect((await r2.json()).status).toBe("failed");
-    expect(callCount).toBe(2);
-
-    const p3 = makeResponsesPost(app, body);
-    const p4 = makeResponsesPost(app, body);
-    await Promise.resolve();
-    release3?.();
-    const [r3, r4] = await Promise.all([p3, p4]);
-    expect((await r3.json()).status).toBe("failed");
-    expect((await r4.json()).status).toBe("failed");
-    expect(callCount).toBe(4);
-  });
-
-  test("streaming cached failure has one terminal", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-      );
-    });
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("stream-cached-fail");
-
-    await makeResponsesPost(app, body);
-    await makeResponsesPost(app, body);
-    expect(callCount).toBe(4);
-
-    const streamRes = await makeResponsesPost(app, { ...body, stream: true });
-    expect(streamRes.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-
-    const events: JsonObject[] = [];
-    let sawDone = false;
-    for await (const event of readSseEvents(streamRes.body!)) {
-      const data = event.data.trim();
-      if (!data) continue;
-      if (data === "[DONE]") {
-        sawDone = true;
-        continue;
-      }
-      const parsed = tryParseJsonObject(data);
-      if (parsed) events.push(parsed);
-    }
-    expect(sawDone).toBeTrue();
-    const terminals = events.filter((e) =>
-      ["response.completed", "response.failed", "response.incomplete"].includes(String(e.type)),
-    );
-    expect(terminals).toHaveLength(1);
-    expect(terminals[0]?.type).toBe("response.failed");
-    expect(callCount).toBe(4);
-  });
-
-  test("decoder-cycle failure has no durable failure replay", async () => {
-    const durable = new DurableStateStore();
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-      );
-    });
-    services.responseStore = new ResponseStore(services.options, durable);
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("durable-fail");
-
-    await makeResponsesPost(app, body);
-    await makeResponsesPost(app, body);
-    expect(callCount).toBe(4);
-
-    expect(Object.keys(durable.state.replays)).toHaveLength(0);
-    expect(Object.keys(durable.state.responses)).toHaveLength(0);
-
-    const restartedServices = createServices((conversationId, payload) => {
-      callCount += 1;
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-      );
-    });
-    restartedServices.responseStore = new ResponseStore(restartedServices.options, durable);
-    const restartedApp = createProxyApp(restartedServices);
-
-    await makeResponsesPost(restartedApp, body);
-    expect(callCount).toBe(6);
-  });
-
-  test("regeneration throw fails closed and subsequent retries replay failure terminal without third cycle", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      if (callCount <= 2) {
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-        );
-      }
-      throw new Error("Upstream network error");
-    });
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("regen-throw");
-
-    const res1 = await makeResponsesPost(app, body);
-    const body1 = (await res1.json()) as JsonObject;
-    expect(body1.status).toBe("failed");
-    expect(callCount).toBe(2);
-
-    const res2 = await makeResponsesPost(app, body);
-    expect(res2.status).toBe(500);
-    expect(callCount).toBe(3);
-
-    const res3 = await makeResponsesPost(app, body);
-    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-    expect((await res3.json())).toEqual(body1);
-    expect(callCount).toBe(3);
-
-    const res4 = await makeResponsesPost(app, body);
-    expect(res4.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-    expect((await res4.json())).toEqual(body1);
-    expect(callCount).toBe(3);
-  });
-
-  test("upstream failure during regeneration fails closed without third cycle", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      if (callCount <= 2) {
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-        );
-      }
-      return {
-        isSuccess: false,
-        statusCode: 500,
-        rawBody: "Internal Server Error",
-        responseJson: null,
-        conversationId,
-      };
-    });
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("regen-upstream-500");
-
-    const res1 = await makeResponsesPost(app, body);
-    const body1 = (await res1.json()) as JsonObject;
-    expect(body1.status).toBe("failed");
-    expect(callCount).toBe(2);
-
-    const res2 = await makeResponsesPost(app, body);
-    expect(res2.status).toBe(500);
-    expect(callCount).toBe(3);
-
-    const res3 = await makeResponsesPost(app, body);
-    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-    expect((await res3.json())).toEqual(body1);
-    expect(callCount).toBe(3);
-  });
-
-  test("tool-result-bearing retry gets regeneration with idempotent ledger validation", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      if (callCount === 1) {
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson({
-            id: "resp_init_tool",
-            object: "response",
-            status: "completed",
-            output: [
-              {
-                type: "custom_tool_call",
-                status: "completed",
-                call_id: "call_tool_1",
-                name: "exec",
-                input: "{\"cmd\":\"pwd\"}",
-              },
-            ],
-          }),
-        );
-      }
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed candidate ${callCount}}`,
-      );
-    });
-    const app = createProxyApp(services);
-
-    const initReq = makeRetryRequestBody("turn-tool-init");
-    const initRes = await makeResponsesPost(app, initReq);
-    expect(initRes.status).toBe(200);
-    expect(callCount).toBe(1);
-    const initBody = (await initRes.json()) as JsonObject;
-
-    const continuationReq = makeRetryRequestBody("turn-tool-cont", {
-      previous_response_id: initBody.id as string,
-      input: [
-        {
-          type: "custom_tool_call_output",
-          call_id: "call_tool_1",
-          output: "/home/user",
-        },
-      ],
-    });
-
-    const res1 = await makeResponsesPost(app, continuationReq);
-    expect((await res1.json()).status).toBe("failed");
-    expect(callCount).toBe(3);
-
-    const ledgerResolution =
-      services.responseStore.resolveToolLedgerTaskScope(
-        ["call_tool_1"],
-        initBody.id as string,
-        "unused",
-      );
-    expect(ledgerResolution.kind).toBe("resolved");
-    if (ledgerResolution.kind !== "resolved") return;
-    const ledgerScope = ledgerResolution.taskId;
-    const ledgerAfterCont1 =
-      services.responseStore.getOrCreateToolLedger(ledgerScope);
-    expect(ledgerAfterCont1.get("call_tool_1")?.status).toBe("completed");
-
-    const res2 = await makeResponsesPost(app, continuationReq);
-    const body2 = (await res2.json()) as JsonObject;
-    expect(body2.status).toBe("failed");
-    expect(callCount).toBe(5);
-
-    const ledgerAfterRegen =
-      services.responseStore.getOrCreateToolLedger(ledgerScope);
-    expect(ledgerAfterRegen.get("call_tool_1")?.status).toBe("completed");
-
-    const res3 = await makeResponsesPost(app, continuationReq);
-    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-    expect((await res3.json())).toEqual(body2);
-    expect(callCount).toBe(5);
-  });
-
-  test("rejects mixed known and unknown tool-result call IDs before upstream", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        toMarkdownJson({
-          object: "response",
-          status: "completed",
-          output: [{
-            type: "custom_tool_call",
-            status: "completed",
-            call_id: "call_known",
-            name: "exec",
-            input: "{\"cmd\":\"pwd\"}",
-          }],
-        }),
-      );
-    });
-    const app = createProxyApp(services);
-    const initial = await makeResponsesPost(
-      app,
-      makeRetryRequestBody("mixed-call-init"),
-    );
-    const initialBody = (await initial.json()) as JsonObject;
-    expect(callCount).toBe(1);
-
-    const continuation = await makeResponsesPost(
-      app,
-      makeRetryRequestBody("mixed-call-result", {
-        previous_response_id: initialBody.id as string,
-        input: [
-          {
-            type: "custom_tool_call_output",
-            call_id: "call_known",
-            output: "known",
-          },
-          {
-            type: "custom_tool_call_output",
-            call_id: "call_unknown",
-            output: "unknown",
-          },
-        ],
-      }),
-    );
-    expect((await continuation.json()).status).toBe("failed");
-    expect(callCount).toBe(1);
-
-    const resolution =
-      services.responseStore.resolveToolLedgerTaskScope(
-        ["call_known"],
-        initialBody.id as string,
-        "unused",
-      );
-    expect(resolution.kind).toBe("resolved");
-    if (resolution.kind !== "resolved") return;
-    expect(
-      services.responseStore
-        .getOrCreateToolLedger(resolution.taskId)
-        .get("call_known")?.status,
-    ).toBe("pending");
-  });
-
-  test("rejects duplicate tool-result call IDs without completing the call", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        toMarkdownJson({
-          object: "response",
-          status: "completed",
-          output: [{
-            type: "custom_tool_call",
-            status: "completed",
-            call_id: "call_duplicate",
-            name: "exec",
-            input: "{\"cmd\":\"pwd\"}",
-          }],
-        }),
-      );
-    });
-    const app = createProxyApp(services);
-    const initial = await makeResponsesPost(
-      app,
-      makeRetryRequestBody("duplicate-result-init"),
-    );
-    const initialBody = (await initial.json()) as JsonObject;
-    expect(callCount).toBe(1);
-
-    const duplicateResult = {
-      type: "custom_tool_call_output",
-      call_id: "call_duplicate",
-      output: "result",
-    };
-    const continuation = await makeResponsesPost(
-      app,
-      makeRetryRequestBody("duplicate-result-cont", {
-        previous_response_id: initialBody.id as string,
-        input: [duplicateResult, duplicateResult],
-      }),
-    );
-    expect((await continuation.json()).status).toBe("failed");
-    expect(callCount).toBe(1);
-
-    const resolution = services.responseStore.resolveToolLedgerTaskScope(
-      ["call_duplicate"],
-      initialBody.id as string,
-      "unused",
-    );
-    expect(resolution.kind).toBe("resolved");
-    if (resolution.kind !== "resolved") return;
-    expect(
-      services.responseStore
-        .getOrCreateToolLedger(resolution.taskId)
-        .get("call_duplicate")?.status,
-    ).toBe("pending");
-  });
-
-  test("keeps corrected continuation tool calls in the original task ledger", async () => {
-    let callCount = 0;
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      if (callCount === 1) {
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          toMarkdownJson({
-            object: "response",
-            status: "completed",
-            output: [{
-              type: "custom_tool_call",
-              status: "completed",
-              call_id: "call_round_1",
-              name: "exec",
-              input: "{\"cmd\":\"pwd\"}",
-            }],
-          }),
-        );
-      }
-      if (callCount === 2) {
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          "{\"object\":\"response\",\"status\":\"completed\",\"output\":malformed}",
-        );
-      }
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        toMarkdownJson({
-          object: "response",
-          status: "completed",
-          output: [{
-            type: "custom_tool_call",
-            status: "completed",
-            call_id: "call_round_2",
-            name: "exec",
-            input: "{\"cmd\":\"ls\"}",
-          }],
-        }),
-      );
-    });
-    const app = createProxyApp(services);
-    const initial = await makeResponsesPost(
-      app,
-      makeRetryRequestBody("ledger-scope-init"),
-    );
-    const initialBody = (await initial.json()) as JsonObject;
-
-    const continuation = await makeResponsesPost(
-      app,
-      makeRetryRequestBody("ledger-scope-cont", {
-        previous_response_id: initialBody.id as string,
-        input: [{
-          type: "custom_tool_call_output",
-          call_id: "call_round_1",
-          output: "/home/user",
-        }],
-      }),
-    );
-    const continuationBody = (await continuation.json()) as JsonObject;
-    expect(continuationBody.status).toBe("completed");
-    expect(callCount).toBe(3);
-
-    const firstScope = services.responseStore.resolveToolLedgerTaskScope(
-      ["call_round_1"],
-      initialBody.id as string,
-      "unused",
-    );
-    const secondScope = services.responseStore.resolveToolLedgerTaskScope(
-      ["call_round_2"],
-      continuationBody.id as string,
-      "unused",
-    );
-    expect(firstScope.kind).toBe("resolved");
-    expect(secondScope).toEqual(firstScope);
-  });
-
-  test("bounds request-hash decoder failures in memory for stream and non-stream", async () => {
-    for (const stream of [false, true]) {
-      const durable = new DurableStateStore();
-      let callCount = 0;
-      const services = createServices((conversationId, payload) => {
-        callCount += 1;
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          `{"object":"response","status":"in_progress","output":malformed_${callCount}}`,
-        );
-      });
-      services.responseStore = new ResponseStore(services.options, durable);
-      const app = createProxyApp(services);
-      const body: JsonObject = {
-        model: "m365-copilot",
-        stream,
-        input: "Run pwd without protocol metadata.",
-        tools: [{
-          type: "custom",
-          name: "exec",
-          description: "Execute.",
-          format: { type: "grammar", syntax: "lark" },
-        }],
-        tool_choice: "auto",
-      };
-
-      const first = await makeResponsesPost(app, body);
-      await (stream ? first.text() : first.json());
-      expect(callCount).toBe(2);
-
-      const second = await makeResponsesPost(app, body);
-      await (stream ? second.text() : second.json());
-      expect(callCount).toBe(4);
-
-      const third = await makeResponsesPost(app, body);
-      expect(third.headers.get("x-m365-request-hash-replayed")).toBe("true");
-      await (stream ? third.text() : third.json());
-      expect(callCount).toBe(4);
-      expect(Object.keys(durable.state.replays)).toHaveLength(0);
-      expect(Object.keys(durable.state.responses)).toHaveLength(0);
-    }
-  });
-
-  test("cancellation after acceptance during regeneration fails closed without third cycle", async () => {
-    let callCount = 0;
-    const controller = new AbortController();
-    const services = createServices((conversationId, payload) => {
-      callCount += 1;
-      if (callCount <= 2) {
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          `{"id":"resp_${callCount}","object":"response","status":"in_progress","output":malformed}`,
-        );
-      }
-      controller.abort();
-      return buildGraphChatResult(
-        conversationId,
-        payload,
-        toMarkdownJson({
-          id: `resp_${callCount}`,
-          object: "response",
-          status: "completed",
-          output: [responseMessage("completed text")],
-          output_text: "completed text",
-        }),
-      );
-    });
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("regen-cancel-acceptance", {
-      tools: undefined,
-      input: "Hello again.",
-    });
-
-    const res1 = await makeResponsesPost(app, body);
-    expect((await res1.json()).status).toBe("failed");
-    expect(callCount).toBe(2);
-
-    const res2 = await makeResponsesPost(app, body, controller.signal);
-    const body2 = (await res2.json()) as JsonObject;
-    expect(body2.status).toBe("failed");
-    expect(callCount).toBe(3);
-
-    const res3 = await makeResponsesPost(app, body);
-    expect(res3.headers.get("x-m365-protocol-identity-replayed")).toBe("true");
-    expect((await res3.json())).toEqual(body2);
-    expect(callCount).toBe(3);
-  });
-
-  test("buildSimulatedRegenerationPrompt creates independent regeneration prompt directly from original prompt", () => {
-    const originalPrompt = "The JSON payload below is an entire request...\nSTRICT OUTPUT CONTRACT: Return valid JSON.";
-    const regen = buildSimulatedRegenerationPrompt(originalPrompt, 6000);
-    expect(regen).toContain("PROTOCOL REGENERATION:");
-    expect(regen).toContain("Regenerate the entire response from scratch");
-    expect(regen).toContain("Return exactly one complete JSON object");
-    expect(regen).toEndWith("Follow the strict output contract above.");
-
-    expect(() =>
-      buildSimulatedRegenerationPrompt(originalPrompt, 500),
-    ).toThrow("Substrate prompt regeneration cannot fit");
-  });
-
-  test("bridge_v1 corrects and rejects unframed prose instead of accepting directly", async () => {
-    let callCount = 0;
-    const services = createServices(
-      (conversationId, payload) => {
-        callCount += 1;
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          "Here is plain unframed prose without V1 framing or JSON.",
-        );
-      },
-      (options) => {
-        options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
-      },
-    );
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("bridge-v1-unframed");
-
-    const res = await makeResponsesPost(app, body);
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as JsonObject;
-    expect(json.status).toBe("failed");
-    expect(callCount).toBe(2);
-  });
-
-  test("bridge_v1 unframed prose triggers correction which accepts valid frame", async () => {
-    let callCount = 0;
-    const services = createServices(
-      (conversationId, payload) => {
-        callCount += 1;
-        if (callCount === 1) {
-          return buildGraphChatResult(
-            conversationId,
-            payload,
-            "Unframed plain prose.",
-          );
-        }
-        return buildGraphChatResult(
-          conversationId,
-          payload,
-          "M365_FINAL_V1\nParis",
-        );
-      },
-      (options) => {
-        options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
-      },
-    );
-    const app = createProxyApp(services);
-    const body = makeRetryRequestBody("bridge-v1-framed-correction", {
-      input: "What is the capital of France?",
-      tools: [],
-    });
-
-    const res = await makeResponsesPost(app, body);
-    expect(res.status).toBe(200);
-    const json = (await res.json()) as JsonObject;
-    expect(json.status).toBe("completed");
-    expect(callCount).toBe(2);
-  });
-
-  test("derives responseFormat from text.format and disables bridge_v1", () => {
-    const options = createOptions();
-    options.simulatedOutputProtocol = SimulatedOutputProtocols.BridgeV1;
-
-    const parsedJsonObject = tryParseResponsesRequest(
-      {
-        model: "m365-copilot",
-        input: [{ role: "user", content: "hello" }],
-        text: { format: { type: "json_object" } },
-      },
-      options,
-    );
-    expect(parsedJsonObject.ok).toBeTrue();
-    if (parsedJsonObject.ok) {
-      expect(parsedJsonObject.request.base.responseFormat).toEqual({
-        type: "json_object",
-        name: null,
-        jsonSchema: null,
-      });
-      expect(parsedJsonObject.request.base.simulatedOutputProtocol).toBe(
-        SimulatedOutputProtocols.Legacy,
-      );
-    }
-
-    const parsedJsonSchema = tryParseResponsesRequest(
-      {
-        model: "m365-copilot",
-        input: [{ role: "user", content: "hello" }],
-        text: {
-          format: {
-            type: "json_schema",
-            name: "test_schema",
-            schema: { type: "object", properties: { key: { type: "string" } } },
-          },
-        },
-      },
-      options,
-    );
-    expect(parsedJsonSchema.ok).toBeTrue();
-    if (parsedJsonSchema.ok) {
-      expect(parsedJsonSchema.request.base.responseFormat?.type).toBe("json_schema");
-      expect(parsedJsonSchema.request.base.responseFormat?.name).toBe("test_schema");
-      expect(parsedJsonSchema.request.base.responseFormat?.jsonSchema).toEqual({
-        type: "object",
-        properties: { key: { type: "string" } },
-      });
-      expect(parsedJsonSchema.request.base.simulatedOutputProtocol).toBe(
-        SimulatedOutputProtocols.Legacy,
-      );
-    }
-
-    const parsedNormal = tryParseResponsesRequest(
-      {
-        model: "m365-copilot",
-        input: [{ role: "user", content: "hello" }],
-      },
-      options,
-    );
-    expect(parsedNormal.ok).toBeTrue();
-    if (parsedNormal.ok) {
-      expect(parsedNormal.request.base.responseFormat).toBeNull();
-      expect(parsedNormal.request.base.simulatedOutputProtocol).toBe(
-        SimulatedOutputProtocols.BridgeV1,
-      );
-    }
-  });
-
-  test("near-limit regression: initial, regeneration, and regeneration-correction each fit maxChars without truncating envelope", () => {
-    const options = createOptions();
-    options.substrate.truncateBeforeSending = true;
-    options.substrate.maxSendChars = 6_000;
-
-    const largeToolResult = "x".repeat(10_000);
-    const parsed = tryParseResponsesRequest(
-      {
-        model: "m365-copilot",
-        input: [
-          { role: "user", content: "Initial task description" },
-          {
-            type: "function_call",
-            call_id: "call_1",
-            name: "test_fn",
-            arguments: "{}",
-          },
-          {
-            type: "function_call_output",
-            call_id: "call_1",
-            output: largeToolResult,
-          },
-        ],
-        tools: [
-          {
-            type: "function",
-            name: "test_fn",
-            parameters: { type: "object" },
-          },
-        ],
-      },
-      options,
-    );
-
-    expect(parsed.ok).toBeTrue();
-    if (!parsed.ok) return;
-
-    const initialPrompt = parsed.request.base.promptText;
-    expect(initialPrompt.length).toBeLessThanOrEqual(
-      options.substrate.maxSendChars -
-        (SIMULATED_CORRECTION_RESERVE_CHARS +
-          SIMULATED_REGENERATION_RESERVE_CHARS),
-    );
-
-    const regenPrompt = buildSimulatedRegenerationPrompt(
-      initialPrompt,
-      options.substrate.maxSendChars,
-    );
-    expect(regenPrompt.length).toBeLessThanOrEqual(
-      options.substrate.maxSendChars - SIMULATED_CORRECTION_RESERVE_CHARS,
-    );
-    expect(regenPrompt).toContain("PROTOCOL REGENERATION:");
-
-    const regenCorrection = appendSimulatedProtocolCorrection(
-      regenPrompt,
-      1,
-      "protocol_error",
-      options.substrate.maxSendChars,
-      '{"status":"failed"}',
-    );
-    expect(regenCorrection.length).toBeLessThanOrEqual(
-      options.substrate.maxSendChars,
-    );
-    expect(regenCorrection).toContain("PROTOCOL CORRECTION 1:");
-  });
 });
-
-function responseMessage(content: string): JsonObject {
-  return {
-    id: "msg_test",
-    type: "message",
-    status: "completed",
-    role: "assistant",
-    content: [{ type: "output_text", text: content }],
-  };
-}
-
-function responseFunctionCall(
-  name: string,
-  argumentsJson: string,
-  callId: string,
-): JsonObject {
-  return {
-    id: `item_${callId}`,
-    type: "function_call",
-    status: "completed",
-    call_id: callId,
-    name,
-    arguments: argumentsJson,
-  };
-}
 
 function createServices(
   onChat: (conversationId: string, payload: JsonObject) => ChatResult,

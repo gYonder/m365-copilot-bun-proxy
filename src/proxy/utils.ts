@@ -128,55 +128,6 @@ export function tryParseJsonObject(
   }
 }
 
-export function repairJsonStringLexemes(raw: string): string {
-  let output = "";
-  let inString = false;
-
-  for (let index = 0; index < raw.length; index += 1) {
-    const ch = raw[index];
-    if (inString) {
-      if (ch === "\\") {
-        const escapeLength = validJsonEscapeLength(raw, index);
-        if (escapeLength > 0) {
-          output += raw.slice(index, index + escapeLength);
-          index += escapeLength - 1;
-        } else {
-          output += "\\\\";
-        }
-        continue;
-      }
-      if (ch === "\"") {
-        output += ch;
-        inString = false;
-        continue;
-      }
-      if (ch.charCodeAt(0) < 0x20) {
-        output += JSON.stringify(ch).slice(1, -1);
-        continue;
-      }
-      output += ch;
-      continue;
-    }
-
-    if (ch === "\"") {
-      inString = true;
-    }
-    output += ch;
-  }
-
-  return output;
-}
-
-function validJsonEscapeLength(raw: string, backslashIndex: number): number {
-  const escaped = raw[backslashIndex + 1];
-  if (!escaped) return 0;
-  if ("\"\\/bfnrt".includes(escaped)) return 2;
-  if (escaped !== "u") return 0;
-  return /^[0-9A-Fa-f]{4}$/.test(raw.slice(backslashIndex + 2, backslashIndex + 6))
-    ? 6
-    : 0;
-}
-
 export async function tryReadJsonPayload(
   request: Request,
 ): Promise<JsonPayload | null> {

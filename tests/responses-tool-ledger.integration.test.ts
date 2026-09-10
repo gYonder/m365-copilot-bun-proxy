@@ -134,67 +134,6 @@ describe("Responses tool ledger integration", () => {
     });
   });
 
-  test("replays a ledger failure once for an identical protocol request", async () => {
-    let upstreamCalls = 0;
-    const app = createApp(() => {
-      upstreamCalls += 1;
-      return toolResponse(`call_${upstreamCalls}`, { path: "same.txt" });
-    });
-
-    let previousResponseId: string | null = null;
-    let previousCallId: string | null = null;
-    let failingRequest: JsonObject | null = null;
-    let failureBody: JsonObject | null = null;
-    for (let round = 1; round <= 5; round += 1) {
-      const input: JsonObject[] = [taskMessage];
-      if (previousCallId) {
-        input.push(
-          {
-            type: "function_call",
-            call_id: previousCallId,
-            name: "read_file",
-            arguments: JSON.stringify({ path: "same.txt" }),
-          },
-          {
-            type: "function_call_output",
-            call_id: previousCallId,
-            output: "ok",
-          },
-        );
-      }
-      const requestBody: JsonObject = {
-        model: "m365-copilot",
-        input,
-        previous_response_id: previousResponseId,
-        tools,
-        tool_choice: "required",
-      };
-      const response = await post(app, requestBody);
-      const body = (await response.json()) as JsonObject;
-      if (body.status === "failed") {
-        failingRequest = requestBody;
-        failureBody = body;
-        break;
-      }
-      previousCallId = firstFunctionCall(body)?.call_id as string;
-      previousResponseId = body.id as string;
-    }
-
-    expect(failingRequest).not.toBeNull();
-    expect(failureBody).toMatchObject({
-      status: "failed",
-      error: { code: "fallback_exhausted" },
-    });
-
-    const duplicate = await post(app, failingRequest!);
-    expect(duplicate.status).toBe(200);
-    expect(duplicate.headers.get("x-m365-protocol-identity-replayed")).toBe(
-      "true",
-    );
-    expect((await duplicate.json()) as JsonObject).toEqual(failureBody);
-    expect(upstreamCalls).toBe(5);
-  });
-
   test("rejects a duplicate completed result with one semantic terminal", async () => {
     let upstreamCalls = 0;
     const app = createApp(() => {
@@ -209,7 +148,6 @@ describe("Responses tool ledger integration", () => {
       input: [taskMessage],
       tools,
       tool_choice: "required",
-      parallel_tool_calls: true,
     });
     const firstBody = (await first.json()) as JsonObject;
     const continuation = {
@@ -219,9 +157,7 @@ describe("Responses tool ledger integration", () => {
       input: [
         taskMessage,
         {
-          id: "provider_call_1",
           type: "function_call",
-          status: "completed",
           call_id: "call_1",
           name: "read_file",
           arguments: JSON.stringify({ path: "same.txt" }),
@@ -230,7 +166,6 @@ describe("Responses tool ledger integration", () => {
       ],
       tools,
       tool_choice: "auto",
-      parallel_tool_calls: true,
     };
     const second = await post(app, continuation);
     expect(second.status).toBe(200);
@@ -291,9 +226,7 @@ describe("Responses tool ledger integration", () => {
                 arguments: JSON.stringify({ path: "one.txt" }),
               },
               {
-                id: "provider_call_2",
                 type: "function_call",
-                status: "completed",
                 call_id: "call_2",
                 name: "read_file",
                 arguments: JSON.stringify({ path: "two.txt" }),
@@ -308,7 +241,6 @@ describe("Responses tool ledger integration", () => {
       input: [taskMessage],
       tools,
       tool_choice: "required",
-      parallel_tool_calls: true,
     });
     const firstBody = (await first.json()) as JsonObject;
     const second = await post(app, {
@@ -333,12 +265,11 @@ describe("Responses tool ledger integration", () => {
       ],
       tools,
       tool_choice: "auto",
-      parallel_tool_calls: true,
     });
 
     expect(second.status).toBe(200);
     expect((await second.json()).status).toBe("completed");
-    expect(upstreamCalls).toBe(3);
+    expect(upstreamCalls).toBe(2);
   });
 });
 
@@ -430,36 +361,30 @@ function firstFunctionCall(body: JsonObject): JsonObject | null {
 
 function toolResponse(callId: string, args: JsonObject): JsonObject {
   return {
+    id: `upstream_${callId}`,
     object: "response",
-    status: "completed",
     output: [
       {
-        id: `provider_${callId}`,
         type: "function_call",
-        status: "completed",
         call_id: callId,
         name: "read_file",
         arguments: JSON.stringify(args),
       },
     ],
-    output_text: "",
   };
 }
 
 function finalResponse(text: string): JsonObject {
   return {
+    id: "upstream_final",
     object: "response",
-    status: "completed",
     output: [
       {
-        id: "provider_final",
         type: "message",
-        status: "completed",
         role: "assistant",
         content: [{ type: "output_text", text }],
       },
     ],
-    output_text: text,
   };
 }
 

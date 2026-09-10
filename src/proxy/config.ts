@@ -5,9 +5,8 @@ import {
   LogLevels,
   OpenAiTransformModes,
   PlaywrightBrowsers,
-  SimulatedOutputProtocols,
   type JsonObject,
-  type LoadedWrapperOptions,
+  type WrapperOptions,
 } from "./types";
 import { deepMerge, isJsonObject, parseEnvValue, setDeepValue } from "./utils";
 
@@ -25,14 +24,6 @@ const LogLevelSchema = z.preprocess(
 const OpenAiTransformModeSchema = z.preprocess(
   (value) => (typeof value === "string" ? value.trim().toLowerCase() : value),
   z.enum([OpenAiTransformModes.Simulated, OpenAiTransformModes.Mapped]),
-);
-
-const SimulatedOutputProtocolSchema = z.preprocess(
-  (value) => (typeof value === "string" ? value.trim().toLowerCase() : value),
-  z.enum([
-    SimulatedOutputProtocols.Legacy,
-    SimulatedOutputProtocols.BridgeV1,
-  ]),
 );
 
 const PlaywrightBrowserSchema = z.preprocess(
@@ -72,9 +63,6 @@ const WrapperOptionsSchema = z.object({
   logStreamingResponseBody: z.boolean().default(false),
   openAiTransformMode: OpenAiTransformModeSchema.default(
     OpenAiTransformModes.Simulated,
-  ),
-  simulatedOutputProtocol: SimulatedOutputProtocolSchema.default(
-    SimulatedOutputProtocols.Legacy,
   ),
   temporaryChat: z.boolean().default(true),
   ignoreIncomingAuthorizationHeader: z.boolean().default(true),
@@ -224,14 +212,6 @@ const WrapperOptionsSchema = z.object({
   includeConversationIdInResponseBody: z.boolean().default(true),
   retrySimulatedToollessResponses: z.boolean().default(true),
   logStdout: z.boolean().default(false),
-  observability: z
-    .object({
-      enabled: z.boolean().default(false),
-      logPath: z.string().min(1).default("./logs/proxy-events.jsonl"),
-      maxBytes: z.number().int().min(256).default(5_242_880),
-      maxFiles: z.number().int().min(1).default(3),
-    })
-    .default({}),
   confabRetries: z.number().int().min(0).default(1),
   msalAuth: z.boolean().default(true),
   imageGeneration: z
@@ -250,9 +230,7 @@ const WrapperOptionsSchema = z.object({
     .default({}),
 });
 
-export async function loadWrapperOptions(
-  cwd: string,
-): Promise<LoadedWrapperOptions> {
+export async function loadWrapperOptions(cwd: string): Promise<WrapperOptions> {
   const rootConfig: JsonObject = {};
   const baseConfig = await readJsonFile(path.join(cwd, "config.json"));
   deepMerge(rootConfig, baseConfig ?? {});
@@ -268,7 +246,7 @@ export async function loadWrapperOptions(
   return normalizeWrapperOptions(rootConfig);
 }
 
-function normalizeWrapperOptions(wrapper: JsonObject): LoadedWrapperOptions {
+function normalizeWrapperOptions(wrapper: JsonObject): WrapperOptions {
   const normalized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(wrapper)) {
     normalized[key] = value;
@@ -288,7 +266,7 @@ function normalizeWrapperOptions(wrapper: JsonObject): LoadedWrapperOptions {
     }
   }
 
-  return WrapperOptionsSchema.parse(normalized) as LoadedWrapperOptions;
+  return WrapperOptionsSchema.parse(normalized) as WrapperOptions;
 }
 
 function applyConfigEnvOverrides(

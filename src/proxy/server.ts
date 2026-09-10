@@ -19,7 +19,6 @@ import {
   extractCopilotAssistantText,
   extractCopilotAssistantTextFromStreamData,
   extractCopilotConversationIdFromStream,
-  looksLikeToolCallAttemptText,
   requiresBufferedAssistantResponse,
   tryBuildAssistantResponseFromChatCompletionPayload,
   tryExtractIncrementalSimulatedChatContent,
@@ -61,14 +60,11 @@ import {
   resolveTransport,
   scopeConversationKey,
   selectConversation,
-  appendSimulatedProtocolCorrection,
-  buildSimulatedRegenerationPrompt,
   tryParseOpenAiRequest,
   tryParseResponsesRequest,
 } from "./request-parser";
 import {
   OpenAiTransformModes,
-  SimulatedOutputProtocols,
   ToolChoiceModes,
   TransportNames,
   type JsonValue,
@@ -83,35 +79,22 @@ import {
   type SubstrateStreamUpdate,
   type WrapperOptions,
 } from "./types";
-import {
-  buildLocalChatCompletion,
-  buildLocalChatCompletionChunk,
-  buildLocalResponsesProjection,
-  decodeAndValidateSimulatedOutput,
-  type SimulatedOutputAccepted,
-  type SimulatedOutputEndpoint,
-  type SimulatedOutputRejected,
-  type SimulatedOutputResult,
-} from "./simulated-output";
-import { decodeSimulatedActionOutputV1 } from "./simulated-action-output";
 import { ProxyTokenProvider } from "./token-provider";
 import { ProxyVizTraceStore } from "./viz-trace-store";
 import { RateCircuitBreaker } from "./rate-circuit-breaker";
 import { ImageGenerationService } from "./image-generation";
 import { BridgeObservability } from "./observability";
 import {
-  ToolLedgerError,
   type ToolCallToIssue,
   type ToolLedger,
+  type ToolLedgerError,
 } from "./tool-ledger";
 import {
   cloneJsonValue,
   extractGraphErrorMessage,
   isJsonObject,
   nowUnix,
-  repairJsonStringLexemes,
   readSseEvents,
-  tryGetBoolean,
   tryGetRawString,
   tryGetString,
   tryParseJsonObject,
@@ -310,8 +293,6 @@ function buildHealthResponse(
     openAiTransformMode: normalizeOpenAiTransformMode(
       options.openAiTransformMode,
     ),
-    simulatedOutputProtocol:
-      options.simulatedOutputProtocol ?? SimulatedOutputProtocols.Legacy,
     transport: options.transport,
     defaultModel: options.defaultModel,
     configured_context_limit: ConfiguredContextLimit,
@@ -723,10 +704,6 @@ async function handleChat(
   const graphPayload = buildCopilotRequestPayload(parsedRequest);
   const shouldBufferAssistant =
     requiresBufferedAssistantResponse(parsedRequest);
-  const simulatedPromptMaxChars =
-    options.substrate.truncateBeforeSending
-      ? options.substrate.maxSendChars
-      : 0;
   const taskDeadlineMs = resolveTaskDeadlineMs(options);
 
   const executeChatTurn = async (
@@ -775,9 +752,6 @@ async function handleChat(
     // user turn. Only the substrate client may retry failures proven to occur
     // before send; preserve the first result here.
     let result = await executeChatTurn();
-    if (parsedRequest.transformMode === OpenAiTransformModes.Simulated) {
-      return result;
-    }
     result = await retryConfabGiveUp(
       services,
       selectedTransport,
@@ -785,10 +759,54 @@ async function handleChat(
       result,
       executeChatTurn,
     );
+    if (
+      parsedRequest.transformMode === OpenAiTransformModes.Simulated &&
+      isInvalidSimulatedChatResult(
+        result,
+        parsedRequest,
+        conversationId!,
+        options.includeConversationIdInResponseBody,
+      )
+    ) {
+      services.observability?.record("retry", {
+        reason: "simulated_protocol_correction",
+        retryCount: 1,
+      });
+      const retryConversationId = await createProtocolRetryConversationId(
+        selectedTransport,
+        substrateClient,
+        graphClient,
+        authorizationHeader,
+      );
+      if (retryConversationId) {
+        result = await executeChatTurn(
+          retryConversationId,
+          true,
+          buildSimulatedProtocolRetryRequest(parsedRequest, 1),
+        );
+      }
+    }
     return result;
   };
 
   if (parsedRequest.stream) {
+    if (
+      parsedRequest.transformMode === OpenAiTransformModes.Simulated &&
+      selectedTransport === TransportNames.Substrate
+    ) {
+      return streamSubstrateAsSimulatedOpenAi(
+        services,
+        authorizationHeader,
+        conversationId,
+        parsedRequest,
+        createdConversation,
+        scopedConversationKey,
+        responseHeaders,
+        trace,
+        request.signal,
+      );
+    }
+
     if (shouldBufferAssistant) {
       const buffered = await executeChatTurnWithRecovery();
       if (!buffered.isSuccess) {
@@ -821,62 +839,48 @@ async function handleChat(
         ) ??
         "";
       if (parsedRequest.transformMode === OpenAiTransformModes.Simulated) {
-        const resolution = await resolveSimulatedOutput(
-          services,
-          buffered,
+        const simulatedPayload = tryExtractSimulatedResponsePayload(
+          assistantText,
           "chat.completions",
-          parsedRequest,
-          selectedTransport,
-          conversationId,
-          request.signal,
-          () =>
-            createProtocolRetryConversationId(
-              selectedTransport,
-              substrateClient,
-              graphClient,
-              authorizationHeader,
-            ),
-          (retryConversationId, retryRequest) =>
-            executeChatTurn(retryConversationId, true, retryRequest),
-          simulatedPromptMaxChars,
         );
-        if (resolution.kind === "upstream_failure") {
-          return writeFromUpstreamFailure(
+        const normalizedSimulatedPayload = simulatedPayload
+          ? normalizeSimulatedChatCompletionPayload(
+              simulatedPayload,
+              parsedRequest.model,
+              conversationId,
+              options.includeConversationIdInResponseBody,
+            )
+          : null;
+
+        if (
+          !normalizedSimulatedPayload ||
+          !hasUsableSimulatedChatCompletionPayload(normalizedSimulatedPayload) ||
+          shouldRetrySimulatedInvalidChatToolPayload(
+            normalizedSimulatedPayload,
+            parsedRequest.tooling,
+          ) ||
+          shouldRetrySimulatedToollessChatPayload(
+            options,
+            parsedRequest,
+            normalizedSimulatedPayload,
+          )
+        ) {
+          return writeOpenAiError(
             services,
-            resolution.result.statusCode,
-            resolution.result.rawBody,
-            selectedTransport === TransportNames.Substrate
-              ? "Substrate chat request failed during protocol correction."
-              : "Microsoft Graph chat request failed during protocol correction.",
-            selectedTransport === TransportNames.Substrate
-              ? "substrate_error"
-              : "graph_error",
+            502,
+            "Simulated mode response did not include a usable assistant message or tool call payload.",
+            "api_error",
+            "invalid_simulated_payload",
           );
         }
-        if (resolution.kind === "rejected") {
-          return writeSimulatedProtocolFailure(services);
-        }
-        if (resolution.kind === "cancelled") {
-          return writeSimulatedCancellationFailure(services);
-        }
-        if (request.signal.aborted) {
-          return writeSimulatedCancellationFailure(services);
-        }
-        conversationId = resolution.conversationId;
-        responseHeaders.set("x-m365-conversation-id", conversationId);
-        if (scopedConversationKey) {
-          conversationStore.set(scopedConversationKey, conversationId);
-        }
-        return buildSimulatedChatStreamResponseFromAccepted(
+        return buildSimulatedChatStreamResponse(
           services,
           parsedRequest.model,
           conversationId,
-          resolution.output,
-          parsedRequest.rawRequest,
+          normalizedSimulatedPayload,
           options.includeConversationIdInResponseBody,
           responseHeaders,
           trace,
-          request.signal,
         );
       }
 
@@ -893,7 +897,7 @@ async function handleChat(
           services.observability?.record("tool_call_recovery_exhausted", {
             reason: classification.reason,
             toolChoiceMode: parsedRequest.tooling.toolChoiceMode,
-            assistantTextSize: assistantText.length,
+            preview: assistantText.slice(0, 200),
           });
           return writeOpenAiError(
             services,
@@ -919,7 +923,6 @@ async function handleChat(
         options.includeConversationIdInResponseBody,
         responseHeaders,
         trace,
-        request.signal,
       );
     }
 
@@ -994,72 +997,50 @@ async function handleChat(
     ) ??
     "";
   if (parsedRequest.transformMode === OpenAiTransformModes.Simulated) {
-    const resolution = await resolveSimulatedOutput(
-      services,
-      chatResponse,
+    const simulatedPayload = tryExtractSimulatedResponsePayload(
+      assistantText,
       "chat.completions",
-      parsedRequest,
-      selectedTransport,
-      conversationId,
-      request.signal,
-      () =>
-        createProtocolRetryConversationId(
-          selectedTransport,
-          substrateClient,
-          graphClient,
-          authorizationHeader,
-        ),
-      (retryConversationId, retryRequest) =>
-        executeChatTurn(retryConversationId, true, retryRequest),
-      simulatedPromptMaxChars,
     );
-    if (resolution.kind === "upstream_failure") {
-      return writeFromUpstreamFailure(
-        services,
-        resolution.result.statusCode,
-        resolution.result.rawBody,
-        selectedTransport === TransportNames.Substrate
-          ? "Substrate chat request failed during protocol correction."
-          : "Microsoft Graph chat request failed during protocol correction.",
-        selectedTransport === TransportNames.Substrate
-          ? "substrate_error"
-          : "graph_error",
-      );
-    }
-    if (resolution.kind === "rejected") {
+    const normalized = simulatedPayload
+      ? normalizeSimulatedChatCompletionPayload(
+          simulatedPayload,
+          parsedRequest.model,
+          conversationId,
+          options.includeConversationIdInResponseBody,
+        )
+      : null;
+
+    if (
+      !normalized ||
+      !hasUsableSimulatedChatCompletionPayload(normalized) ||
+      shouldRetrySimulatedInvalidChatToolPayload(
+        normalized,
+        parsedRequest.tooling,
+      ) ||
+      shouldRetrySimulatedToollessChatPayload(options, parsedRequest, normalized)
+    ) {
       traceError(
         services,
         trace,
         {
-          message: "Simulated protocol correction was rejected.",
+          message:
+            "Simulated mode response did not include a usable assistant message or tool call payload.",
           type: "api_error",
           param: null,
-          code: "provider_drift",
+          code: "invalid_simulated_payload",
         },
         502,
       );
-      return writeSimulatedProtocolFailure(services);
+      return writeOpenAiError(
+        services,
+        502,
+        "Simulated mode response did not include a usable assistant message or tool call payload.",
+        "api_error",
+        "invalid_simulated_payload",
+      );
     }
-    if (resolution.kind === "cancelled") {
-      return writeSimulatedCancellationFailure(services);
-    }
-    if (request.signal.aborted) {
-      return writeSimulatedCancellationFailure(services);
-    }
-    conversationId = resolution.conversationId;
-    responseHeaders.set("x-m365-conversation-id", conversationId);
-    if (scopedConversationKey) {
-      conversationStore.set(scopedConversationKey, conversationId);
-    }
-    const responseBody = buildLocalChatCompletion(
-      resolution.output,
-      parsedRequest.model,
-      conversationId,
-      options.includeConversationIdInResponseBody,
-      parsedRequest.rawRequest,
-    );
-    const body = JSON.stringify(responseBody);
-    tracePane2(services, trace, responseBody, 200);
+    const body = JSON.stringify(normalized);
+    tracePane2(services, trace, normalized, 200);
     traceComplete(services, trace, 200);
     responseHeaders.set("content-type", "application/json");
     await debugLogger.logOutgoingResponse(200, responseHeaders.entries(), body);
@@ -1079,7 +1060,7 @@ async function handleChat(
       services.observability?.record("tool_call_recovery_exhausted", {
         reason: classification.reason,
         toolChoiceMode: parsedRequest.tooling.toolChoiceMode,
-        assistantTextSize: assistantText.length,
+        preview: assistantText.slice(0, 200),
       });
       return writeOpenAiError(
         services,
@@ -1153,12 +1134,7 @@ async function handleResponsesCreate(
           joined.headers.set("x-m365-in-flight-replayed", "true");
           return joined;
         }
-        let resolveExecution: (response: Response) => void = () => {};
-        let rejectExecution: (reason: unknown) => void = () => {};
-        const execution = new Promise<Response>((resolve, reject) => {
-          resolveExecution = resolve;
-          rejectExecution = reject;
-        });
+        const execution = handleResponsesCreateOnce(request, services);
         const registered = services.responseStore.registerInFlightResponse(
           identityKey,
           execution,
@@ -1169,10 +1145,6 @@ async function handleResponsesCreate(
           joined.headers.set("x-m365-in-flight-replayed", "true");
           return joined;
         }
-        void handleResponsesCreateOnce(request, services).then(
-          resolveExecution,
-          rejectExecution,
-        );
         return execution;
       }
     }
@@ -1446,69 +1418,12 @@ async function handleResponsesCreateOnce(
     );
   }
 
-  const failureCycleClaim =
-    responseStore.claimProtocolFailureCycle(replayIdentityKey);
-  if (failureCycleClaim.kind === "replay") {
-    services.observability?.record("dedup_hit", {
-      kind: isProtocolIdentity
-        ? "protocol_failure_replay"
-        : "legacy_failure_replay",
-    });
-    responseHeaders.set(
-      isProtocolIdentity
-        ? "x-m365-protocol-identity-replayed"
-        : "x-m365-request-hash-replayed",
-      "true",
-    );
-    return buildStoredReplayResponsesResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      failureCycleClaim.conversationId,
-      failureCycleClaim.response,
-      request.signal,
-    );
-  }
-  const cycleStrategy: SimulatedCycleStrategy =
-    failureCycleClaim.kind === "regenerate" ? "regenerate" : "primary";
-
-  const logicalConversationScope =
-    conversationId ??
-    parsedRequest.protocolIdentity.conversationId ??
-    scopedConversationKey;
-  const computedToolLedgerScope = computeResponsesToolLedgerScope(
+  const toolLedgerScope = computeResponsesToolLedgerScope(
     payload.json,
-    logicalConversationScope,
+    conversationId ??
+      parsedRequest.protocolIdentity.conversationId ??
+      scopedConversationKey,
   );
-  const toolResultCallIds = parsedRequest.protocolIdentity.callIds;
-  const toolLedgerResolution =
-    toolResultCallIds.length > 0
-      ? responseStore.resolveToolLedgerTaskScope(
-          toolResultCallIds,
-          parsedRequest.previousResponseId,
-          computedToolLedgerScope,
-        )
-      : { kind: "none" as const };
-  if (toolLedgerResolution.kind === "conflict") {
-    return buildResponsesLedgerFailureResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      conversationId,
-      taskDeadlineMs,
-      new ToolLedgerError(
-        "unknown_call_id",
-        classifyBridgeFailure("invalid_request"),
-      ),
-      request.signal,
-      replayIdentityKey,
-      cycleStrategy === "regenerate" ? "exhausted" : undefined,
-    );
-  }
-  let toolLedgerScope =
-    toolLedgerResolution.kind === "resolved"
-      ? toolLedgerResolution.taskId
-      : computedToolLedgerScope;
   const toolProfileKey = requestProfile.compatibilityKey;
   const toolLedger = responseStore.getOrCreateToolLedger(toolLedgerScope);
   const toolResultFailure = validateResponsesToolResults(
@@ -1517,7 +1432,6 @@ async function handleResponsesCreateOnce(
     toolLedgerScope,
     toolProfileKey,
     responseStore,
-    cycleStrategy === "regenerate",
   );
   if (toolResultFailure) {
     return buildResponsesLedgerFailureResult(
@@ -1528,68 +1442,44 @@ async function handleResponsesCreateOnce(
       taskDeadlineMs,
       toolResultFailure,
       request.signal,
-      replayIdentityKey,
-      cycleStrategy === "regenerate" ? "exhausted" : undefined,
     );
-  }
-
-  const simulatedPromptMaxChars =
-    options.substrate.truncateBeforeSending
-      ? options.substrate.maxSendChars
-      : 0;
-
-  let activeBaseRequest = baseRequest;
-  if (cycleStrategy === "regenerate") {
-    activeBaseRequest = buildSimulatedProtocolRegenerationRequest(
-      baseRequest,
-      simulatedPromptMaxChars,
-    );
-    parsedRequest.base = activeBaseRequest;
-    conversationId = null;
   }
 
   if (!conversationId) {
-    const createResult =
-      selectedTransport === TransportNames.Substrate
-        ? substrateClient.createConversation()
-        : await graphClient.createConversation(authorizationHeader);
-
-    if (!createResult.isSuccess || !createResult.conversationId) {
-      const fallbackMessage =
+    if (!conversationId) {
+      const createResult =
         selectedTransport === TransportNames.Substrate
-          ? "Unable to initialize Substrate conversation."
-          : "Unable to create Microsoft 365 Copilot conversation.";
-      const code =
-        selectedTransport === TransportNames.Substrate
-          ? "substrate_error"
-          : "graph_error";
-      return writeFromUpstreamFailure(
-        services,
-        createResult.statusCode,
-        createResult.rawBody,
-        fallbackMessage,
-        code,
-      );
-    }
+          ? substrateClient.createConversation()
+          : await graphClient.createConversation(authorizationHeader);
 
-    conversationId = createResult.conversationId;
-    createdConversation = true;
-    if (scopedConversationKey) {
-      conversationStore.set(scopedConversationKey, conversationId);
+      if (!createResult.isSuccess || !createResult.conversationId) {
+        const fallbackMessage =
+          selectedTransport === TransportNames.Substrate
+            ? "Unable to initialize Substrate conversation."
+            : "Unable to create Microsoft 365 Copilot conversation.";
+        const code =
+          selectedTransport === TransportNames.Substrate
+            ? "substrate_error"
+            : "graph_error";
+        return writeFromUpstreamFailure(
+          services,
+          createResult.statusCode,
+          createResult.rawBody,
+          fallbackMessage,
+          code,
+        );
+      }
+
+      conversationId = createResult.conversationId;
+      createdConversation = true;
+      if (scopedConversationKey) {
+        conversationStore.set(scopedConversationKey, conversationId);
+      }
     }
   }
 
   if (conversationId && scopedConversationKey) {
     conversationStore.set(scopedConversationKey, conversationId);
-  }
-  if (
-    toolResultCallIds.length === 0 &&
-    toolLedgerResolution.kind !== "resolved"
-  ) {
-    toolLedgerScope = computeResponsesToolLedgerScope(
-      payload.json,
-      conversationId,
-    );
   }
 
   if (!conversationId) {
@@ -1607,13 +1497,13 @@ async function handleResponsesCreateOnce(
     responseHeaders.set("x-m365-conversation-created", "true");
   }
 
-  const graphPayload = buildCopilotRequestPayload(activeBaseRequest);
-  const shouldBufferAssistant = requiresBufferedAssistantResponse(activeBaseRequest);
+  const graphPayload = buildCopilotRequestPayload(baseRequest);
+  const shouldBufferAssistant = requiresBufferedAssistantResponse(baseRequest);
 
   const executeChatTurn = async (
     turnConversationId: string = conversationId!,
     turnIsStartOfSession: boolean = createdConversation,
-    turnRequest: ParsedOpenAiRequest = activeBaseRequest,
+    turnRequest: ParsedOpenAiRequest = baseRequest,
   ): Promise<ChatResult> => {
     if (selectedTransport === TransportNames.Substrate) {
       const result = await substrateClient.chat(
@@ -1658,50 +1548,49 @@ async function handleResponsesCreateOnce(
     // Do not chain the general confab retry with protocol correction. A bad
     // simulated payload gets one focused correction turn; all other requests
     // retain the independently configured confab recovery behavior.
-    return activeBaseRequest.transformMode === OpenAiTransformModes.Simulated
-      ? result
-      : retryConfabGiveUp(
-          services,
-          selectedTransport,
-          activeBaseRequest,
-          result,
-          executeChatTurn,
-        );
-  };
-  const safeExecuteChatTurnWithRecovery = async (): Promise<ChatResult> => {
-    try {
-      return await executeChatTurnWithRecovery();
-    } catch (error) {
-      if (
-        cycleStrategy === "regenerate" &&
-        replayIdentityKey &&
-        failureCycleClaim.kind === "regenerate"
-      ) {
-        services.responseStore.rememberExhaustedProtocolFailure(
-          replayIdentityKey,
-          failureCycleClaim.conversationId,
-          failureCycleClaim.response,
+    if (baseRequest.transformMode !== OpenAiTransformModes.Simulated) {
+      return retryConfabGiveUp(
+        services,
+        selectedTransport,
+        baseRequest,
+        result,
+        executeChatTurn,
+      );
+    }
+    if (
+      isInvalidSimulatedResponsesResult(
+        options,
+        result,
+        parsedRequest,
+        conversationId!,
+        options.includeConversationIdInResponseBody,
+      )
+    ) {
+      services.observability?.record("retry", {
+        reason: "simulated_protocol_correction",
+        retryCount: 1,
+      });
+      const retryConversationId = await createProtocolRetryConversationId(
+        selectedTransport,
+        substrateClient,
+        graphClient,
+        authorizationHeader,
+      );
+      if (retryConversationId) {
+        result = await executeChatTurn(
+          retryConversationId,
+          true,
+          buildSimulatedProtocolRetryRequest(baseRequest, 1),
         );
       }
-      throw error;
     }
+    return result;
   };
 
-  if (activeBaseRequest.stream) {
+  if (baseRequest.stream) {
     if (shouldBufferAssistant) {
-      const buffered = await safeExecuteChatTurnWithRecovery();
+      const buffered = await executeChatTurnWithRecovery();
       if (!buffered.isSuccess) {
-        if (
-          cycleStrategy === "regenerate" &&
-          replayIdentityKey &&
-          failureCycleClaim.kind === "regenerate"
-        ) {
-          services.responseStore.rememberExhaustedProtocolFailure(
-            replayIdentityKey,
-            failureCycleClaim.conversationId,
-            failureCycleClaim.response,
-          );
-        }
         return writeFromUpstreamFailure(
           services,
           buffered.statusCode,
@@ -1727,95 +1616,71 @@ async function handleResponsesCreateOnce(
         buffered.assistantText ??
         extractCopilotAssistantText(
           buffered.responseJson,
-          activeBaseRequest.promptText,
+          baseRequest.promptText,
         ) ??
         "";
-      if (activeBaseRequest.transformMode === OpenAiTransformModes.Simulated) {
-        const resolution = await resolveSimulatedOutput(
-          services,
-          buffered,
+      if (baseRequest.transformMode === OpenAiTransformModes.Simulated) {
+        const simulatedPayload = tryExtractSimulatedResponsePayload(
+          assistantText,
           "responses",
-          activeBaseRequest,
-          selectedTransport,
-          conversationId,
-          request.signal,
-          () =>
-            createProtocolRetryConversationId(
-              selectedTransport,
-              substrateClient,
-              graphClient,
-              authorizationHeader,
-            ),
-          (retryConversationId, retryRequest) =>
-            executeChatTurn(retryConversationId, true, retryRequest),
-          simulatedPromptMaxChars,
-          cycleStrategy,
         );
-        if (resolution.kind === "upstream_failure") {
-          return buildResponsesFailureResult(
-            services,
+        if (simulatedPayload) {
+          const normalized = normalizeSimulatedResponsesPayload(
+            simulatedPayload,
             parsedRequest,
-            responseHeaders,
             conversationId,
-            taskDeadlineMs,
-            request.signal.aborted
-              ? "upstream_timeout"
-              : selectedTransport === TransportNames.Substrate
-                ? "substrate_error"
-                : "graph_error",
-            undefined,
-            request.signal.aborted ? undefined : replayIdentityKey,
-            true,
-            cycleStrategy === "regenerate" ? "exhausted" : undefined,
+            options.includeConversationIdInResponseBody,
           );
-        }
-        if (resolution.kind === "cancelled" || request.signal.aborted) {
-          return buildResponsesFailureResult(
+
+          if (
+            !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
+            shouldRetrySimulatedInvalidResponsesToolPayload(
+              normalized.responseBody,
+              baseRequest.tooling,
+            ) ||
+            shouldRetrySimulatedToollessResponsesPayload(
+              options,
+              baseRequest,
+              normalized.responseBody,
+            )
+          ) {
+            return writeOpenAiError(
+              services,
+              502,
+              "Simulated mode response did not include a usable response output payload.",
+              "api_error",
+              "invalid_simulated_payload",
+            );
+          }
+          return buildSimulatedResponsesStreamResponse(
             services,
             parsedRequest,
-            responseHeaders,
             conversationId,
-            taskDeadlineMs,
-            "upstream_timeout",
-            request.signal,
-            cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
-            false,
-            cycleStrategy === "regenerate" ? "exhausted" : undefined,
-          );
-        }
-        if (resolution.kind === "rejected") {
-          return buildResponsesFailureResult(
-            services,
-            parsedRequest,
+            normalized.responseBody,
+            requestProfile.compatibilityKey,
             responseHeaders,
-            conversationId,
-            taskDeadlineMs,
-            resolution.reason,
-            undefined,
+            trace,
             replayIdentityKey,
-            true,
-            cycleStrategy === "primary" ? "retry_available" : "exhausted",
+            taskDeadlineMs,
+            request.signal,
           );
         }
-        conversationId = resolution.conversationId;
-        responseHeaders.set("x-m365-conversation-id", conversationId);
-        if (scopedConversationKey) {
-          conversationStore.set(scopedConversationKey, conversationId);
+
+        // M365 occasionally returns the final assistant text directly after a
+        // tool result instead of wrapping it in a simulated Responses object.
+        // Convert that first response locally; never resend the upstream turn.
+        if (
+          !assistantText.trim() ||
+          looksLikeForeignSandboxLeak(assistantText)
+        ) {
+          return writeOpenAiError(
+            services,
+            502,
+            "Simulated mode response did not include a usable response output payload.",
+            "api_error",
+            "invalid_simulated_payload",
+          );
         }
-        return buildSimulatedResponsesStreamResponseFromAccepted(
-          services,
-          parsedRequest,
-          conversationId,
-          resolution.output,
-          toolLedgerScope,
-          requestProfile.compatibilityKey,
-          responseHeaders,
-          trace,
-          replayIdentityKey,
-          taskDeadlineMs,
-          request.signal,
-          cycleStrategy,
-        );
       }
 
       const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
@@ -1828,7 +1693,7 @@ async function handleResponsesCreateOnce(
           services.observability?.record("tool_call_recovery_exhausted", {
             reason: classification.reason,
             toolChoiceMode: baseRequest.tooling.toolChoiceMode,
-            assistantTextSize: assistantText.length,
+            preview: assistantText.slice(0, 200),
           });
           return writeOpenAiError(
             services,
@@ -1847,6 +1712,24 @@ async function handleResponsesCreateOnce(
         return strictToolError;
       }
       const responseId = createOpenAiResponseId();
+      const toolLedgerFailure = issueResponsesToolCalls(
+        services.responseStore,
+        computeResponsesToolLedgerScope(parsedRequest.rawRequest, conversationId),
+        requestProfile.compatibilityKey,
+        responseId,
+        assistantToolCallsForLedger(assistantResponse.toolCalls),
+      );
+      if (toolLedgerFailure) {
+        return buildResponsesLedgerFailureResult(
+          services,
+          parsedRequest,
+          responseHeaders,
+          conversationId,
+          taskDeadlineMs,
+          toolLedgerFailure,
+          request.signal,
+        );
+      }
       return buildBufferedResponsesStreamResponse(
         services,
         parsedRequest,
@@ -1857,8 +1740,6 @@ async function handleResponsesCreateOnce(
           stripPrivateCitationMarkers(assistantText),
         ),
         responseId,
-        toolLedgerScope,
-        requestProfile.compatibilityKey,
         responseHeaders,
         trace,
         replayIdentityKey,
@@ -1911,19 +1792,8 @@ async function handleResponsesCreateOnce(
     );
   }
 
-  const chatResponse = await safeExecuteChatTurnWithRecovery();
+  const chatResponse = await executeChatTurnWithRecovery();
   if (!chatResponse.isSuccess) {
-    if (
-      cycleStrategy === "regenerate" &&
-      replayIdentityKey &&
-      failureCycleClaim.kind === "regenerate"
-    ) {
-      services.responseStore.rememberExhaustedProtocolFailure(
-        replayIdentityKey,
-        failureCycleClaim.conversationId,
-        failureCycleClaim.response,
-      );
-    }
     return writeFromUpstreamFailure(
       services,
       chatResponse.statusCode,
@@ -1947,185 +1817,123 @@ async function handleResponsesCreateOnce(
 
   const assistantText =
     chatResponse.assistantText ??
-    extractCopilotAssistantText(chatResponse.responseJson, activeBaseRequest.promptText) ??
+    extractCopilotAssistantText(chatResponse.responseJson, baseRequest.promptText) ??
     "";
-  if (activeBaseRequest.transformMode === OpenAiTransformModes.Simulated) {
-    const resolution = await resolveSimulatedOutput(
-      services,
-      chatResponse,
+  if (baseRequest.transformMode === OpenAiTransformModes.Simulated) {
+    const simulatedPayload = tryExtractSimulatedResponsePayload(
+      assistantText,
       "responses",
-      activeBaseRequest,
-      selectedTransport,
-      conversationId,
-      request.signal,
-      () =>
-        createProtocolRetryConversationId(
-          selectedTransport,
-          substrateClient,
-          graphClient,
-          authorizationHeader,
+    );
+    if (simulatedPayload) {
+      const normalized = normalizeSimulatedResponsesPayload(
+        simulatedPayload,
+        parsedRequest,
+        conversationId,
+        options.includeConversationIdInResponseBody,
+      );
+
+      if (
+        !hasUsableSimulatedResponsesPayload(normalized.responseBody) ||
+        shouldRetrySimulatedInvalidResponsesToolPayload(
+          normalized.responseBody,
+          baseRequest.tooling,
+        ) ||
+        shouldRetrySimulatedToollessResponsesPayload(
+          options,
+          baseRequest,
+          normalized.responseBody,
+        )
+      ) {
+        traceError(
+          services,
+          trace,
+          {
+            message:
+              "Simulated mode response did not include a usable response output payload.",
+            type: "api_error",
+            param: null,
+            code: "invalid_simulated_payload",
+          },
+          502,
+        );
+        return writeOpenAiError(
+          services,
+          502,
+          "Simulated mode response did not include a usable response output payload.",
+          "api_error",
+          "invalid_simulated_payload",
+        );
+      }
+
+      const toolLedgerFailure = issueResponsesToolCalls(
+        responseStore,
+        computeResponsesToolLedgerScope(payload.json, conversationId),
+        requestProfile.compatibilityKey,
+        normalized.responseId,
+        outputItemsForLedger(
+          Array.isArray(normalized.responseBody.output)
+            ? normalized.responseBody.output.filter(isJsonObject)
+            : [],
         ),
-      (retryConversationId, retryRequest) =>
-        executeChatTurn(retryConversationId, true, retryRequest),
-      simulatedPromptMaxChars,
-      cycleStrategy,
-    );
-    if (resolution.kind === "upstream_failure") {
-      return buildResponsesFailureResult(
-        services,
-        parsedRequest,
-        responseHeaders,
-        conversationId,
-        taskDeadlineMs,
-        request.signal.aborted
-          ? "upstream_timeout"
-          : selectedTransport === TransportNames.Substrate
-            ? "substrate_error"
-            : "graph_error",
-        undefined,
-        request.signal.aborted ? undefined : replayIdentityKey,
-        true,
-        cycleStrategy === "regenerate" ? "exhausted" : undefined,
       );
-    }
-    if (resolution.kind === "cancelled" || request.signal.aborted) {
-      return buildResponsesFailureResult(
-        services,
-        parsedRequest,
-        responseHeaders,
+      if (toolLedgerFailure) {
+        return buildResponsesLedgerFailureResult(
+          services,
+          parsedRequest,
+          responseHeaders,
+          conversationId,
+          taskDeadlineMs,
+          toolLedgerFailure,
+          request.signal,
+        );
+      }
+      responseStore.set(
+        normalized.responseId,
+        normalized.responseBody,
         conversationId,
         taskDeadlineMs,
-        "upstream_timeout",
-        request.signal,
-        cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
-        false,
-        cycleStrategy === "regenerate" ? "exhausted" : undefined,
       );
-    }
-    if (resolution.kind === "rejected") {
-      return buildResponsesFailureResult(
-        services,
-        parsedRequest,
-        responseHeaders,
-        conversationId,
-        taskDeadlineMs,
-        resolution.reason,
-        undefined,
+      rememberResponsesReplayIdentity(
+        responseStore,
         replayIdentityKey,
-        true,
-        cycleStrategy === "primary" ? "retry_available" : "exhausted",
-      );
-    }
-    conversationId = resolution.conversationId;
-    responseHeaders.set("x-m365-conversation-id", conversationId);
-    if (scopedConversationKey) {
-      conversationStore.set(scopedConversationKey, conversationId);
-    }
-    if (request.signal.aborted) {
-      return buildResponsesFailureResult(
-        services,
-        parsedRequest,
-        responseHeaders,
         conversationId,
-        taskDeadlineMs,
-        "upstream_timeout",
-        request.signal,
-        cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
-        false,
-        cycleStrategy === "regenerate" ? "exhausted" : undefined,
+        normalized.responseBody,
       );
+      responseHeaders.set("content-type", "application/json");
+      const body = JSON.stringify(normalized.responseBody);
+      tracePane2(services, trace, normalized.responseBody, 200);
+      traceComplete(services, trace, 200);
+      await debugLogger.logOutgoingResponse(
+        200,
+        responseHeaders.entries(),
+        body,
+      );
+      return new Response(body, { status: 200, headers: responseHeaders });
     }
-    const projection = buildLocalResponsesProjection(
-      resolution.output,
-      parsedRequest,
-      conversationId,
-      options.includeConversationIdInResponseBody,
-    );
-    const toolLedgerFailure =
-      resolution.output.status === "completed"
-        ? issueResponsesToolCalls(
-            responseStore,
-            toolLedgerScope,
-            requestProfile.compatibilityKey,
-            projection.responseId,
-            outputItemsForLedger(projection.outputItems),
-          )
-        : null;
-    if (toolLedgerFailure) {
-      return buildResponsesLedgerFailureResult(
+
+    // Accept a direct final answer after tool output by converting the first
+    // upstream response locally. Empty or hosted-sandbox answers remain invalid.
+    if (!assistantText.trim() || looksLikeForeignSandboxLeak(assistantText)) {
+      traceError(
         services,
-        parsedRequest,
-        responseHeaders,
-        conversationId,
-        taskDeadlineMs,
-        toolLedgerFailure,
-        request.signal,
-        replayIdentityKey,
-        cycleStrategy === "regenerate" ? "exhausted" : undefined,
+        trace,
+        {
+          message:
+            "Simulated mode response did not include a usable response output payload.",
+          type: "api_error",
+          param: null,
+          code: "invalid_simulated_payload",
+        },
+        502,
       );
-    }
-    if (request.signal.aborted) {
-      return buildResponsesFailureResult(
+      return writeOpenAiError(
         services,
-        parsedRequest,
-        responseHeaders,
-        conversationId,
-        taskDeadlineMs,
-        "upstream_timeout",
-        request.signal,
-        cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
-        false,
-        cycleStrategy === "regenerate" ? "exhausted" : undefined,
+        502,
+        "Simulated mode response did not include a usable response output payload.",
+        "api_error",
+        "invalid_simulated_payload",
       );
     }
-    responseStore.set(
-      projection.responseId,
-      projection.responseBody,
-      conversationId,
-      taskDeadlineMs,
-    );
-    if (request.signal.aborted) {
-      return buildResponsesFailureResult(
-        services,
-        parsedRequest,
-        responseHeaders,
-        conversationId,
-        taskDeadlineMs,
-        "upstream_timeout",
-        request.signal,
-        undefined,
-        false,
-      );
-    }
-    rememberResponsesReplayIdentity(
-      responseStore,
-      replayIdentityKey,
-      conversationId,
-      projection.responseBody,
-    );
-    if (request.signal.aborted) {
-      return buildResponsesFailureResult(
-        services,
-        parsedRequest,
-        responseHeaders,
-        conversationId,
-        taskDeadlineMs,
-        "upstream_timeout",
-        request.signal,
-        undefined,
-        false,
-      );
-    }
-    responseHeaders.set("content-type", "application/json");
-    const body = JSON.stringify(projection.responseBody);
-    tracePane2(services, trace, projection.responseBody, 200);
-    traceComplete(services, trace, 200);
-    await debugLogger.logOutgoingResponse(
-      200,
-      responseHeaders.entries(),
-      body,
-    );
-    return new Response(body, { status: 200, headers: responseHeaders });
   }
 
   const assistantResponse = buildAssistantResponse(baseRequest, assistantText);
@@ -2138,7 +1946,7 @@ async function handleResponsesCreateOnce(
       services.observability?.record("tool_call_recovery_exhausted", {
         reason: classification.reason,
         toolChoiceMode: baseRequest.tooling.toolChoiceMode,
-        assistantTextSize: assistantText.length,
+        preview: assistantText.slice(0, 200),
       });
       return writeOpenAiError(
         services,
@@ -2173,22 +1981,9 @@ async function handleResponsesCreateOnce(
       stripPrivateCitationMarkers(assistantText),
     ),
   );
-  if (request.signal.aborted) {
-    return buildResponsesFailureResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      conversationId,
-      taskDeadlineMs,
-      "upstream_timeout",
-      request.signal,
-      undefined,
-      false,
-    );
-  }
   const toolLedgerFailure = issueResponsesToolCalls(
     responseStore,
-    toolLedgerScope,
+    computeResponsesToolLedgerScope(payload.json, conversationId),
     requestProfile.compatibilityKey,
     responseId,
     assistantToolCallsForLedger(assistantResponse.toolCalls),
@@ -2202,55 +1997,15 @@ async function handleResponsesCreateOnce(
       taskDeadlineMs,
       toolLedgerFailure,
       request.signal,
-      replayIdentityKey,
-    );
-  }
-  if (request.signal.aborted) {
-    return buildResponsesFailureResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      conversationId,
-      taskDeadlineMs,
-      "upstream_timeout",
-      request.signal,
-      undefined,
-      false,
     );
   }
   responseStore.set(responseId, responseBody, conversationId, taskDeadlineMs);
-  if (request.signal.aborted) {
-    return buildResponsesFailureResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      conversationId,
-      taskDeadlineMs,
-      "upstream_timeout",
-      request.signal,
-      undefined,
-      false,
-    );
-  }
   rememberResponsesReplayIdentity(
     responseStore,
     replayIdentityKey,
     conversationId,
     responseBody,
   );
-  if (request.signal.aborted) {
-    return buildResponsesFailureResult(
-      services,
-      parsedRequest,
-      responseHeaders,
-      conversationId,
-      taskDeadlineMs,
-      "upstream_timeout",
-      request.signal,
-      undefined,
-      false,
-    );
-  }
 
   responseHeaders.set("content-type", "application/json");
   const body = JSON.stringify(responseBody);
@@ -2580,17 +2335,7 @@ async function buildStoredReplayResponsesResult(
     return new Response(body, { status: 200, headers });
   }
 
-  const inProgress = buildOpenAiResponseObject(
-    responseId,
-    createdAt,
-    parsedRequest.base.model,
-    "in_progress",
-    [],
-    parsedRequest,
-    services.options.includeConversationIdInResponseBody
-      ? normalizedConversationId
-      : null,
-  );
+  const inProgress = { ...storedResponse, status: "in_progress", output: [] };
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -2611,9 +2356,43 @@ async function buildStoredReplayResponsesResult(
           return;
         }
         const outputItem = outputItems[index];
-        emitSimulatedResponsesOutputItem(writer, responseId, index, outputItem);
+        const outputItemType = String(outputItem.type ?? "message");
+        const outputItemId = String(
+          outputItem.id ?? createOpenAiOutputItemId("item"),
+        );
+
+        if (outputItemType === "message") {
+          const text = extractOutputItemText(outputItem);
+          writer.outputItemAdded(
+            responseId,
+            index,
+            buildMessageOutputItem(outputItemId, "", "in_progress"),
+          );
+          writer.contentPartAdded(responseId, index, outputItemId, {
+            type: "output_text",
+            text: "",
+          });
+          if (text) {
+            writer.outputTextDelta(responseId, index, outputItemId, text);
+          }
+          writer.outputTextDone(responseId, index, outputItemId, text);
+          writer.contentPartDone(responseId, index, outputItemId, {
+            type: "output_text",
+            text,
+          });
+          writer.outputItemDone(responseId, index, outputItem);
+          continue;
+        }
+
+        // Non-message items (function_call above all): emit the item verbatim
+        // via added/done so tool calls survive the replay intact.
+        writer.outputItemAdded(responseId, index, {
+            ...outputItem,
+            status: "in_progress",
+          });
+        writer.outputItemDone(responseId, index, outputItem);
       }
-      writer.replayTerminal(storedResponse);
+      writer.completed(storedResponse);
       enqueueSseDoneEvent(controller, encoder);
       controller.close();
     },
@@ -2633,8 +2412,6 @@ async function buildBufferedResponsesStreamResponse(
   assistantResponse: ReturnType<typeof buildAssistantResponse>,
   annotations: JsonObject[],
   responseId: string,
-  toolLedgerScope: string,
-  requestProfileKey: string,
   headers: Headers,
   trace: TraceContext | null,
   replayIdentityKey: string,
@@ -2649,9 +2426,20 @@ async function buildBufferedResponsesStreamResponse(
       const writer = createResponsesEventWriter(controller, encoder);
       let inProgress: JsonObject | null = null;
       let outputItems: JsonObject[] = [];
-      let completed: JsonObject | null = null;
 
       try {
+        inProgress = buildOpenAiResponseObject(
+          responseId,
+          createdAt,
+          parsedRequest.base.model,
+          "in_progress",
+          [],
+          parsedRequest,
+          includeConversationId ? conversationId : null,
+        );
+        writer.created(inProgress);
+        writer.inProgress(inProgress);
+
         outputItems =
           assistantResponse.toolCalls.length > 0
             ? buildFunctionCallOutputItems(assistantResponse.toolCalls, "completed")
@@ -2663,42 +2451,71 @@ async function buildBufferedResponsesStreamResponse(
                   annotations,
                 ),
               ];
-        inProgress = buildOpenAiResponseObject(
-          responseId,
-          createdAt,
-          parsedRequest.base.model,
-          "in_progress",
-          [],
-          parsedRequest,
-          includeConversationId ? conversationId : null,
-        );
-        if (signal?.aborted) {
-          writer.clientAbort();
-          return;
-        }
-        const ledgerFailure = issueResponsesToolCalls(
-          services.responseStore,
-          toolLedgerScope,
-          requestProfileKey,
-          responseId,
-          outputItemsForLedger(outputItems),
-        );
-        if (ledgerFailure) {
-          writer.created(inProgress);
-          writer.inProgress(inProgress);
-          emitResponsesFailureTerminal(
-            writer,
-            inProgress,
-            ledgerFailure.reason,
-            parsedRequest,
+
+        for (let index = 0; index < outputItems.length; index++) {
+          if (signal?.aborted) {
+            writer.clientAbort();
+            return;
+          }
+          const item = outputItems[index];
+          writer.outputItemAdded(
+            responseId,
+            index,
+            item.type === "message"
+              ? buildMessageOutputItem(String(item.id ?? ""), "", "in_progress")
+              : item,
           );
-          return;
+          if (item.type === "message") {
+            const content = assistantResponse.content ?? "";
+            writer.contentPartAdded(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              { type: "output_text", text: "" },
+            );
+            if (content) {
+              writer.outputTextDelta(
+                responseId,
+                index,
+                String(item.id ?? ""),
+                content,
+              );
+            }
+            writer.outputTextDone(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              content,
+            );
+            writer.contentPartDone(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              { type: "output_text", text: content, annotations },
+            );
+          } else if (item.type === "custom_tool_call") {
+            const input = tryGetRawString(item, "input") ?? "";
+            writer.customToolInputDelta(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              input,
+            );
+            writer.customToolInputDone(
+              responseId,
+              index,
+              String(item.id ?? ""),
+              input,
+            );
+          }
+          writer.outputItemDone(responseId, index, item);
         }
+
         if (signal?.aborted) {
           writer.clientAbort();
           return;
         }
-        completed = buildOpenAiResponseObject(
+        const completed = buildOpenAiResponseObject(
           responseId,
           createdAt,
           parsedRequest.base.model,
@@ -2707,45 +2524,21 @@ async function buildBufferedResponsesStreamResponse(
           parsedRequest,
           includeConversationId ? conversationId : null,
         );
+        writer.completed(completed);
         services.responseStore.set(
           responseId,
           completed,
           conversationId,
           taskDeadlineMs,
         );
-        if (signal?.aborted) {
-          writer.clientAbort();
-          return;
-        }
         rememberResponsesReplayIdentity(
           services.responseStore,
           replayIdentityKey,
           conversationId,
           completed,
         );
-        if (signal?.aborted) {
-          writer.clientAbort();
-          return;
-        }
         tracePane2(services, trace, completed, 200);
         traceComplete(services, trace, 200);
-        writer.created(inProgress);
-        writer.inProgress(inProgress);
-
-        for (let index = 0; index < outputItems.length; index++) {
-          if (signal?.aborted) {
-            writer.clientAbort();
-            return;
-          }
-          const item = outputItems[index];
-          emitSimulatedResponsesOutputItem(writer, responseId, index, item);
-        }
-
-        if (signal?.aborted) {
-          writer.clientAbort();
-          return;
-        }
-        writer.completed(completed!);
       } catch (error) {
         traceError(
           services,
@@ -2789,7 +2582,6 @@ async function buildBufferedResponsesStreamResponse(
             writer,
             terminalResponse,
             "response_stream_error",
-            parsedRequest,
           );
         }
       } finally {
@@ -2877,39 +2669,18 @@ export function looksLikeConfabGiveUp(text: string | null | undefined): boolean 
   return ConfabGiveUpPatterns.some((pattern) => pattern.test(text));
 }
 
-export type SimulatedCycleStrategy = "primary" | "regenerate";
-
 function buildSimulatedProtocolRetryRequest(
   request: ParsedOpenAiRequest,
   attempt: number,
-  rejectedReason: string,
-  rejectedAssistantText: string,
-  maxChars = 0,
 ): ParsedOpenAiRequest {
   return {
     ...request,
-    promptText: appendSimulatedProtocolCorrection(
+    promptText: [
       request.promptText,
-      attempt,
-      rejectedReason,
-      maxChars,
-      rejectedAssistantText,
-      request.simulatedOutputProtocol,
-    ),
-  };
-}
-
-function buildSimulatedProtocolRegenerationRequest(
-  request: ParsedOpenAiRequest,
-  maxChars = 0,
-): ParsedOpenAiRequest {
-  return {
-    ...request,
-    promptText: buildSimulatedRegenerationPrompt(
-      request.promptText,
-      maxChars,
-      request.simulatedOutputProtocol,
-    ),
+      "",
+      `PROTOCOL RETRY ${attempt}: The previous response was rejected because it did not contain the required valid local tool call.`,
+      "Do not answer the user request in prose. Return only the minified JSON tool-call object required above.",
+    ].join("\n"),
   };
 }
 
@@ -2928,405 +2699,6 @@ async function createProtocolRetryConversationId(
   return retryConversation.isSuccess
     ? retryConversation.conversationId
     : null;
-}
-
-type SimulatedResolution =
-  | {
-      kind: "accepted";
-      result: ChatResult;
-      output: SimulatedOutputAccepted;
-      conversationId: string;
-    }
-  | {
-      kind: "upstream_failure";
-      result: ChatResult;
-    }
-  | {
-      kind: "rejected";
-      reason: string;
-    }
-  | {
-      kind: "cancelled";
-    };
-
-function decodeSimulatedCandidate(
-  assistantText: string,
-  endpoint: SimulatedOutputEndpoint,
-  request: ParsedOpenAiRequest,
-): {
-  result: SimulatedOutputResult;
-  isRecognizedV1: boolean;
-} {
-  const isEligibleBridgeV1 =
-    endpoint === "responses" &&
-    request.simulatedOutputProtocol === SimulatedOutputProtocols.BridgeV1;
-
-  if (isEligibleBridgeV1) {
-    const v1Result = decodeSimulatedActionOutputV1(assistantText, request);
-    if (v1Result.kind !== "not_v1") {
-      return {
-        result: v1Result,
-        isRecognizedV1: true,
-      };
-    }
-  }
-
-  const legacyResult = decodeAndValidateSimulatedOutput(
-    assistantText,
-    endpoint,
-    request.tooling,
-  );
-  return {
-    result: legacyResult,
-    isRecognizedV1: false,
-  };
-}
-
-async function resolveSimulatedOutput(
-  services: Services,
-  initialResult: ChatResult,
-  endpoint: SimulatedOutputEndpoint,
-  request: ParsedOpenAiRequest,
-  route: string,
-  currentConversationId: string,
-  signal: AbortSignal | undefined,
-  createRetryConversation: () => Promise<string | null>,
-  executeRetry: (
-    conversationId: string,
-    request: ParsedOpenAiRequest,
-  ) => Promise<ChatResult>,
-  maxPromptChars = 0,
-  cycleStrategy: SimulatedCycleStrategy = "primary",
-): Promise<SimulatedResolution> {
-  const cycle: 1 | 2 = cycleStrategy === "regenerate" ? 2 : 1;
-  const strategy = cycleStrategy;
-
-  if (!initialResult.isSuccess) {
-    return { kind: "upstream_failure", result: initialResult };
-  }
-
-  const firstText = simulatedAssistantText(initialResult, request.promptText);
-  const firstDecoded = decodeSimulatedCandidate(firstText, endpoint, request);
-  const first = firstDecoded.result;
-  if (first.kind === "accepted" && !hasKnownInvalidSimulatedOutput(first)) {
-    if (signal?.aborted) {
-      return { kind: "cancelled" };
-    }
-    return {
-      kind: "accepted",
-      result: initialResult,
-      output: first,
-      conversationId: initialResult.conversationId ?? currentConversationId,
-    };
-  }
-  if (
-    request.simulatedOutputProtocol !== SimulatedOutputProtocols.BridgeV1 &&
-    !firstDecoded.isRecognizedV1 &&
-    canAcceptToolFreeAssistantText(
-      endpoint,
-      request.tooling,
-      first,
-      firstText,
-    )
-  ) {
-    if (signal?.aborted) {
-      return { kind: "cancelled" };
-    }
-    return {
-      kind: "accepted",
-      result: initialResult,
-      output: buildToolFreeSimulatedOutput(endpoint, firstText),
-      conversationId: initialResult.conversationId ?? currentConversationId,
-    };
-  }
-  const firstRejection = first.kind === "rejected"
-    ? first
-    : { kind: "rejected" as const, reason: "invalid_envelope" as const };
-  const canAcceptCorrectionText =
-    request.simulatedOutputProtocol !== SimulatedOutputProtocols.BridgeV1 &&
-    !firstDecoded.isRecognizedV1 &&
-    !hasSimulatedToolSurface(request.tooling) &&
-    !looksLikeToolCallAttemptText(firstText) &&
-    !looksLikeSimulatedEndpointEnvelope(endpoint, firstText);
-
-  recordSimulatedCorrection(
-    services,
-    endpoint,
-    route,
-    request,
-    firstRejection,
-    firstText.length,
-    1,
-    undefined,
-    cycle,
-    strategy,
-  );
-  if (signal?.aborted) {
-    return { kind: "cancelled" };
-  }
-  const retryConversationId = await createRetryConversation();
-  if (!retryConversationId) {
-    recordSimulatedProtocolExhaustion(
-      services,
-      endpoint,
-      route,
-      request,
-      firstRejection,
-      firstText.length,
-      undefined,
-      cycle,
-      strategy,
-    );
-    return {
-      kind: "rejected",
-      reason: "simulated_protocol_correction_exhausted",
-    };
-  }
-  if (signal?.aborted) {
-    return { kind: "cancelled" };
-  }
-
-  const retryRequest = buildSimulatedProtocolRetryRequest(
-    request,
-    1,
-    firstRejection.reason,
-    firstText,
-    maxPromptChars,
-  );
-  const retryResult = await executeRetry(retryConversationId, retryRequest);
-  if (signal?.aborted) {
-    return { kind: "cancelled" };
-  }
-  if (!retryResult.isSuccess) {
-    return { kind: "upstream_failure", result: retryResult };
-  }
-  const retryText = simulatedAssistantText(retryResult, request.promptText);
-  const secondDecoded = decodeSimulatedCandidate(
-    retryText,
-    endpoint,
-    retryRequest,
-  );
-  const second = secondDecoded.result;
-  if (
-    request.simulatedOutputProtocol !== SimulatedOutputProtocols.BridgeV1 &&
-    canAcceptCorrectionText &&
-    !secondDecoded.isRecognizedV1 &&
-    canAcceptToolFreeAssistantText(
-      endpoint,
-      retryRequest.tooling,
-      second,
-      retryText,
-    )
-  ) {
-    return {
-      kind: "accepted",
-      result: retryResult,
-      output: buildToolFreeSimulatedOutput(endpoint, retryText),
-      conversationId: retryConversationId,
-    };
-  }
-  if (
-    second.kind === "rejected" ||
-    hasKnownInvalidSimulatedOutput(second)
-  ) {
-    const secondRejection = second.kind === "rejected"
-      ? second
-      : { kind: "rejected" as const, reason: "invalid_envelope" as const };
-    const sameAsFirstCandidate = retryText === firstText;
-    recordSimulatedCorrection(
-      services,
-      endpoint,
-      route,
-      retryRequest,
-      secondRejection,
-      retryText.length,
-      2,
-      sameAsFirstCandidate,
-      cycle,
-      strategy,
-    );
-    recordSimulatedProtocolExhaustion(
-      services,
-      endpoint,
-      route,
-      retryRequest,
-      secondRejection,
-      retryText.length,
-      sameAsFirstCandidate,
-      cycle,
-      strategy,
-    );
-    return {
-      kind: "rejected",
-      reason: "simulated_protocol_correction_exhausted",
-    };
-  }
-  if (signal?.aborted) {
-    return { kind: "cancelled" };
-  }
-  return {
-    kind: "accepted",
-    result: retryResult,
-    output: second,
-    conversationId: retryConversationId,
-  };
-}
-
-function canAcceptToolFreeAssistantText(
-  endpoint: SimulatedOutputEndpoint,
-  tooling: OpenAiTooling,
-  result: SimulatedOutputAccepted | SimulatedOutputRejected,
-  assistantText: string,
-): boolean {
-  if (hasSimulatedToolSurface(tooling)) {
-    return false;
-  }
-  if (result.kind !== "rejected" || !assistantText.trim()) {
-    return false;
-  }
-  if (looksLikeToolCallAttemptText(assistantText)) {
-    return false;
-  }
-  return !looksLikeSimulatedEndpointEnvelope(endpoint, assistantText);
-}
-
-function hasSimulatedToolSurface(tooling: OpenAiTooling): boolean {
-  return (
-    tooling.tools.length > 0 &&
-    tooling.toolChoiceMode !== ToolChoiceModes.None
-  );
-}
-
-function looksLikeSimulatedEndpointEnvelope(
-  endpoint: SimulatedOutputEndpoint,
-  assistantText: string,
-): boolean {
-  const trimmed = assistantText.trim();
-  const fenced = /^```json[ \t]*\r?\n([\s\S]*?)\r?\n```$/.exec(trimmed);
-  const candidate = fenced?.[1] ?? trimmed;
-  const parsed = tryParseJsonObject(candidate);
-  if (parsed && Object.hasOwn(parsed, "object")) {
-    return true;
-  }
-  const expectedObject =
-    endpoint === "responses" ? "response" : "chat.completion";
-  const escapedObject = expectedObject.replace(".", "\\.");
-  return new RegExp(
-    `^(?:\`\`\`json\\s*)?\\{[\\s\\S]*"object"\\s*:\\s*"${escapedObject}"`,
-    "i",
-  ).test(trimmed);
-}
-
-function buildToolFreeSimulatedOutput(
-  endpoint: SimulatedOutputEndpoint,
-  assistantText: string,
-): SimulatedOutputAccepted {
-  const text = stripPrivateCitationMarkers(assistantText);
-  return {
-    kind: "accepted",
-    endpoint,
-    status: "completed",
-    finishReason: "stop",
-    outputText: text,
-    items: [{
-      kind: "message",
-      status: "completed",
-      content: text,
-      refusal: null,
-      parts: [{ kind: "output_text", text }],
-    }],
-    terminalCause: null,
-  };
-}
-
-function hasKnownInvalidSimulatedOutput(
-  output: SimulatedOutputAccepted,
-): boolean {
-  return output.items.some((item) => {
-    if (item.kind === "message") {
-      return false;
-    }
-    return isKnownInvalidSimulatedToolCall(
-      item.call.name,
-      item.call.argumentsJson,
-    );
-  });
-}
-
-function simulatedAssistantText(result: ChatResult, promptText: string): string {
-  return (
-    result.assistantText ??
-    extractCopilotAssistantText(result.responseJson, promptText) ??
-    ""
-  );
-}
-
-function recordSimulatedCorrection(
-  services: Services,
-  endpoint: SimulatedOutputEndpoint,
-  route: string,
-  request: ParsedOpenAiRequest,
-  rejection: SimulatedOutputRejected,
-  assistantTextSize: number,
-  attempt: number,
-  sameAsFirstCandidate?: boolean,
-  cycle: 1 | 2 = 1,
-  strategy: SimulatedCycleStrategy = "primary",
-): void {
-  const fields: JsonObject = {
-    reason: "simulated_protocol_correction",
-    endpoint,
-    route,
-    attempt,
-    rejectionReason: rejection.reason,
-    offeredToolCount: request.tooling.tools.length,
-    assistantTextSize,
-    requestChars: request.promptText.length,
-    cycle,
-    strategy,
-    outputProtocol:
-      request.simulatedOutputProtocol ?? SimulatedOutputProtocols.Legacy,
-  };
-  if (sameAsFirstCandidate !== undefined) {
-    fields.sameAsFirstCandidate = sameAsFirstCandidate;
-  }
-  if (rejection.diagnostics) {
-    fields.decodeDiagnostics = { ...rejection.diagnostics };
-  }
-  services.observability?.record("retry", fields);
-}
-
-function recordSimulatedProtocolExhaustion(
-  services: Services,
-  endpoint: SimulatedOutputEndpoint,
-  route: string,
-  request: ParsedOpenAiRequest,
-  rejection: SimulatedOutputRejected,
-  assistantTextSize: number,
-  sameAsFirstCandidate?: boolean,
-  cycle: 1 | 2 = 1,
-  strategy: SimulatedCycleStrategy = "primary",
-): void {
-  const fields: JsonObject = {
-    reason: "simulated_protocol_correction_exhausted",
-    endpoint,
-    route,
-    rejectionReason: rejection.reason,
-    offeredToolCount: request.tooling.tools.length,
-    assistantTextSize,
-    requestChars: request.promptText.length,
-    cycle,
-    strategy,
-    outputProtocol:
-      request.simulatedOutputProtocol ?? SimulatedOutputProtocols.Legacy,
-  };
-  if (sameAsFirstCandidate !== undefined) {
-    fields.sameAsFirstCandidate = sameAsFirstCandidate;
-  }
-  if (rejection.diagnostics) {
-    fields.decodeDiagnostics = { ...rejection.diagnostics };
-  }
-  services.observability?.record("provider_drift", fields);
 }
 
 // Re-issue a buffered (non-streaming) Substrate turn when the model returns a
@@ -3763,7 +3135,7 @@ function normalizeSimulatedToolArguments(argumentsNode: unknown): string {
     return "{}";
   }
 
-  const repaired = repairJsonStringLexemes(raw);
+  const repaired = sanitizeJsonControlCharsInsideStringLiterals(raw);
   for (const candidate of [raw, repaired]) {
     try {
       const parsed = JSON.parse(candidate) as unknown;
@@ -3774,6 +3146,62 @@ function normalizeSimulatedToolArguments(argumentsNode: unknown): string {
   }
 
   return JSON.stringify({ input: raw });
+}
+
+function sanitizeJsonControlCharsInsideStringLiterals(raw: string): string {
+  let output = "";
+  let inString = false;
+  let escaped = false;
+
+  for (let index = 0; index < raw.length; index++) {
+    const ch = raw[index];
+    if (!ch) {
+      continue;
+    }
+
+    if (inString) {
+      if (escaped) {
+        output += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        output += ch;
+        escaped = true;
+        continue;
+      }
+      if (ch === "\"") {
+        output += ch;
+        inString = false;
+        continue;
+      }
+      if (ch === "\n") {
+        output += "\\n";
+        continue;
+      }
+      if (ch === "\r") {
+        output += "\\r";
+        continue;
+      }
+      if (ch === "\t") {
+        output += "\\t";
+        continue;
+      }
+
+      output += ch;
+      continue;
+    }
+
+    if (ch === "\"") {
+      inString = true;
+      output += ch;
+      continue;
+    }
+
+    output += ch;
+  }
+
+  return output;
 }
 
 function normalizeSimulatedResponsesPayload(
@@ -4078,372 +3506,53 @@ function hasEmptySearchBlock(diff: string): boolean {
   return false;
 }
 
-async function buildSimulatedChatStreamResponseFromAccepted(
+async function buildSimulatedChatStreamResponse(
   services: Services,
   model: string,
   conversationId: string,
-  accepted: SimulatedOutputAccepted,
-  rawRequest: JsonObject | undefined,
+  payload: JsonObject,
   includeConversationId: boolean,
   headers: Headers,
   trace: TraceContext | null,
-  signal?: AbortSignal,
 ): Promise<Response> {
-  const completionId = `chatcmpl-${randomUUID().replaceAll("-", "")}`;
-  const created = nowUnix();
-  const responseBody = buildLocalChatCompletion(
-    accepted,
+  const normalized = normalizeSimulatedChatCompletionPayload(
+    payload,
     model,
     conversationId,
     includeConversationId,
-    rawRequest,
   );
-  const includeUsage =
-    isJsonObject(rawRequest?.stream_options) &&
-    tryGetBoolean(rawRequest.stream_options, "include_usage") === true;
-  const message = accepted.items.find((item) => item.kind === "message");
-  const calls = accepted.items
-    .filter((item) => item.kind !== "message")
-    .map((item) => item.call);
-
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const encoder = new TextEncoder();
-      if (signal?.aborted) {
-        controller.close();
-        return;
-      }
-      const write = (
-        role: string | null,
-        content: string | null,
-        refusal: string | null,
-        finishReason: string | null,
-        toolCalls = calls,
-        usage?: JsonObject,
-      ) => {
-        const chunk = buildLocalChatCompletionChunk(
-          completionId,
-          created,
-          model,
-          includeConversationId ? conversationId : null,
-          role,
-          content,
-          refusal,
-          finishReason,
-          toolCalls,
-          usage,
-        );
-        controller.enqueue(
-          encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`),
-        );
-      };
-
-      write("assistant", null, null, null, []);
-      if (message?.kind === "message") {
-        if (message.content) {
-          write(null, message.content, null, null, []);
-        }
-        if (message.refusal) {
-          write(null, null, message.refusal, null, []);
-        }
-      }
-      if (calls.length > 0) {
-        write(null, null, null, null, calls);
-      }
-      write(null, null, null, accepted.finishReason, []);
-      if (includeUsage && isJsonObject(responseBody.usage)) {
-        write(null, null, null, null, [], responseBody.usage);
-      }
-      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
-      tracePane2(services, trace, responseBody, 200);
-      traceComplete(services, trace, 200);
-      controller.close();
-    },
-  });
-
-  headers.set("content-type", "text/event-stream");
-  headers.set("cache-control", "no-cache");
-  headers.set("connection", "keep-alive");
-  headers.set("x-m365-conversation-id", conversationId);
-  await services.debugLogger.logOutgoingResponse(200, headers.entries(), null);
-  return finalizeOutgoingStreamResponse(services, stream, headers);
-}
-
-async function buildSimulatedResponsesStreamResponseFromAccepted(
-  services: Services,
-  parsedRequest: ParsedResponsesRequest,
-  conversationId: string,
-  accepted: SimulatedOutputAccepted,
-  toolLedgerScope: string,
-  requestProfileKey: string,
-  headers: Headers,
-  trace: TraceContext | null,
-  replayIdentityKey: string,
-  taskDeadlineMs: number,
-  signal?: AbortSignal,
-  cycleStrategy: SimulatedCycleStrategy = "primary",
-): Promise<Response> {
-  const projection = buildLocalResponsesProjection(
-    accepted,
-    parsedRequest,
-    conversationId,
-    services.options.includeConversationIdInResponseBody,
-  );
-  if (signal?.aborted) {
-    return buildResponsesFailureResult(
+  const assistantResponse =
+    tryBuildAssistantResponseFromChatCompletionPayload(normalized);
+  if (!assistantResponse) {
+    traceError(
       services,
-      parsedRequest,
-      headers,
-      conversationId,
-      taskDeadlineMs,
-      "upstream_timeout",
-      signal,
-      cycleStrategy === "regenerate" ? replayIdentityKey : undefined,
-      false,
-      cycleStrategy === "regenerate" ? "exhausted" : undefined,
+      trace,
+      {
+        message: "Simulated chat payload was not a valid chat completion object.",
+        type: "api_error",
+        param: null,
+        code: "invalid_simulated_payload",
+      },
+      502,
     );
-  }
-  const ledgerFailure =
-    accepted.status === "completed"
-      ? issueResponsesToolCalls(
-          services.responseStore,
-          toolLedgerScope,
-          requestProfileKey,
-          projection.responseId,
-          outputItemsForLedger(projection.outputItems),
-        )
-      : null;
-  if (ledgerFailure) {
-    return buildResponsesLedgerFailureResult(
+    return writeOpenAiError(
       services,
-      parsedRequest,
-      headers,
-      conversationId,
-      taskDeadlineMs,
-      ledgerFailure,
-      signal,
-      replayIdentityKey,
-      cycleStrategy === "regenerate" ? "exhausted" : undefined,
+      502,
+      "Simulated chat payload was not a valid chat completion object.",
+      "api_error",
+      "invalid_simulated_payload",
     );
   }
-  services.responseStore.set(
-    projection.responseId,
-    projection.responseBody,
+
+  return buildAssistantStreamResponse(
+    services,
+    model,
     conversationId,
-    taskDeadlineMs,
+    assistantResponse,
+    includeConversationId,
+    headers,
+    trace,
   );
-  rememberResponsesReplayIdentity(
-    services.responseStore,
-    replayIdentityKey,
-    conversationId,
-    projection.responseBody,
-  );
-
-  const stream = new ReadableStream<Uint8Array>({
-    start(controller) {
-      const encoder = new TextEncoder();
-      const writer = createResponsesEventWriter(controller, encoder);
-      const inProgress = buildOpenAiResponseObject(
-        projection.responseId,
-        projection.createdAt,
-        parsedRequest.base.model,
-        "in_progress",
-        [],
-        parsedRequest,
-        services.options.includeConversationIdInResponseBody
-          ? conversationId
-          : null,
-      );
-      try {
-        tracePane2(services, trace, projection.responseBody, 200);
-        traceComplete(services, trace, 200);
-        writer.created(inProgress);
-        writer.inProgress(inProgress);
-        for (let index = 0; index < projection.outputItems.length; index += 1) {
-          if (signal?.aborted) {
-            writer.clientAbort();
-            return;
-          }
-          const item = projection.outputItems[index]!;
-          emitSimulatedResponsesOutputItem(
-            writer,
-            projection.responseId,
-            index,
-            item,
-          );
-        }
-        if (accepted.status === "completed") {
-          writer.completed(projection.responseBody);
-        } else {
-          writer.replayTerminal(projection.responseBody);
-        }
-      } finally {
-        if (writer.terminalState?.kind !== "cancelled") {
-          enqueueSseDoneEvent(controller, encoder);
-        }
-        controller.close();
-      }
-    },
-  });
-
-  headers.set("content-type", "text/event-stream");
-  headers.set("cache-control", "no-cache");
-  headers.set("connection", "keep-alive");
-  headers.set("x-m365-conversation-id", conversationId);
-  await services.debugLogger.logOutgoingResponse(200, headers.entries(), null);
-  return finalizeOutgoingStreamResponse(services, stream, headers);
-}
-
-function emitSimulatedResponsesOutputItem(
-  writer: ResponsesEventWriter,
-  responseId: string,
-  outputIndex: number,
-  item: JsonObject,
-): void {
-  const itemId = tryGetString(item, "id") ?? createOpenAiOutputItemId("out");
-  const itemType = tryGetString(item, "type") ?? "";
-  const inProgressItem = buildInProgressResponsesOutputItem(item, itemId);
-  writer.outputItemAdded(responseId, outputIndex, {
-    ...inProgressItem,
-  });
-  if (itemType === "message" && Array.isArray(item.content)) {
-    for (const [contentIndex, part] of item.content.entries()) {
-      if (!isJsonObject(part)) continue;
-      if (part.type === "output_text" && typeof part.text === "string") {
-        const textPart = { type: "output_text", text: "", annotations: [] };
-        writer.contentPartAdded(
-          responseId,
-          outputIndex,
-          itemId,
-          textPart,
-          contentIndex,
-        );
-        if (part.text) {
-          writer.outputTextDelta(
-            responseId,
-            outputIndex,
-            itemId,
-            part.text,
-            contentIndex,
-          );
-        }
-        writer.outputTextDone(
-          responseId,
-          outputIndex,
-          itemId,
-          part.text,
-          contentIndex,
-        );
-        writer.contentPartDone(
-          responseId,
-          outputIndex,
-          itemId,
-          { ...cloneJsonValue(part), type: "output_text", text: part.text },
-          contentIndex,
-        );
-        continue;
-      }
-      if (part.type === "refusal" && typeof part.refusal === "string") {
-        writer.contentPartAdded(
-          responseId,
-          outputIndex,
-          itemId,
-          { type: "refusal", refusal: "" },
-          contentIndex,
-        );
-        if (part.refusal) {
-          writer.refusalDelta(
-            responseId,
-            outputIndex,
-            itemId,
-            part.refusal,
-            contentIndex,
-          );
-        }
-        writer.refusalDone(
-          responseId,
-          outputIndex,
-          itemId,
-          part.refusal,
-          contentIndex,
-        );
-        writer.contentPartDone(
-          responseId,
-          outputIndex,
-          itemId,
-          { type: "refusal", refusal: part.refusal },
-          contentIndex,
-        );
-      }
-    }
-  } else if (itemType === "custom_tool_call") {
-    const input = tryGetRawString(item, "input") ?? "";
-    if (input) {
-      writer.customToolInputDelta(responseId, outputIndex, itemId, input);
-    }
-    writer.customToolInputDone(responseId, outputIndex, itemId, input);
-  } else if (itemType === "function_call") {
-    const argumentsText = tryGetRawString(item, "arguments") ?? "";
-    const callId = tryGetString(item, "call_id") ?? undefined;
-    if (argumentsText) {
-      writer.functionCallArgumentsDelta(
-        responseId,
-        outputIndex,
-        itemId,
-        argumentsText,
-        callId,
-      );
-    }
-    writer.functionCallArgumentsDone(
-      responseId,
-      outputIndex,
-      itemId,
-      argumentsText,
-      callId,
-    );
-  }
-  writer.outputItemDone(responseId, outputIndex, item);
-}
-
-function buildInProgressResponsesOutputItem(
-  item: JsonObject,
-  itemId: string,
-): JsonObject {
-  const type = tryGetString(item, "type") ?? "";
-  if (type === "message") {
-    return {
-      id: itemId,
-      type,
-      status: "in_progress",
-      role: tryGetString(item, "role") ?? "assistant",
-      content: [],
-    };
-  }
-  if (type === "function_call") {
-    return {
-      id: itemId,
-      type,
-      status: "in_progress",
-      call_id: tryGetString(item, "call_id") ?? "",
-      name: tryGetString(item, "name") ?? "",
-      arguments: "",
-    };
-  }
-  if (type === "custom_tool_call") {
-    return {
-      id: itemId,
-      type,
-      status: "in_progress",
-      call_id: tryGetString(item, "call_id") ?? "",
-      name: tryGetString(item, "name") ?? "",
-      input: "",
-    };
-  }
-  return {
-    id: itemId,
-    type,
-    status: "in_progress",
-  };
 }
 
 async function buildSimulatedResponsesStreamResponse(
@@ -4486,7 +3595,9 @@ async function buildSimulatedResponsesStreamResponse(
     }
     const normalizedItem: JsonObject = { ...item };
     normalizedItem.id = itemId;
-    normalizedItem.status = "completed";
+    if (!tryGetString(normalizedItem, "status")) {
+      normalizedItem.status = "completed";
+    }
     if (!tryGetString(normalizedItem, "type")) {
       normalizedItem.type = "output";
     }
@@ -4509,7 +3620,6 @@ async function buildSimulatedResponsesStreamResponse(
       taskDeadlineMs,
       toolLedgerFailure,
       signal,
-      replayIdentityKey,
     );
   }
 
@@ -4530,13 +3640,63 @@ async function buildSimulatedResponsesStreamResponse(
         );
         writer.created(inProgress);
         writer.inProgress(inProgress);
+
         for (let index = 0; index < finalizedOutputItems.length; index++) {
           if (signal?.aborted) {
             writer.clientAbort();
             return;
           }
           const item = finalizedOutputItems[index];
-          emitSimulatedResponsesOutputItem(writer, responseId, index, item);
+          const itemId = tryGetString(item, "id") ?? createOpenAiOutputItemId("out");
+          const itemType = (tryGetString(item, "type") ?? "").toLowerCase();
+          if (itemType === "message") {
+            const text = extractMessageOutputText(item);
+            writer.outputItemAdded(
+              responseId,
+              index,
+              buildMessageOutputItem(itemId, "", "in_progress"),
+            );
+            writer.contentPartAdded(
+              responseId,
+              index,
+              itemId,
+              { type: "output_text", text: "" },
+            );
+            if (text) {
+              writer.outputTextDelta(responseId, index, itemId, text);
+            }
+            writer.outputTextDone(responseId, index, itemId, text);
+            writer.contentPartDone(
+              responseId,
+              index,
+              itemId,
+              { type: "output_text", text },
+            );
+            writer.outputItemDone(
+              responseId,
+              index,
+              buildMessageOutputItem(itemId, text, "completed"),
+            );
+            continue;
+          }
+
+          writer.outputItemAdded(responseId, index, item);
+          if (itemType === "custom_tool_call") {
+            const input = tryGetRawString(item, "input") ?? "";
+            writer.customToolInputDelta(
+              responseId,
+              index,
+              itemId,
+              input,
+            );
+            writer.customToolInputDone(
+              responseId,
+              index,
+              itemId,
+              input,
+            );
+          }
+          writer.outputItemDone(responseId, index, item);
         }
 
         if (signal?.aborted) {
@@ -4596,7 +3756,6 @@ async function buildSimulatedResponsesStreamResponse(
               responseConversationId,
             ),
             "response_stream_error",
-            parsedRequest,
           );
         }
       } finally {
@@ -4680,14 +3839,12 @@ function rememberResponsesReplayIdentity(
       conversationId,
       response,
     );
-    responseStore.clearProtocolFailureCycle(replayIdentityKey);
     return;
   }
   const requestHash = replayIdentityKey.startsWith("legacy:")
     ? replayIdentityKey.slice("legacy:".length)
     : replayIdentityKey;
   responseStore.rememberCompletedRequest(requestHash, conversationId, response);
-  responseStore.clearProtocolFailureCycle(replayIdentityKey);
 }
 
 export function computeResponsesReplayIdentityKey(
@@ -4803,7 +3960,6 @@ function validateResponsesToolResults(
   taskId: string,
   requestProfileKey: string,
   responseStore: ResponseStore,
-  isRegenerationCycle = false,
 ): ToolLedgerError | null {
   const resultItems = Array.isArray(requestJson.input)
     ? requestJson.input.filter((item): item is JsonObject => {
@@ -4819,40 +3975,23 @@ function validateResponsesToolResults(
   }
 
   const hadPending = ledger.hasPending(taskId);
-  const callIds = resultItems.map((item) => tryGetString(item, "call_id") ?? "");
-  if (new Set(callIds).size !== callIds.length) {
-    return new ToolLedgerError(
-      "duplicate_result",
-      classifyBridgeFailure("duplicate_tool_result_or_replay"),
-    );
-  }
-  const callIdsToAccept: string[] = [];
+  let accepted = false;
   for (const item of resultItems) {
     const callId = tryGetString(item, "call_id") ?? "";
     const knownCall = ledger.get(callId);
     if (!knownCall && !hadPending) {
       continue;
     }
-    if (isRegenerationCycle && knownCall?.status === "completed") {
-      if (knownCall.request_profile_key !== requestProfileKey) {
-        return new ToolLedgerError(
-          "cross_profile",
-          classifyBridgeFailure("invalid_request"),
-        );
+    const result = ledger.acceptResult(callId, requestProfileKey);
+    if (!result.ok) {
+      if (accepted) {
+        responseStore.saveToolLedger(taskId, ledger);
       }
-      continue;
-    }
-    const result = ledger.validateResult(callId, requestProfileKey);
-    if (!result.ok) {
       return result.error;
     }
-    callIdsToAccept.push(callId);
+    accepted = true;
   }
-  if (callIdsToAccept.length > 0) {
-    const result = ledger.acceptResults(callIdsToAccept, requestProfileKey);
-    if (!result.ok) {
-      return result.error;
-    }
+  if (accepted) {
     responseStore.saveToolLedger(taskId, ledger);
   }
   return null;
@@ -4927,8 +4066,6 @@ function buildResponsesLedgerFailureResult(
   taskDeadlineMs: number,
   failure: ToolLedgerError,
   signal?: AbortSignal,
-  replayIdentityKey?: string,
-  protocolFailurePhase?: "retry_available" | "exhausted",
 ): Response {
   return buildResponsesFailureResult(
     services,
@@ -4938,45 +4075,7 @@ function buildResponsesLedgerFailureResult(
     taskDeadlineMs,
     failure.reason,
     signal,
-    replayIdentityKey,
-    true,
-    protocolFailurePhase,
   );
-}
-
-function createResponsesFailureTerminal(
-  parsedRequest: ParsedResponsesRequest,
-  rawReason: string,
-  conversationId: string | null = null,
-  responseId: string = createOpenAiResponseId(),
-  createdAt: number = nowUnix(),
-  output: JsonObject[] = [],
-): { failure: BridgeFailure; response: JsonObject } {
-  const failure = classifyResponsesFailure(rawReason);
-  const terminal: Parameters<typeof buildOpenAiResponseObject>[8] =
-    failure.terminal === "failed"
-      ? {
-          status: "failed",
-          error: { code: failure.code, message: failure.message },
-          incomplete_details: null,
-        }
-      : {
-          status: "incomplete",
-          error: null,
-          incomplete_details: { reason: failure.reason },
-        };
-  const response = buildOpenAiResponseObject(
-    responseId,
-    createdAt,
-    parsedRequest.base.model,
-    failure.terminal,
-    output,
-    parsedRequest,
-    conversationId,
-    parsedRequest.contextInputTokens ?? undefined,
-    terminal,
-  );
-  return { failure, response };
 }
 
 function buildResponsesFailureResult(
@@ -4987,9 +4086,6 @@ function buildResponsesFailureResult(
   taskDeadlineMs: number | null,
   rawReason: string,
   signal?: AbortSignal,
-  replayIdentityKey?: string,
-  persistResponse = true,
-  protocolFailurePhase?: "retry_available" | "exhausted",
 ): Response {
   const responseId = createOpenAiResponseId();
   const createdAt = nowUnix();
@@ -4997,74 +4093,6 @@ function buildResponsesFailureResult(
     services.options.includeConversationIdInResponseBody
       ? conversationId
       : null;
-  const { failure, response: terminalResponse } =
-    createResponsesFailureTerminal(
-      parsedRequest,
-      rawReason,
-      responseConversationId,
-      responseId,
-      createdAt,
-    );
-
-  if (replayIdentityKey) {
-    if (persistResponse) {
-      if (protocolFailurePhase) {
-        services.responseStore.setTransient(
-          responseId,
-          terminalResponse,
-          conversationId,
-          taskDeadlineMs,
-        );
-      } else {
-        services.responseStore.set(
-          responseId,
-          terminalResponse,
-          conversationId,
-          taskDeadlineMs,
-        );
-      }
-    }
-    if (protocolFailurePhase === "retry_available") {
-      services.responseStore.rememberRetryableProtocolFailure(
-        replayIdentityKey,
-        conversationId,
-        terminalResponse,
-      );
-    } else if (protocolFailurePhase === "exhausted") {
-      services.responseStore.rememberExhaustedProtocolFailure(
-        replayIdentityKey,
-        conversationId,
-        terminalResponse,
-      );
-    } else {
-      rememberResponsesReplayIdentity(
-        services.responseStore,
-        replayIdentityKey,
-        conversationId,
-        terminalResponse,
-      );
-    }
-  }
-
-  if (!parsedRequest.base.stream) {
-    if (persistResponse && !replayIdentityKey && !protocolFailurePhase) {
-      services.responseStore.set(
-        responseId,
-        terminalResponse,
-        conversationId,
-        taskDeadlineMs,
-      );
-    }
-    headers.set("content-type", "application/json");
-    if (conversationId) {
-      headers.set("x-m365-conversation-id", conversationId);
-    }
-    return new Response(JSON.stringify(terminalResponse), {
-      status: 200,
-      headers,
-    });
-  }
-
   const inProgress = buildOpenAiResponseObject(
     responseId,
     createdAt,
@@ -5074,6 +4102,29 @@ function buildResponsesFailureResult(
     parsedRequest,
     responseConversationId,
   );
+
+  if (!parsedRequest.base.stream) {
+    const writer = new ResponsesEventWriter(() => {});
+    emitResponsesFailureTerminal(writer, inProgress, rawReason);
+    const terminalResponse =
+      writer.terminalState && writer.terminalState.kind !== "cancelled"
+        ? writer.terminalState.response
+        : inProgress;
+    services.responseStore.set(
+      responseId,
+      terminalResponse,
+      conversationId,
+      taskDeadlineMs,
+    );
+    headers.set("content-type", "application/json");
+    if (conversationId) {
+      headers.set("x-m365-conversation-id", conversationId);
+    }
+    return new Response(JSON.stringify(terminalResponse), {
+      status: 200,
+      headers,
+    });
+  }
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -5086,10 +4137,17 @@ function buildResponsesFailureResult(
       } else {
         writer.created(inProgress);
         writer.inProgress(inProgress);
-        if (failure.terminal === "incomplete") {
-          writer.incomplete(terminalResponse, failure);
-        } else {
-          writer.failed(terminalResponse, failure);
+        emitResponsesFailureTerminal(writer, inProgress, rawReason);
+        if (
+          writer.terminalState &&
+          writer.terminalState.kind !== "cancelled"
+        ) {
+          services.responseStore.set(
+            responseId,
+            writer.terminalState.response,
+            conversationId,
+            taskDeadlineMs,
+          );
         }
       }
       if (writer.terminalState?.kind !== "cancelled") {
@@ -5396,15 +4454,12 @@ function normalizeSimulatedResponseOutputItems(
 
     const text = extractMessageOutputText(item);
     if (!text.trim()) {
-      normalized.push({
-        ...item,
-        status: normalizeSimulatedItemStatus(item.status),
-      });
+      normalized.push(item);
       continue;
     }
 
     const id = tryGetString(item, "id") ?? createOpenAiOutputItemId("msg");
-    const status = normalizeSimulatedItemStatus(item.status);
+    const status = tryGetString(item, "status") ?? "completed";
     normalized.push(buildMessageOutputItem(id, text, status));
   }
 
@@ -5463,7 +4518,7 @@ function normalizeSimulatedResponsesFunctionCallItem(
   return {
     id: itemId,
     type: isCustom ? "custom_tool_call" : "function_call",
-    status: normalizeSimulatedItemStatus(item.status),
+    status: tryGetString(item, "status") ?? "completed",
     call_id:
       tryGetString(item, "call_id") ??
       tryGetString(item, "tool_call_id") ??
@@ -5488,14 +4543,6 @@ function normalizeSimulatedResponsesFunctionCallItem(
           ),
         }),
   };
-}
-
-function normalizeSimulatedItemStatus(
-  value: JsonValue | undefined,
-): "in_progress" | "completed" | "incomplete" {
-  return value === "in_progress" || value === "incomplete"
-    ? value
-    : "completed";
 }
 
 function extractTextFromSimulatedChoices(payload: JsonObject): string | null {
@@ -5692,7 +4739,6 @@ async function transformGraphStreamToResponses(
               includeConversationId ? conversationId : null,
             ),
             "substrate_incomplete_terminal",
-            parsedRequest,
           );
           return;
         }
@@ -5781,7 +4827,6 @@ async function transformGraphStreamToResponses(
               includeConversationId ? conversationId : null,
             ),
             "graph_error",
-            parsedRequest,
           );
         }
       } finally {
@@ -5937,7 +4982,6 @@ async function streamSubstrateAsResponses(
               includeConversationId ? conversationId : null,
             ),
             reason,
-            parsedRequest,
           );
           return;
         }
@@ -6177,30 +5221,6 @@ async function writeOpenAiError(
   return new Response(body, { status: statusCode, headers });
 }
 
-async function writeSimulatedProtocolFailure(
-  services: Services,
-): Promise<Response> {
-  return writeOpenAiError(
-    services,
-    502,
-    "The simulated provider did not produce a valid endpoint response after one protocol correction.",
-    "api_error",
-    "provider_drift",
-  );
-}
-
-async function writeSimulatedCancellationFailure(
-  services: Services,
-): Promise<Response> {
-  return writeOpenAiError(
-    services,
-    499,
-    "The request was cancelled before the simulated protocol correction completed.",
-    "api_error",
-    "client_aborted",
-  );
-}
-
 async function writeFromUpstreamFailure(
   services: Services,
   statusCode: number,
@@ -6267,62 +5287,21 @@ function emitResponsesFailureTerminal(
   writer: ResponsesEventWriter,
   response: JsonObject,
   rawReason: string,
-  parsedRequest?: ParsedResponsesRequest,
 ): void {
   if (writer.terminalState) {
     return;
   }
   try {
     const failure = classifyResponsesFailure(rawReason);
-    const terminalResponse = parsedRequest
-      ? buildLocalResponsesFailureResponse(response, parsedRequest, failure)
-      : response;
     if (failure.terminal === "incomplete") {
-      writer.incomplete(terminalResponse, failure);
+      writer.incomplete(response, failure);
     } else {
-      writer.failed(terminalResponse, failure);
+      writer.failed(response, failure);
     }
   } catch {
     if (!writer.terminalState) {
       writer.clientAbort();
     }
-  }
-
-  function buildLocalResponsesFailureResponse(
-    response: JsonObject,
-    parsedRequest: ParsedResponsesRequest,
-    failure: BridgeFailure,
-  ): JsonObject {
-    const output = Array.isArray(response.output)
-      ? response.output.filter(isJsonObject)
-      : [];
-    const conversationId =
-      tryGetString(response, "conversation_id") ??
-      tryGetString(response, "conversation") ??
-      null;
-    const terminal: Parameters<typeof buildOpenAiResponseObject>[8] =
-      failure.terminal === "failed"
-        ? {
-            status: "failed",
-            error: { code: failure.code, message: failure.message },
-            incomplete_details: null,
-          }
-        : {
-            status: "incomplete",
-            error: null,
-            incomplete_details: { reason: failure.reason },
-          };
-    return buildOpenAiResponseObject(
-      tryGetString(response, "id") ?? createOpenAiResponseId(),
-      resolveResponseCreatedAt(response.created_at),
-      parsedRequest.base.model,
-      failure.terminal,
-      output,
-      parsedRequest,
-      conversationId,
-      parsedRequest.contextInputTokens ?? undefined,
-      terminal,
-    );
   }
 }
 
@@ -6446,7 +5425,6 @@ async function buildAssistantStreamResponse(
   includeConversationId: boolean,
   headers: Headers,
   trace: TraceContext | null,
-  signal?: AbortSignal,
 ): Promise<Response> {
   const completionId = `chatcmpl-${randomUUID().replaceAll("-", "")}`;
   const created = nowUnix();
@@ -6454,10 +5432,6 @@ async function buildAssistantStreamResponse(
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       const encoder = new TextEncoder();
-      if (signal?.aborted) {
-        controller.close();
-        return;
-      }
       const writeChunk = (
         role: string | null,
         content: string | null,

@@ -102,53 +102,32 @@ Headless token fetch uses the saved Playwright browser state, opens M365 Copilot
 
 `openAiTransformMode` controls how requests are translated for M365 Copilot:
 
-- `simulated` (default): sends the full incoming OpenAI JSON payload with an
-  endpoint-specific output contract. The proxy buffers the complete upstream
-  turn, validates it before emitting output, and locally builds the OpenAI
-  response or terminal failure.
-- Tool-free simulated requests ask for direct assistant text and project that
-  text into the requested OpenAI response shape. Strict whole-envelope
-  validation remains mandatory whenever tools are available.
+- `simulated` (default): sends the full incoming OpenAI JSON payload as a markdown JSON block and asks Copilot to respond in the same endpoint format; proxy extracts JSON from the response block and returns it.
 - `mapped`: uses the legacy request/response mapping logic.
 
-`simulatedOutputProtocol` selects the tool-bearing Responses contract:
+`substrate.earlyCompleteOnSimulatedPayload` (default `false`) controls early websocket completion in simulated mode. It is evaluated in `src/proxy/clients.ts`, and only triggers once a fully parseable simulated payload is detected. By design, tool-call payloads are excluded from early completion.
 
-- `legacy` (default): requires the validated endpoint JSON envelope.
-- `bridge_v1`: accepts exact bridge-owned frames for one final message, one
-  function call, or one custom-tool call, with strict legacy JSON retained as a
-  compatibility fallback. JSON response formats always use `legacy`.
+`substrate.incrementalSimulatedContentStreaming` (default `false`) enables a guarded incremental extractor in the simulated SSE bridge (`src/proxy/server.ts`) that can emit partial `choices[0].message.content` before full JSON parse completes.
 
-Enable the V1 contract for a canary with:
+### Simulated Streaming Flag Interaction
 
-```bash
-CONFIG__simulatedOutputProtocol=bridge_v1 bun run start:proxy
-```
+These are independent flags at different layers with partial overlap:
 
-The V1 frames start at byte zero:
+- `earlyCompleteOnSimulatedPayload` is in the Substrate client loop (`src/proxy/clients.ts`). It stops reading websocket frames once a fully parseable simulated payload is detected (`hasCompleteSimulatedPayload`).
+- `incrementalSimulatedContentStreaming` is in the proxy SSE bridge (`src/proxy/server.ts`). It can emit partial `message.content` before full payload parse by using the incremental extractor (`src/proxy/openai.ts`).
 
-```text
-M365_FINAL_V1
-<raw final text>
+How they combine:
 
-M365_FUNCTION_TOOL_CALL_V1
-<exact tool name>
-<one JSON argument object>
+- `earlyComplete=false`, `incremental=false`: parse-then-emit behavior.
+- `earlyComplete=true`, `incremental=false`: still parse-then-emit, but upstream websocket may end earlier for plain text simulated payloads.
+- `earlyComplete=false`, `incremental=true`: partial content can stream early; websocket still runs normally.
+- `earlyComplete=true`, `incremental=true`: fastest plain-text path; incremental emits early text, then websocket can stop early once payload is complete.
 
-M365_CUSTOM_TOOL_CALL_V1
-<exact tool name>
-<raw input to EOF>
-```
+Important caveats:
 
-Recognized malformed frames are corrected or rejected; they are never accepted
-as final prose. Function arguments, offered tool names, tool choice, schemas,
-call IDs, and parallel policy still pass the same strict validator used by the
-legacy protocol.
-
-The legacy `substrate.earlyCompleteOnSimulatedPayload` and
-`substrate.incrementalSimulatedContentStreaming` settings remain accepted for
-configuration compatibility but are ignored. Simulated output is never emitted
-incrementally or before whole-response validation; mapped streaming behavior is
-unchanged.
+- Incremental mode is auto-disabled for strict tool-validation flows and structured response format (`src/proxy/server.ts`).
+- Incremental mode suppresses itself if `tool_calls` is detected mid-stream (`src/proxy/server.ts`).
+- `earlyCompleteOnSimulatedPayload` does not early-complete tool-call payloads by design (`src/proxy/clients.ts`).
 
 Use `CONFIG__openAiTransformMode=mapped` if you need to revert to the legacy behavior.
 
@@ -169,24 +148,6 @@ To override nested values, use double underscores for each path segment, for exa
 ```bash
 CONFIG__substrate__hubPath=wss://substrate.office.com/m365Copilot/Chathub bun run start:proxy
 ```
-
-Sanitized bridge events can be persisted independently of debug request logs:
-
-```json
-{
-  "observability": {
-    "enabled": true,
-    "logPath": "./logs/proxy-events.jsonl",
-    "maxBytes": 5242880,
-    "maxFiles": 3
-  }
-}
-```
-
-The JSONL log contains event names, counters, classifications, and sizes only.
-Prompt and response bodies, authentication material, account identifiers, and
-authenticated URLs are redacted. Rotation retains the active file plus numbered
-archives up to `maxFiles`.
 
 ## API endpoints
 
@@ -309,31 +270,12 @@ Example tool-call response shape:
 
 Strictness behavior:
 
-- Tool-free simulated turns accept direct assistant text. Tool-bearing turns use
-  the configured strict protocol described above.
-- Strict JSON decoding first applies deterministic lexical repair only inside
-  JSON strings: literal control characters are escaped, and invalid escape
-  prefixes are preserved as literal backslashes. Truncation, quote insertion,
-  brace balancing, surrounding prose, multiple values, and structural damage
-  are never guessed or repaired.
-- A malformed or invalid candidate receives one bounded protocol-correction
-  turn. If that primary cycle is exhausted, the next sequential identical
-  request receives one fresh regeneration cycle with an independent prompt and
-  one correction. Later identical retries replay the cached failed terminal.
-  This bounds a live failure episode to four upstream generations without
-  durably storing failed response bodies.
-- Tool choice, offered name and namespace, function/custom kind, argument schema,
-  call IDs, and parallel-call policy are validated before any output is emitted.
-  Mixed valid/invalid call batches are rejected atomically.
-- Malformed-output telemetry contains only parse categories, lengths, booleans,
-  root-shape metadata, and parser-provided offsets. It never records prompts,
-  candidates, tool input, URLs, identifiers, or authentication material.
+- If `tool_choice` is `required` or a specific `function`, the proxy returns `400 invalid_tool_output` when no valid tool-call JSON can be extracted from assistant output.
+- If `tool_choice` is `auto` (or tools are not strictly required), the proxy falls back to a normal assistant text completion when tool-call JSON is not found.
 
 Input normalization notes:
 
-- Validated function argument and custom-tool input bytes are preserved for
-  downstream delivery; malformed input is rejected rather than repaired or
-  evaluated.
+- JSON-stringified `message.content`, tool payloads, and function arguments are parsed best-effort and re-serialized to canonical minified JSON when valid.
 - Assistant message content containing serialized `tool_calls` structures is preserved as tool-call context for downstream Copilot prompt construction.
 
 ## Responses API usage

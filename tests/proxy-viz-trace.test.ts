@@ -111,7 +111,7 @@ describe("proxy viz trace capture", () => {
 
     expect(response.status).toBe(200);
     const body = (await response.json()) as JsonObject;
-    expect(body.id).toMatch(/^chatcmpl-/);
+    expect(body.id).toBe("chatcmpl_trace_simulated");
 
     const trace = await getTrace(app, traceId);
     expect(trace.status).toBe("completed");
@@ -121,7 +121,7 @@ describe("proxy viz trace capture", () => {
       String(((trace.pane3 as JsonObject).message as JsonObject).text ?? ""),
     ).toContain('"messages"');
     expect((trace.pane4 as JsonObject).id).toBe("conv-1");
-    expect((trace.pane2 as JsonObject).id).toBe(body.id);
+    expect((trace.pane2 as JsonObject).id).toBe("chatcmpl_trace_simulated");
   });
 
   test("captures graph chat/completions stream trace as buffered json", async () => {

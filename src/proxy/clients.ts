@@ -1,6 +1,11 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import { getTokenPath, loadToken } from "../cli/token-helpers";
+import {
+  tryBuildAssistantResponseFromChatCompletionPayload,
+  tryExtractSimulatedResponsePayload,
+} from "./openai";
+import { OpenAiTransformModes } from "./types";
 import type {
   ChatResult,
   CreateConversationResult,
@@ -930,6 +935,22 @@ export class CopilotSubstrateClient {
 
             }
 
+            if (
+              request.transformMode === OpenAiTransformModes.Simulated &&
+              this.options.substrate.earlyCompleteOnSimulatedPayload &&
+              resolveCompleteSimulatedAssistantText(
+                extractedAssistantText,
+                deltaBuilder,
+              )
+            ) {
+              assistantText =
+                resolveCompleteSimulatedAssistantText(
+                  extractedAssistantText,
+                  deltaBuilder,
+                ) ?? assistantText;
+              completed = true;
+              break;
+            }
           }
 
           const frameError = tryGetString(json, "error");
@@ -2316,6 +2337,90 @@ function hasSubstrateResultValue(envelope: JsonObject): boolean {
 function isSubstrateResultSuccess(resultValue: string): boolean {
   const normalized = resultValue.toLowerCase();
   return normalized === "success" || normalized === "apologyresponsereturned";
+}
+
+function hasCompleteSimulatedPayload(assistantText: string): boolean {
+  const chatPayload = tryExtractSimulatedResponsePayload(
+    assistantText,
+    "chat.completions",
+  );
+  if (chatPayload) {
+    const assistantResponse =
+      tryBuildAssistantResponseFromChatCompletionPayload(chatPayload);
+    if (!assistantResponse) {
+      return false;
+    }
+    // Tool-call payloads tend to continue changing across subsequent frames.
+    // Early completion is safer for plain assistant text responses only.
+    if (assistantResponse.toolCalls.length > 0) {
+      return false;
+    }
+    return Boolean(assistantResponse.content?.trim());
+  }
+
+  const responsesPayload = tryExtractSimulatedResponsePayload(
+    assistantText,
+    "responses",
+  );
+  if (!responsesPayload) {
+    return false;
+  }
+
+  const output = responsesPayload.output;
+  if (!Array.isArray(output) || output.length === 0) {
+    return false;
+  }
+
+  let hasMessageText = false;
+  for (const item of output) {
+    if (!isJsonObject(item)) {
+      continue;
+    }
+    const type = (tryGetString(item, "type") ?? "").toLowerCase();
+    if (type === "function_call") {
+      return false;
+    }
+    if (type === "message") {
+      const content = item.content;
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (!isJsonObject(part)) {
+            continue;
+          }
+          const text =
+            tryGetString(part, "text") ?? tryGetString(part, "output_text");
+          if (text?.trim()) {
+            hasMessageText = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  if (hasMessageText) {
+    return true;
+  }
+
+  return Boolean(tryGetString(responsesPayload, "output_text")?.trim());
+}
+
+function resolveCompleteSimulatedAssistantText(
+  latestAssistantText: string | null,
+  accumulatedAssistantText: string,
+): string | null {
+  if (latestAssistantText && hasCompleteSimulatedPayload(latestAssistantText)) {
+    return latestAssistantText;
+  }
+
+  if (
+    accumulatedAssistantText &&
+    hasCompleteSimulatedPayload(accumulatedAssistantText)
+  ) {
+    return accumulatedAssistantText;
+  }
+
+  return null;
 }
 
 function buildNormalizedConversation(

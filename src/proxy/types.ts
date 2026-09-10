@@ -37,14 +37,6 @@ export const OpenAiTransformModes = {
   Mapped: "mapped",
 } as const;
 
-export const SimulatedOutputProtocols = {
-  Legacy: "legacy",
-  BridgeV1: "bridge_v1",
-} as const;
-
-export type SimulatedOutputProtocol =
-  (typeof SimulatedOutputProtocols)[keyof typeof SimulatedOutputProtocols];
-
 export const ProxyVizTraceStatuses = {
   Pending: "pending",
   Completed: "completed",
@@ -76,7 +68,6 @@ export type ParsedImageInput = {
 export type OpenAiToolDefinition = {
   name: string;
   type: "function" | "custom";
-  namespace?: string | null;
   description: string | null;
   parameters: JsonObject;
   format: JsonObject | null;
@@ -86,7 +77,6 @@ export type OpenAiTooling = {
   tools: OpenAiToolDefinition[];
   toolChoiceMode: string;
   toolChoiceFunctionName: string | null;
-  toolChoiceToolType?: "function" | "custom" | null;
   parallelToolCalls: boolean;
   requiredByLocalAction?: boolean;
 };
@@ -115,8 +105,6 @@ export type ParsedOpenAiRequest = {
   model: string;
   stream: boolean;
   transformMode: string;
-  simulatedOutputProtocol?: SimulatedOutputProtocol;
-  rawRequest?: JsonObject;
   hostedWebSearch?: boolean;
   promptText: string;
   userKey: string | null;
@@ -267,7 +255,6 @@ export type WrapperOptions = {
   logLevel: LogLevel;
   logStreamingResponseBody?: boolean;
   openAiTransformMode: string;
-  simulatedOutputProtocol?: SimulatedOutputProtocol;
   temporaryChat: boolean;
   ignoreIncomingAuthorizationHeader: boolean;
   playwrightBrowser: PlaywrightBrowser;
@@ -286,24 +273,9 @@ export type WrapperOptions = {
   includeConversationIdInResponseBody: boolean;
   retrySimulatedToollessResponses: boolean;
   logStdout: boolean;
-  observability?: ObservabilityOptions;
   confabRetries: number;
   msalAuth: boolean;
   imageGeneration: ImageGenerationOptions;
-};
-
-export type LoadedWrapperOptions = Omit<
-  WrapperOptions,
-  "simulatedOutputProtocol"
-> & {
-  simulatedOutputProtocol: SimulatedOutputProtocol;
-};
-
-export type ObservabilityOptions = {
-  enabled: boolean;
-  logPath: string;
-  maxBytes: number;
-  maxFiles: number;
 };
 
 export type ImageGenerationOptions = {

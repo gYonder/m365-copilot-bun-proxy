@@ -5,19 +5,12 @@
   "logStreamingResponseBody": false,
   "transport": "substrate",
   "openAiTransformMode": "simulated",
-  "simulatedOutputProtocol": "legacy",
   "temporaryChat": true,
   "ignoreIncomingAuthorizationHeader": true,
   "playwrightBrowser": "edge",
   "includeConversationIdInResponseBody": true,
   "retrySimulatedToollessResponses": true,
   "logStdout": false,
-  "observability": {
-    "enabled": false,
-    "logPath": "./logs/proxy-events.jsonl",
-    "maxBytes": 5242880,
-    "maxFiles": 3
-  },
   "confabRetries": 1,
   "msalAuth": true,
   "imageGeneration": {
